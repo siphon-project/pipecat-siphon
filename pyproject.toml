@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-siphon"
+version = "0.1.0"
+description = "Pipecat frame serializer for the siphon-rtp media WebSocket protocol"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = ["pipecat", "siphon-rtp", "voice-ai", "websocket", "rtp", "telephony"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Telephony",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pipecat-ai>=1.7.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "websockets>=13.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_siphon"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM", "RUF", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100", "D101", "D102", "D103", "D104"]
+"examples/*" = ["D100", "D103"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests", "examples"]
+strict = true
+warn_unreachable = true
+# pipecat's `@transport.event_handler(...)` is an untyped decorator; every handler in a pipecat
+# app goes through it, so this is the one strict flag that cannot be satisfied from here.
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["audioop", "pipecat.*", "websockets.*"]
+ignore_missing_imports = true
+
+# numpy ships stubs that use 3.12-only syntax, which mypy cannot parse while analysing for the
+# 3.11 floor. We never touch numpy ourselves; it arrives through pipecat's resampler.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
