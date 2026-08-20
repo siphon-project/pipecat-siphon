@@ -234,6 +234,22 @@ Then offer a call with `"profile": {"ws_uri": "ws://127.0.0.1:9001/stream"}` and
 back, one jitter-buffer frame plus one playout frame later. Swap the echo processor for an
 STT → LLM → TTS chain and it is a bot.
 
+## Integration harness
+
+`integration/` holds a four-way harness that runs the whole chain with nothing mocked: SIPp
+places a call through siphon-sip, siphon-rtp bridges the leg to a pipecat bot using this
+serializer, and the assertions are on the audio that comes back rather than on the socket being
+open. One scenario proves a known signal survives the round trip, checked spectrally against a
+tshark capture; the other proves the engine's VAD edges land where the fixture puts them and
+that barge-in flushes the bot's queued speech.
+
+```bash
+cd integration && ./run.sh
+```
+
+It needs Docker and checkouts of siphon-sip and siphon-rtp beside this repository, and it is
+not part of CI. See [`integration/README.md`](integration/README.md).
+
 ## Compatibility
 
 | | Verified against |
