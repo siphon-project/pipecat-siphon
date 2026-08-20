@@ -97,14 +97,19 @@ The first text frame is always `start`:
 
 ## Sample rates: the wire rate is negotiated, and authoritative
 
-`media.sampleRate` in the `start` envelope is **the negotiated wire rate**, in both directions, for
-the life of the stream. It is *not* the call's codec rate. A controller selects it with the
-`ws_sample_rate` (takeover) or `ws_tee_sample_rate` / `sample_rate` (tee) knobs, anywhere in the
-8000–48000 band in multiples of 1000, and the engine resamples on its side. So an 8 kHz G.711 call
-can speak 16 kHz L16 to a model that wants wideband input.
+`media.sampleRate` in the `start` envelope is **the wire rate**, in both directions, for the life of
+the stream, and it is authoritative. Never assume 8000. Frame against the number `start` gives you,
+and expect it to differ from what your pipeline runs at.
 
-Never assume 8000. Frame against the number `start` gives you, and expect it to differ from what
-your pipeline runs at.
+Whether that rate is *selectable* depends on the engine build:
+
+| siphon-rtp | Behaviour |
+|---|---|
+| **0.2.1 and earlier** | The wire rate follows the call's codec rate. `start` still carries it and is still authoritative — an 8 kHz G.711 call streams at 8000. |
+| **Newer builds** | A controller selects it independently of the codec, with the `ws_sample_rate` (takeover) or `ws_tee_sample_rate` / `sample_rate` (tee) knobs, anywhere in the 8000–48000 band in multiples of 1000, and the engine resamples on its side. So an 8 kHz G.711 call can speak 16 kHz L16 to a model that wants wideband input. |
+
+Those knobs do not exist in 0.2.1, so check your engine version before reaching for them. Nothing in
+this package depends on which case you are in: it reads the rate out of `start` either way.
 
 This serializer handles the mismatch for you. `setup(StartFrame)` records the pipeline's
 `audio_in_sample_rate`; the wire rate arrives later, in `start` (the engine cannot dial you before
@@ -234,7 +239,7 @@ STT → LLM → TTS chain and it is a bot.
 | | Verified against |
 |---|---|
 | pipecat | `pipecat-ai` 1.7.0 |
-| siphon-rtp bridge protocol | `crates/siphon-rtp-media/src/bridge/protocol.rs` as of the selectable-wire-rate change (`ws_sample_rate` / `ws_tee_sample_rate`) |
+| siphon-rtp bridge protocol | `crates/siphon-rtp-media/src/bridge/protocol.rs`. The control envelope is unchanged since 0.2.0, so this works against the released 0.2.1. The **selectable** wire rate (`ws_sample_rate` / `ws_tee_sample_rate`) is a newer engine feature — see the table above; it changes which rates a controller may ask for, not the wire this package speaks. |
 | Python | 3.13 (declared support 3.11+, matching pipecat's floor) |
 
 The control-frame fixtures under `tests/wire_fixtures.py` are byte-exact strings produced by
