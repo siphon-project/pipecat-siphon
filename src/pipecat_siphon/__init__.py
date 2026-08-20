@@ -31,6 +31,11 @@ from pipecat_siphon.protocol import (
     encode_control,
     parse_control,
 )
+from pipecat_siphon.serializer import (
+    SiphonFrameSerializer,
+    SpeechFrameMode,
+    StereoInputMode,
+)
 
 __version__ = "0.1.0"
 
@@ -49,11 +54,14 @@ __all__ = [
     "PlayStartData",
     "PlayStopData",
     "RenegotiateData",
+    "SiphonFrameSerializer",
     "SiphonProtocolError",
     "SpeechData",
+    "SpeechFrameMode",
     "SpeechStartedData",
     "SpeechStoppedData",
     "StartData",
+    "StereoInputMode",
     "StopData",
     "__version__",
     "encode_control",
