@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Scenario 1 UAC: place a call to sip:roundtrip@, play the two-tone fixture, hang up.
+
+  INVITE (SDP) -> 100 -> 200 OK (engine-anchored SDP) -> ACK -> [RTP] -> BYE -> 200
+
+  Only one thing is asserted here, and it is a SIP-level one: the 200 OK's c= line has to be the
+  engine's own relay address. If it is not, the RTP below goes somewhere that cannot forward it
+  and every audio assertion downstream fails for a reason that has nothing to do with audio.
+  Everything else is asserted on the capture and on the bot's trace, because neither the
+  returning audio's spectrum nor the engine's session count is visible from a UAC.
+
+  A-law is offered because the fixture is A-law. Offering a codec the media does not match would
+  put the wrong bytes on the wire and make the spectral check meaningless. ptime is 20 to match
+  the fixture's 160-byte payloads: the engine takes its bridge tick from the negotiated ptime,
+  so declaring a packetisation the media does not use desynchronises the whole path.
+
+  The IPv4 literal in the ereg is the engine's address on the harness network. It is duplicated
+  from docker-compose.yaml on purpose: an assertion that reads its expected value out of the
+  same variable as the thing under test asserts nothing.
+-->
+<scenario name="pipecat-siphon round-trip UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:roundtrip@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:roundtrip@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:+15550100@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/pipecat-siphon-harness
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.28\.7\.10"
+            search_in="body"
+            check_it="true"
+            assign_to="anchored" />
+      <log message="answer anchored on the engine: [$anchored]" />
+      <ereg regexp="a=rtpmap:8 PCMA/8000"
+            search_in="body"
+            check_it="true"
+            assign_to="codec" />
+      <log message="answer codec: [$codec]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:roundtrip@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- 200 packets at 20 ms: 4.0 s of the 500 Hz + 1300 Hz fixture. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="/harness/artifacts/roundtrip.pcap" />
+    </action>
+  </nop>
+
+  <!-- Half a second past the end of the fixture, so the last echoed frames have made it back
+       through the bot and into the capture before the call goes away. -->
+  <pause milliseconds="4500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:roundtrip@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>
