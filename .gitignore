@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Local-only conventions and tooling scratch — never committed.
+CLAUDE.md
+.claude/
