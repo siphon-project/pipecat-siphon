@@ -1,0 +1,177 @@
+# The four-way integration stack: SIPp -> siphon-sip -> siphon-rtp -> a pipecat bot.
+#
+# Every component is the real thing. siphon-sip and siphon-rtp are built from the checkouts
+# beside this repository (override with SIPHON_SIP_PATH / SIPHON_RTP_PATH), the bot is this
+# package's serializer inside a real pipecat pipeline, and the caller is SIPp playing a real
+# RTP capture. Nothing in the media or signalling path is a stand-in. The one extra hop, the
+# control tap, forwards every byte between the proxy and the engine unchanged and exists only
+# so a failed run leaves a readable transcript behind.
+#
+# The subnet is deliberately not one of the ranges the sibling repositories' harnesses use, so
+# this stack can run beside them.
+
+name: pipecat-siphon-harness
+
+x-artifacts: &artifacts
+  # Bind-mounted rather than a named volume: the whole point is that a failed run leaves the
+  # capture, the traces and the transcript somewhere a person can open them.
+  type: bind
+  source: ./artifacts
+  target: /harness/artifacts
+
+services:
+
+  # ── The media engine under test ──────────────────────────────────────────────────────────
+  # Built from the local checkout, not pulled: the harness has to test the engine on the
+  # developer's disk. --relay-bind-ip is load-bearing. The UDP backend binds loopback by
+  # default (a NIC-free convenience for its own tests), and without this the engine would
+  # answer with c=IN IP4 127.0.0.1 and no RTP on this network could ever reach it. The SIPp
+  # scenarios assert on this exact address so that regression fails loudly instead of quietly.
+  engine:
+    build:
+      context: ${SIPHON_RTP_PATH:-../../siphon-rtp}
+      target: runtime
+    image: pipecat-siphon-integration/siphon-rtp:local
+    command:
+      - "--control"
+      - "0.0.0.0:8080"
+      - "--relay-bind-ip"
+      - "172.28.7.10"
+      - "--port-min"
+      - "30000"
+      - "--port-max"
+      - "30100"
+      - "--metrics-addr"
+      - "0.0.0.0:9091"
+    environment:
+      RUST_LOG: "info,siphon_rtp::control=debug,siphon_rtp::media=debug"
+    networks:
+      harness:
+        ipv4_address: 172.28.7.10
+    # No healthcheck: the image is distroless, so there is no shell for CMD-SHELL to run.
+    # Readiness is probed from outside, over /readyz, by run.sh.
+
+  # ── Control-plane transcript ─────────────────────────────────────────────────────────────
+  # A transparent tap, not a mock. It forwards bytes verbatim in both directions and decodes a
+  # copy for the transcript, because neither siphon-sip nor siphon-rtp logs the JSON bodies and
+  # "what did the proxy ask for" is the first question a red run raises.
+  control-tap:
+    image: python:3.13-slim
+    depends_on:
+      - engine
+    volumes:
+      - type: bind
+        source: ./proxy
+        target: /harness/proxy
+        read_only: true
+      - *artifacts
+    command:
+      - python3
+      - /harness/proxy/control_tap.py
+      - "--listen-port"
+      - "8080"
+      - "--upstream"
+      - "172.28.7.10:8080"
+      - "--transcript"
+      - /harness/artifacts/control-transcript.jsonl
+    networks:
+      harness:
+        ipv4_address: 172.28.7.15
+
+  # ── The B2BUA / proxy under test ─────────────────────────────────────────────────────────
+  proxy:
+    build:
+      context: ${SIPHON_SIP_PATH:-../../siphon}
+    image: pipecat-siphon-integration/siphon-sip:local
+    depends_on:
+      - control-tap
+    volumes:
+      - type: bind
+        source: ./proxy/siphon.yaml
+        target: /etc/siphon/siphon.yaml
+        read_only: true
+      - type: bind
+        source: ./proxy
+        target: /harness/proxy
+        read_only: true
+    environment:
+      SIPHON_SIP_ADDRESS: "172.28.7.20"
+      # Through the tap, so the transcript sees every command.
+      SIPHON_RTP_CONTROL: "172.28.7.15:8080"
+      ROUNDTRIP_WS_URI: "ws://172.28.7.31:9001/stream?call={call_id}"
+      TURNTAKING_WS_URI: "ws://172.28.7.32:9001/stream?call={call_id}"
+      RUST_LOG: "info,siphon::rtpengine=debug,siphon::script=debug"
+    networks:
+      harness:
+        ipv4_address: 172.28.7.20
+
+  # ── The bots ─────────────────────────────────────────────────────────────────────────────
+  # One per scenario, so each handles exactly one call and writes one self-contained trace.
+  # They must be listening before the call is placed: the engine dials the WebSocket from
+  # inside the answer command and tears the call down if the dial is refused.
+  bot-echo:
+    build:
+      context: ..
+      dockerfile: integration/bot/Dockerfile
+    image: pipecat-siphon-integration/bot:local
+    command:
+      - "--mode"
+      - "echo"
+      - "--port"
+      - "9001"
+      - "--trace"
+      - /harness/artifacts/roundtrip-bot.jsonl
+    volumes:
+      - *artifacts
+    networks:
+      harness:
+        ipv4_address: 172.28.7.31
+
+  bot-speaker:
+    image: pipecat-siphon-integration/bot:local
+    depends_on:
+      - bot-echo
+    command:
+      - "--mode"
+      - "speaker"
+      - "--port"
+      - "9001"
+      - "--trace"
+      - /harness/artifacts/turntaking-bot.jsonl
+    volumes:
+      - *artifacts
+    networks:
+      harness:
+        ipv4_address: 172.28.7.32
+
+  # ── The caller ───────────────────────────────────────────────────────────────────────────
+  # Started per scenario by run.sh (`docker compose run --rm uac <scenario>`), never left up.
+  # NET_ADMIN/NET_RAW so tshark can capture on this container's own interface: what the caller
+  # received is then a fact about the caller's interface, not an inference from somewhere else.
+  uac:
+    build:
+      context: ..
+      dockerfile: integration/uac/Dockerfile
+    image: pipecat-siphon-integration/uac:local
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      PROXY_ADDRESS: "172.28.7.20"
+      UAC_ADDRESS: "172.28.7.40"
+      ENGINE_METRICS_URL: "http://172.28.7.10:9091/metrics"
+      MEDIA_PORT: "6000"
+      HOST_UID: "${HOST_UID:-0}"
+      HOST_GID: "${HOST_GID:-0}"
+    volumes:
+      - *artifacts
+    networks:
+      harness:
+        ipv4_address: 172.28.7.40
+
+networks:
+  harness:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.7.0/24

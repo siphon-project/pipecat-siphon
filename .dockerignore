@@ -1,0 +1,8 @@
+# Keep the build context small and free of local artefacts.
+.git
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+integration/artifacts

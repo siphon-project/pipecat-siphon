@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A four-way integration harness under `integration/`: SIPp to siphon-sip to siphon-rtp to a
+  pipecat bot using this serializer, in compose, with no mocks in the path. Two scenarios, both
+  asserting on audio rather than on connectivity -- a Goertzel check on the RTP that returns to
+  the caller for the round trip, and VAD edge timing plus barge-in flush latency for turn
+  taking. Not wired into CI; see `integration/README.md` for why.
+
 ## [0.1.0] - 2026-08-20
 
 First release.

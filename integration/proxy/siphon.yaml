@@ -1,0 +1,83 @@
+# siphon-sip configuration for the integration harness.
+#
+# Two media profiles, one per scenario. They are deliberately near-identical: the only
+# difference is the engine-side turn detection, so a difference in behaviour between the two
+# runs can only come from those flags.
+#
+# Note two things about how siphon-sip reads this file:
+#
+#   * `answer_local` reads the profile's `answer:` block, not `offer:`. The YAML anchors below
+#     make both sides the same object so a flag cannot be set on the half that is never read.
+#   * Unknown keys are dropped silently. A typo here does not fail the boot, it just does
+#     nothing — which is why both scenarios assert on *behaviour* the flags produce rather than
+#     trusting that they arrived.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "harness.example"
+
+# What goes in Contact/Via towards the UAC. Env-driven: compose owns the addressing.
+advertised_address: "${SIPHON_SIP_ADDRESS}"
+
+script:
+  path: "/harness/proxy/harness_script.py"
+
+# HTTP liveness/readiness, so compose can gate on something better than a SIP datagram.
+admin:
+  listen: "0.0.0.0:8081"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "${SIPHON_RTP_CONTROL}"
+    timeout_ms: 4000
+
+  profiles:
+    # Scenario 1. No VAD, and therefore no barge-in: the caller holds a tone for the whole call,
+    # so an engine-side barge-in would flush the echo on the first frame and there would be
+    # nothing to measure.
+    roundtrip:
+      offer: &roundtrip_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        # Off on purpose. Echo cancellation would treat the bot's echo as far-end reference and
+        # subtract the caller's own tone out of the uplink, which is exactly the signal the
+        # spectral assertion is looking for. Noise suppression is off for the same reason:
+        # nothing here is noisy, and a gain stage in the path makes the numbers harder to read.
+        noise_suppression: false
+        echo_cancellation: false
+        ws_vad: false
+        ws_barge_in: false
+      answer: *roundtrip_flags
+
+    # Scenario 2. Turn detection on, explicitly configured rather than left to the engine's
+    # defaults, so the assertion windows are derived from numbers this file states.
+    turntaking:
+      offer: &turntaking_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        noise_suppression: false
+        echo_cancellation: false
+        ws_vad: true
+        ws_barge_in: true
+        # Mean-square energy per frame. The fixture's quietest speech frame sits around 3.1e6
+        # and its silence is digital zero, so this threshold has three times the margin it
+        # needs in one direction and all of it in the other.
+        ws_vad_threshold: 1000000
+        # 300 ms at a 20 ms ptime is 15 hangover frames, and the engine reports the turn ended
+        # on the frame after the last one it held, so speech_stopped lands 320 ms after the
+        # last loud frame.
+        ws_vad_hangover_ms: 300
+      answer: *turntaking_flags
+
+log:
+  level: info
+  format: pretty
