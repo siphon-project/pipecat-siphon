@@ -11,3 +11,7 @@ build/
 # Local-only conventions and tooling scratch — never committed.
 CLAUDE.md
 .claude/
+
+# Scratch git worktrees — a stray `git add -A` would commit a second copy of the tree.
+/.worktrees/
+/worktrees/
