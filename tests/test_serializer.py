@@ -7,6 +7,7 @@ import math
 import struct
 
 import pytest
+from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
@@ -20,13 +21,16 @@ from pipecat.frames.frames import (
     InterruptionWorkerFrame,
     OutputAudioRawFrame,
     OutputTransportMessageFrame,
-    StartFrame,
     TextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.utils.asyncio.task_manager import TaskManager
 
 import wire_fixtures as wire
 from pipecat_siphon import Direction, Encoding, Endianness, SiphonFrameSerializer
@@ -61,6 +65,27 @@ def stereo_tone(samples: int, *, sample_rate: int) -> bytes:
     return struct.pack(f"<{len(interleaved)}h", *interleaved)
 
 
+def pipeline_setup(
+    audio_in_sample_rate: int = PIPELINE_IN_RATE,
+    audio_out_sample_rate: int = PIPELINE_OUT_RATE,
+) -> FrameProcessorSetup:
+    """Build the setup object a transport hands the serializer.
+
+    Pipecat 1.8 moved the pipeline's sample rates out of ``StartFrame`` and into this object, so
+    this is what the transport really passes. It is a real one rather than a stand-in: the clock,
+    the task manager and the worker are inert here (the serializer reads only the two rates), but
+    constructing them is what makes the test fail if the argument type moves again.
+    """
+    return FrameProcessorSetup(
+        # pipecat's clock constructor is untyped; the call is fine, mypy just cannot see it.
+        clock=SystemClock(),  # type: ignore[no-untyped-call]
+        task_manager=TaskManager(),
+        pipeline_worker=PipelineWorker(Pipeline([])),
+        audio_in_sample_rate=audio_in_sample_rate,
+        audio_out_sample_rate=audio_out_sample_rate,
+    )
+
+
 async def make_serializer(
     start_text: str = wire.START_8K,
     *,
@@ -68,14 +93,9 @@ async def make_serializer(
     audio_in_sample_rate: int = PIPELINE_IN_RATE,
     audio_out_sample_rate: int = PIPELINE_OUT_RATE,
 ) -> SiphonFrameSerializer:
-    """Build a serializer that has seen a pipeline StartFrame and then the engine's ``start``."""
+    """Build a serializer that has been set up by the pipeline and seen the engine's ``start``."""
     serializer = SiphonFrameSerializer(params=params)
-    await serializer.setup(
-        StartFrame(
-            audio_in_sample_rate=audio_in_sample_rate,
-            audio_out_sample_rate=audio_out_sample_rate,
-        )
-    )
+    await serializer.setup(pipeline_setup(audio_in_sample_rate, audio_out_sample_rate))
     assert await serializer.deserialize(start_text) is None
     return serializer
 
@@ -104,7 +124,7 @@ async def test_the_wire_rate_from_start_overrides_the_configured_assumption() ->
     params = SiphonFrameSerializer.InputParams(wire_sample_rate=8000)
     serializer = SiphonFrameSerializer(params=params)
     assert serializer.wire_sample_rate == 8000
-    await serializer.setup(StartFrame(audio_in_sample_rate=PIPELINE_IN_RATE))
+    await serializer.setup(pipeline_setup())
     await serializer.deserialize(wire.START_16K)
     assert serializer.wire_sample_rate == 16000
 
@@ -410,13 +430,13 @@ async def test_an_unmapped_frame_serializes_to_nothing() -> None:
 
 async def test_control_frames_are_dropped_while_the_stream_id_is_still_unknown() -> None:
     serializer = SiphonFrameSerializer()
-    await serializer.setup(StartFrame(audio_in_sample_rate=PIPELINE_IN_RATE))
+    await serializer.setup(pipeline_setup())
     assert await serializer.serialize(InterruptionFrame()) is None
 
 
 async def test_a_stream_id_supplied_up_front_addresses_control_frames_before_start() -> None:
     serializer = SiphonFrameSerializer(stream_id=wire.STREAM_ID)
-    await serializer.setup(StartFrame(audio_in_sample_rate=PIPELINE_IN_RATE))
+    await serializer.setup(pipeline_setup())
     assert await serializer.serialize(InterruptionFrame()) == wire.CLEAR_BARGE_IN
 
 
@@ -612,7 +632,7 @@ async def test_a_short_binary_frame_is_still_decoded() -> None:
 async def test_binary_audio_arriving_before_start_uses_the_configured_assumption() -> None:
     params = SiphonFrameSerializer.InputParams(wire_sample_rate=8000)
     serializer = SiphonFrameSerializer(params=params)
-    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    await serializer.setup(pipeline_setup(audio_in_sample_rate=8000))
     frame = await serializer.deserialize(tone(160, sample_rate=8000))
     assert isinstance(frame, InputAudioRawFrame)
     assert frame.sample_rate == 8000
