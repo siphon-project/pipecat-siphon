@@ -17,6 +17,7 @@ python3 -m tools.wait_for --timeout 60 port "${CONTROL_TAP_HOST:?}" "${CONTROL_T
 python3 -m tools.wait_for --timeout 120 http "${PROXY_READY_URL:?}"
 python3 -m tools.wait_for --timeout 120 port "${ROUNDTRIP_BOT_HOST:?}" "${BOT_PORT:?}"
 python3 -m tools.wait_for --timeout 120 port "${TURNTAKING_BOT_HOST:?}" "${BOT_PORT:?}"
+python3 -m tools.wait_for --timeout 120 port "${WIDEBAND_BOT_HOST:?}" "${BOT_PORT:?}"
 
 echo "== checking the fixtures carry what the analyser looks for =="
 python3 -m tools.make_fixtures --self-test

@@ -1,8 +1,8 @@
 # siphon-sip configuration for the integration harness.
 #
-# Two media profiles, one per scenario. They are deliberately near-identical: the only
-# difference is the engine-side turn detection, so a difference in behaviour between the two
-# runs can only come from those flags.
+# Three media profiles, one per scenario. They are deliberately near-identical: scenario 2 adds
+# the engine-side turn detection and scenario 3 adds the negotiated wire rate, so a difference in
+# behaviour between two runs can only come from those flags.
 #
 # Note two things about how siphon-sip reads this file:
 #
@@ -77,6 +77,30 @@ media:
         # last loud frame.
         ws_vad_hangover_ms: 300
       answer: *turntaking_flags
+
+    # Scenario 3. Scenario 1's profile with one flag more: the WebSocket wire rate, negotiated
+    # independently of the call's codec. The caller is still G.711 at 8 kHz and nothing about the
+    # SDP changes; the engine resamples 8 -> 16 kHz on the uplink and 16 -> 8 kHz on the downlink
+    # before re-encoding, and the bot's pipeline runs at 16 kHz so the serializer resamples
+    # nothing. Requires siphon-rtp 0.3.0 or newer for the flag, and a siphon-sip that carries it
+    # (1.8.x); an older proxy drops the key silently, which the scenario catches by asserting on
+    # the rate the `start` envelope announces rather than on the configuration.
+    wideband:
+      offer: &wideband_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        # Off for the same reasons as scenario 1: both would put a gain stage in the path the
+        # spectral assertion reads, and the point here is the rate, not the cleanup.
+        noise_suppression: false
+        echo_cancellation: false
+        ws_vad: false
+        ws_barge_in: false
+        # The whole scenario. 16000 is inside the engine's 8000-48000 band and a multiple of 1000,
+        # so a rejection here is a real refusal and not a validation quibble.
+        ws_sample_rate: 16000
+      answer: *wideband_flags
 
 log:
   level: info
