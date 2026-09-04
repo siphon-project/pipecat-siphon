@@ -4,16 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pipecat-siphon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pipecat frame serializer for the siphon-rtp media WebSocket protocol"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "SIPhon contributors" }]
 requires-python = ">=3.11"
 keywords = ["pipecat", "siphon-rtp", "voice-ai", "websocket", "rtp", "telephony"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -26,6 +27,12 @@ dependencies = [
     "pipecat-ai>=1.8.0,<2",
 ]
 
+[project.urls]
+Homepage = "https://github.com/siphon-project/pipecat-siphon"
+Repository = "https://github.com/siphon-project/pipecat-siphon"
+Changelog = "https://github.com/siphon-project/pipecat-siphon/blob/main/CHANGELOG.md"
+Issues = "https://github.com/siphon-project/pipecat-siphon/issues"
+
 [project.optional-dependencies]
 dev = [
     "mypy>=1.14",
@@ -37,6 +44,24 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pipecat_siphon"]
+
+# What a source distribution is for: the package, its tests, the examples, and the harness that
+# proves the whole thing against a real engine. Explicit, because the default sweeps in whatever is
+# lying in the tree -- a harness run leaves captures, container logs and the control transcript
+# under integration/artifacts, and those were going into the sdist (150 KB, most of it pcaps from
+# somebody's last local run).
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "tests",
+    "examples",
+    "integration",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = ["integration/artifacts"]
 
 [tool.ruff]
 line-length = 100
