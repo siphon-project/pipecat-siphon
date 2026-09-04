@@ -175,7 +175,12 @@ class EchoProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
-            marker = signals.bot_marker_frame(self._downlink_frames)
+            # The marker is generated at the frame's own rate, so the wideband scenario mixes a
+            # 2400 Hz tone built from 320 samples rather than 160. Reading the rate off the frame
+            # rather than off a constant is what keeps the two buffers the same length, which
+            # matters because _mix works over their *common* length and would otherwise shorten
+            # the echo without saying anything.
+            marker = signals.bot_marker_frame(self._downlink_frames, frame.sample_rate)
             mixed = _mix(frame.audio, marker)
             self._downlink_frames += 1
             await self.push_frame(
@@ -193,16 +198,18 @@ class EchoProcessor(FrameProcessor):
 class SpeakerProcessor(FrameProcessor):
     """Talk continuously until the caller interrupts (scenario 2)."""
 
-    def __init__(self, recorder: TraceRecorder, **kwargs: Any) -> None:
+    def __init__(self, recorder: TraceRecorder, sample_rate: int, **kwargs: Any) -> None:
         """Initialize the processor.
 
         Args:
             recorder: Recorder the speech-generation counters are reported to.
+            sample_rate: Rate the pipeline runs at, which the generated voice is built at.
             **kwargs: Passed to :class:`~pipecat.processors.frame_processor.FrameProcessor`.
 
         """
         super().__init__(**kwargs)
         self._recorder = recorder
+        self._sample_rate = sample_rate
         self._generated = 0
         self._speaking = False
         self._interrupted = False
@@ -231,8 +238,8 @@ class SpeakerProcessor(FrameProcessor):
                 break
             await self.push_frame(
                 OutputAudioRawFrame(
-                    audio=signals.bot_speech_frame(index),
-                    sample_rate=signals.SAMPLE_RATE,
+                    audio=signals.bot_speech_frame(index, self._sample_rate),
+                    sample_rate=self._sample_rate,
                     num_channels=1,
                 )
             )
@@ -255,8 +262,16 @@ def _mix(first: bytes, second: bytes) -> bytes:
     return bytes(out)
 
 
-def build_worker(mode: str, host: str, port: int, trace: TextIO) -> PipelineWorker:
-    """Assemble the transport, the serializer and the pipeline for one mode."""
+def build_worker(
+    mode: str, host: str, port: int, trace: TextIO, sample_rate: int
+) -> PipelineWorker:
+    """Assemble the transport, the serializer and the pipeline for one mode.
+
+    ``sample_rate`` is what the *pipeline* runs at. The wire rate is whatever the engine announces
+    in ``start``; the serializer reconciles the two. The harness always sets them equal, so no
+    resampler is built on either side of the socket and the frame clock stays exact -- see the
+    README's note on the SOXR buffering hazard.
+    """
     serializer = SiphonFrameSerializer(
         params=SiphonFrameSerializer.InputParams(
             # The engine's own VAD drives turn taking. "vad" is the mapping that feeds pipecat's
@@ -271,8 +286,8 @@ def build_worker(mode: str, host: str, port: int, trace: TextIO) -> PipelineWork
         params=SingleClientWebsocketServerParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=signals.SAMPLE_RATE,
-            audio_out_sample_rate=signals.SAMPLE_RATE,
+            audio_in_sample_rate=sample_rate,
+            audio_out_sample_rate=sample_rate,
             # Load-bearing. One WebSocket binary message becomes exactly one RTP packet in the
             # engine, whatever its length, and the RTP timestamp still advances by one ptime.
             # Pipecat's default of four 10 ms chunks would put 40 ms of audio in every packet
@@ -283,7 +298,9 @@ def build_worker(mode: str, host: str, port: int, trace: TextIO) -> PipelineWork
     )
 
     recorder = TraceRecorder(trace)
-    speaker: FrameProcessor = EchoProcessor() if mode == "echo" else SpeakerProcessor(recorder)
+    speaker: FrameProcessor = (
+        EchoProcessor() if mode == "echo" else SpeakerProcessor(recorder, sample_rate)
+    )
     # Explicit strategies. Pipecat's defaults would pull in the neural smart-turn analyser,
     # which is a model download and a wall-clock decision — neither belongs in a fixture-driven
     # test. The start strategy is the one that matters here: it turns the engine's
@@ -297,7 +314,7 @@ def build_worker(mode: str, host: str, port: int, trace: TextIO) -> PipelineWork
 
     @transport.event_handler("on_websocket_ready")
     async def on_websocket_ready(_transport: object) -> None:
-        recorder.record("listening", host=host, port=port, mode=mode)
+        recorder.record("listening", host=host, port=port, mode=mode, sample_rate=sample_rate)
         logger.info(f"harness bot listening on ws://{host}:{port}/ in {mode} mode")
 
     @transport.event_handler("on_client_connected")
@@ -317,24 +334,25 @@ def build_worker(mode: str, host: str, port: int, trace: TextIO) -> PipelineWork
             wire_encoding=serializer.media_format.encoding.value,
             wire_channels=serializer.media_format.channels,
             direction=serializer.direction.value,
+            pipeline_sample_rate=sample_rate,
         )
         logger.info("engine disconnected")
 
     return PipelineWorker(
         Pipeline([transport.input(), recorder, turn_processor, speaker, transport.output()]),
         params=PipelineParams(
-            audio_in_sample_rate=signals.SAMPLE_RATE,
-            audio_out_sample_rate=signals.SAMPLE_RATE,
+            audio_in_sample_rate=sample_rate,
+            audio_out_sample_rate=sample_rate,
         ),
     )
 
 
-async def main(mode: str, host: str, port: int, trace_path: Path) -> None:
+async def main(mode: str, host: str, port: int, trace_path: Path, sample_rate: int) -> None:
     """Run the bot until the process is stopped."""
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     with trace_path.open("w", encoding="utf-8") as trace:
         runner = WorkerRunner()
-        await runner.add_workers(build_worker(mode, host, port, trace))
+        await runner.add_workers(build_worker(mode, host, port, trace, sample_rate))
         await runner.run()
 
 
@@ -345,12 +363,26 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9001)
     parser.add_argument("--trace", required=True, help="JSON Lines trace file to write")
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=signals.SAMPLE_RATE,
+        help="rate the pipeline runs at; match it to the wire rate the engine will negotiate",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_arguments()
     try:
-        asyncio.run(main(arguments.mode, arguments.host, arguments.port, Path(arguments.trace)))
+        asyncio.run(
+            main(
+                arguments.mode,
+                arguments.host,
+                arguments.port,
+                Path(arguments.trace),
+                arguments.sample_rate,
+            )
+        )
     except KeyboardInterrupt:
         sys.exit(0)

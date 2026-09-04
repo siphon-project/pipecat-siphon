@@ -6,10 +6,10 @@ that one control command. If the dial fails the engine tears the half-built call
 command errors, so reaching `call.answer` below already means the socket is up. There is no B
 leg and there never will be one; the bot is the far end of the call.
 
-The scenario is selected by the request URI's user part, so one proxy serves both. Each maps to
-its own media profile (they differ in whether the engine's VAD and barge-in are on) and its own
-bot, whose address comes from the environment because under compose the engine's loopback is
-not the bot's.
+The scenario is selected by the request URI's user part, so one proxy serves all three. Each maps
+to its own media profile (they differ in whether the engine's VAD and barge-in are on, and in
+whether the WebSocket wire rate is negotiated away from the codec's) and its own bot, whose
+address comes from the environment because under compose the engine's loopback is not the bot's.
 """
 
 import os
@@ -26,6 +26,10 @@ SCENARIOS = {
     "turntaking": (
         "turntaking",
         os.environ.get("TURNTAKING_WS_URI", "ws://127.0.0.1:9002/stream?call={call_id}"),
+    ),
+    "wideband": (
+        "wideband",
+        os.environ.get("WIDEBAND_WS_URI", "ws://127.0.0.1:9003/stream?call={call_id}"),
     ),
 }
 

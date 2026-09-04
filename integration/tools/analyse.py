@@ -12,6 +12,7 @@ Run one scenario at a time::
 
     python3 -m tools.analyse roundtrip  --artifacts /harness/artifacts
     python3 -m tools.analyse turntaking --artifacts /harness/artifacts
+    python3 -m tools.analyse wideband   --artifacts /harness/artifacts
 
 Every check prints its measured value whether it passes or fails, and the whole measurement set
 is written to ``<scenario>-analysis.json``. A red run that only says "assertion failed" costs
@@ -162,8 +163,16 @@ def check_engine_state(report: Report, metrics_url: str) -> None:
     )
 
 
-def check_wire_format(report: Report, trace: list[dict[str, Any]]) -> None:
-    """Assert the bridge announced and used the format the fixtures are built for."""
+def check_wire_format(
+    report: Report, trace: list[dict[str, Any]], wire_sample_rate: int = signals.SAMPLE_RATE
+) -> None:
+    """Assert the bridge announced and used the format this scenario negotiated.
+
+    ``wire_sample_rate`` is the rate the *WebSocket* carries, which is the leg's codec rate unless
+    the profile asked for another one with ``ws_sample_rate``. Everything here is read out of the
+    bot's trace, so it is what the serializer actually delivered rather than what the engine says
+    it sent.
+    """
     print("websocket")
     disconnected = _first(trace, "engine_disconnected")
     if not report.check(
@@ -175,11 +184,15 @@ def check_wire_format(report: Report, trace: list[dict[str, Any]]) -> None:
     report.record("stream_id", disconnected.get("stream_id"))
     report.record("call_id", disconnected.get("call_id"))
     for name, expected in (
-        ("wire_sample_rate", signals.SAMPLE_RATE),
+        ("wire_sample_rate", wire_sample_rate),
         ("wire_ptime", signals.PTIME_MS),
         ("wire_encoding", "L16"),
         ("wire_channels", 1),
         ("direction", "duplex"),
+        # Equal to the wire rate on purpose: with the two the same, the serializer builds no
+        # resampler in either direction, so a frame that arrives late or short is the engine's
+        # doing and not pipecat's SOXR buffering.
+        ("pipeline_sample_rate", wire_sample_rate),
     ):
         actual = disconnected.get(name)
         report.record(name, actual)
@@ -194,10 +207,19 @@ def check_wire_format(report: Report, trace: list[dict[str, Any]]) -> None:
     report.record("uplink_frames", len(audio))
     sizes = {record["bytes"] for record in audio}
     report.record("uplink_frame_bytes", sorted(sizes))
-    expected_bytes = signals.FRAME_SAMPLES * 2
+    expected_bytes = signals.frame_samples(wire_sample_rate) * 2
     report.check(
         sizes in ({expected_bytes}, set()),
         f"uplink frames were {sorted(sizes)} bytes, wanted only {expected_bytes}",
+    )
+    # The frame geometry above is a byte count; this is the rate the frames claim to be in. A
+    # bridge that framed 20 ms at one rate and labelled it another would pass one and fail the
+    # other.
+    rates = {record["sample_rate"] for record in audio}
+    report.record("uplink_frame_sample_rates", sorted(rates))
+    report.check(
+        rates in ({wire_sample_rate}, set()),
+        f"uplink frames were labelled {sorted(rates)} Hz, wanted only {wire_sample_rate}",
     )
 
 
@@ -254,13 +276,24 @@ def decoded_audio(packets: list[RtpPacket]) -> bytes:
     return signals.alaw_to_pcm(b"".join(packet.payload for packet in packets))
 
 
-def analyse_roundtrip(report: Report, artifacts: Path, metrics_url: str) -> None:
-    """Scenario 1: the caller's tones came back, through the bot."""
-    trace = _load_trace(artifacts / "roundtrip-bot.jsonl")
-    check_wire_format(report, trace)
+def analyse_echo_scenario(
+    report: Report,
+    artifacts: Path,
+    metrics_url: str,
+    scenario: str,
+    wire_sample_rate: int = signals.SAMPLE_RATE,
+) -> None:
+    """Assert the caller's tones came back, through the bot, at the pitch they went out at.
+
+    Shared by scenario 1 and scenario 3: the caller, the fixture and every assertion are the same,
+    and the only variable is the rate the WebSocket carries. That is deliberate -- two runs that
+    differ in one negotiated number are comparable, two harnesses are not.
+    """
+    trace = _load_trace(artifacts / f"{scenario}-bot.jsonl")
+    check_wire_format(report, trace, wire_sample_rate)
 
     print("capture")
-    packets = read_rtp(str(artifacts / "roundtrip-capture.pcap"))
+    packets = read_rtp(str(artifacts / f"{scenario}-capture.pcap"))
     _, downlink = split_rtp(report, packets)
     check_downlink_stream(report, downlink, expected=signals.ROUNDTRIP_FRAMES)
     if not downlink:
@@ -297,7 +330,43 @@ def analyse_roundtrip(report: Report, artifacts: Path, metrics_url: str) -> None
     # emitted it, and a single-leg answer has no second party and no relay path back, so there
     # is nowhere else in the topology it could have come from.
 
+    if wire_sample_rate != signals.SAMPLE_RATE:
+        # A downlink rendered at the wrong rate is the silent failure of a negotiated wire rate:
+        # the samples are right, the audio is present, and it plays at the wrong speed and pitch.
+        # The bot builds its marker at the wire rate, so if the engine encoded that PCM into the
+        # 8 kHz codec sample-for-sample the tone would arrive an octave down, at
+        # BOT_MARKER_HALF_RATE_HZ. Asserting the marker bin is full does not catch that on its
+        # own; asserting the ghost bin is empty does.
+        ghost = signals.goertzel_power(pcm, signals.BOT_MARKER_HALF_RATE_HZ)
+        marker = signals.goertzel_power(pcm, signals.BOT_MARKER_HZ)
+        ratio = marker / ghost if ghost else float("inf")
+        ghost_name = f"bot_marker_half_rate_{int(signals.BOT_MARKER_HALF_RATE_HZ)}hz_power"
+        report.record(ghost_name, round(ghost, 1))
+        report.record("bot_marker_rate_discrimination", round(ratio, 1))
+        report.check(
+            ratio >= MINIMUM_TONE_RATIO,
+            f"the marker is only {ratio:.1f}x its half-rate ghost at "
+            f"{signals.BOT_MARKER_HALF_RATE_HZ:.0f} Hz, wanted {MINIMUM_TONE_RATIO:.0f}x -- the "
+            "downlink is being rendered at the wrong rate",
+        )
+
     check_engine_state(report, metrics_url)
+
+
+def analyse_roundtrip(report: Report, artifacts: Path, metrics_url: str) -> None:
+    """Scenario 1: the wire follows the codec, so nothing is resampled anywhere."""
+    analyse_echo_scenario(report, artifacts, metrics_url, "roundtrip", signals.SAMPLE_RATE)
+
+
+def analyse_wideband(report: Report, artifacts: Path, metrics_url: str) -> None:
+    """Scenario 3: the same call, with the wire negotiated up to 16 kHz by ``ws_sample_rate``.
+
+    The caller is an unchanged 8 kHz G.711 phone, so the engine resamples on both halves: leg to
+    wire on the uplink, wire back to the leg's codec on the downlink. Everything scenario 1
+    asserts still has to hold, plus the pitch check that says the downlink came back at the rate
+    it was rendered at.
+    """
+    analyse_echo_scenario(report, artifacts, metrics_url, "wideband", signals.WIDEBAND_WIRE_RATE)
 
 
 def _speech_window(trace: list[dict[str, Any]]) -> tuple[int, int] | None:
@@ -490,7 +559,7 @@ the expected value out of the configuration under test would make the assertion 
 def main() -> int:
     """Analyse one scenario and report."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scenario", choices=("roundtrip", "turntaking"))
+    parser.add_argument("scenario", choices=("roundtrip", "turntaking", "wideband"))
     parser.add_argument("--artifacts", required=True, help="directory the run wrote into")
     parser.add_argument("--metrics-url", default="http://172.28.7.10:9091/metrics")
     arguments = parser.parse_args()
@@ -501,6 +570,8 @@ def main() -> int:
     try:
         if arguments.scenario == "roundtrip":
             analyse_roundtrip(report, artifacts, arguments.metrics_url)
+        elif arguments.scenario == "wideband":
+            analyse_wideband(report, artifacts, arguments.metrics_url)
         else:
             analyse_turntaking(report, artifacts, arguments.metrics_url)
     except (TsharkError, FileNotFoundError, json.JSONDecodeError) as error:

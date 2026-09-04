@@ -1,11 +1,13 @@
 # The four-way integration stack: SIPp -> siphon-sip -> siphon-rtp -> a pipecat bot.
 #
-# Every component is the real thing. siphon-sip and siphon-rtp are built from the checkouts
-# beside this repository (override with SIPHON_SIP_PATH / SIPHON_RTP_PATH), the bot is this
-# package's serializer inside a real pipecat pipeline, and the caller is SIPp playing a real
-# RTP capture. Nothing in the media or signalling path is a stand-in. The one extra hop, the
-# control tap, forwards every byte between the proxy and the engine unchanged and exists only
-# so a failed run leaves a readable transcript behind.
+# Every component is the real thing. By default siphon-sip and siphon-rtp are the projects'
+# **published release images**, so a fresh clone of this repository can run the whole harness
+# with nothing beside it. Point SIPHON_SIP_PATH / SIPHON_RTP_PATH at a checkout to build that
+# component from source instead -- which is what you want when the thing under test is an engine
+# change on your own disk. Either way the bot is this package's serializer inside a real pipecat
+# pipeline and the caller is SIPp playing a real RTP capture; nothing in the media or signalling
+# path is a stand-in. The one extra hop, the control tap, forwards every byte between the proxy
+# and the engine unchanged and exists only so a failed run leaves a readable transcript behind.
 #
 # The subnet is deliberately not one of the ranges the sibling repositories' harnesses use, so
 # this stack can run beside them.
@@ -22,16 +24,17 @@ x-artifacts: &artifacts
 services:
 
   # ── The media engine under test ──────────────────────────────────────────────────────────
-  # Built from the local checkout, not pulled: the harness has to test the engine on the
-  # developer's disk. --relay-bind-ip is load-bearing. The UDP backend binds loopback by
+  # The published release image by default; `SIPHON_RTP_PATH=... ./run.sh` builds the checkout
+  # there instead and run.sh retags it, which is how you test an engine change on your own disk.
+  # --relay-bind-ip is load-bearing. The UDP backend binds loopback by
   # default (a NIC-free convenience for its own tests), and without this the engine would
   # answer with c=IN IP4 127.0.0.1 and no RTP on this network could ever reach it. The SIPp
   # scenarios assert on this exact address so that regression fails loudly instead of quietly.
   engine:
+    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:0.4.3}
     build:
       context: ${SIPHON_RTP_PATH:-../../siphon-rtp}
       target: runtime
-    image: pipecat-siphon-integration/siphon-rtp:local
     command:
       - "--control"
       - "0.0.0.0:8080"
@@ -80,9 +83,9 @@ services:
 
   # ── The B2BUA / proxy under test ─────────────────────────────────────────────────────────
   proxy:
+    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:1.8.1}
     build:
       context: ${SIPHON_SIP_PATH:-../../siphon}
-    image: pipecat-siphon-integration/siphon-sip:local
     depends_on:
       - control-tap
     volumes:
@@ -100,6 +103,7 @@ services:
       SIPHON_RTP_CONTROL: "172.28.7.15:8080"
       ROUNDTRIP_WS_URI: "ws://172.28.7.31:9001/stream?call={call_id}"
       TURNTAKING_WS_URI: "ws://172.28.7.32:9001/stream?call={call_id}"
+      WIDEBAND_WS_URI: "ws://172.28.7.33:9001/stream?call={call_id}"
       RUST_LOG: "info,siphon::rtpengine=debug,siphon::script=debug"
     networks:
       harness:
@@ -143,6 +147,28 @@ services:
     networks:
       harness:
         ipv4_address: 172.28.7.32
+
+  # Scenario 3's bot is scenario 1's, run at 16 kHz. The engine negotiates the same rate with
+  # `ws_sample_rate`, so the serializer builds no resampler and the only conversion in the path is
+  # the engine's own, on both sides of the leg's 8 kHz G.711 codec.
+  bot-wideband:
+    image: pipecat-siphon-integration/bot:local
+    depends_on:
+      - bot-echo
+    command:
+      - "--mode"
+      - "echo"
+      - "--port"
+      - "9001"
+      - "--sample-rate"
+      - "16000"
+      - "--trace"
+      - /harness/artifacts/wideband-bot.jsonl
+    volumes:
+      - *artifacts
+    networks:
+      harness:
+        ipv4_address: 172.28.7.33
 
   # ── The caller ───────────────────────────────────────────────────────────────────────────
   # Started per scenario by run.sh (`docker compose run --rm uac <scenario>`), never left up.

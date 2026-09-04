@@ -32,12 +32,12 @@ from pipecat.frames.frames import (
     InterruptionWorkerFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
-    StartFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
 
 from pipecat_siphon.protocol import (
@@ -101,7 +101,7 @@ class SiphonFrameSerializer(FrameSerializer):
         Parameters
         ----------
             sample_rate: Optional override for the pipeline input sample rate. Defaults to the
-                ``StartFrame``'s ``audio_in_sample_rate``.
+                ``audio_in_sample_rate`` the pipeline hands to ``setup()``.
             wire_sample_rate: Wire rate assumed before the engine's ``start`` envelope arrives.
                 Once ``start`` is seen, its ``sampleRate`` wins unconditionally.
             wire_ptime: Packetization time in milliseconds assumed before ``start``.
@@ -234,9 +234,9 @@ class SiphonFrameSerializer(FrameSerializer):
         """Return the informational track labels the engine announced."""
         return self._tracks
 
-    # `FrameSerializer.setup(frame)` already narrows `BaseObject.setup(task_manager)` in pipecat
+    # `FrameSerializer.setup(setup)` already narrows `BaseObject.setup(task_manager)` in pipecat
     # itself; this override matches the serializer signature exactly.
-    async def setup(self, frame: StartFrame) -> None:  # type: ignore[override]
+    async def setup(self, setup: FrameProcessorSetup) -> None:  # type: ignore[override]
         """Record the pipeline's sample rates and reconcile them against the wire rate.
 
         The engine's ``start`` envelope usually arrives *after* this: the transport must be
@@ -245,11 +245,12 @@ class SiphonFrameSerializer(FrameSerializer):
         reconciled per frame by the resamplers.
 
         Args:
-            frame: The ``StartFrame`` carrying the pipeline configuration.
+            setup: The pipeline configuration the transport hands every processor. Pipecat 1.8
+                moved the sample rates here from ``StartFrame``, where reading them is deprecated.
 
         """
-        self._pipeline_in_sample_rate = self._params.sample_rate or frame.audio_in_sample_rate
-        self._pipeline_out_sample_rate = frame.audio_out_sample_rate
+        self._pipeline_in_sample_rate = self._params.sample_rate or setup.audio_in_sample_rate
+        self._pipeline_out_sample_rate = setup.audio_out_sample_rate
         self._log_rate_reconciliation()
 
     def _log_rate_reconciliation(self) -> None:
@@ -502,7 +503,9 @@ class SiphonFrameSerializer(FrameSerializer):
             # drain a queued frame. CancelWorkerFrame is the one frame that reliably ends the
             # pipeline from here, and it carries the reason for the logs.
             return [CancelWorkerFrame(reason=f"{message.code}: {message.message}")]
-        return [ErrorFrame(error=f"{message.code}: {message.message}", fatal=False)]
+        # `ErrorFrame.fatal` is deprecated in pipecat 1.8 and goes away in 2.0. Nothing is lost:
+        # false was the default, and the engine's own fatal errors take the branch above.
+        return [ErrorFrame(error=f"{message.code}: {message.message}")]
 
     async def _deserialize_audio(self, payload: bytes) -> InputAudioRawFrame | None:
         """Convert one binary wire frame into a pipecat input audio frame."""

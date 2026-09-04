@@ -16,6 +16,7 @@ import math
 from dataclasses import dataclass
 
 __all__ = [
+    "BOT_MARKER_HALF_RATE_HZ",
     "BOT_MARKER_HZ",
     "BOT_SPEECH_HZ",
     "CALLER_TONES_HZ",
@@ -28,6 +29,7 @@ __all__ = [
     "alaw_to_pcm",
     "bot_marker_frame",
     "bot_speech_frame",
+    "frame_samples",
     "goertzel_power",
     "pcm_to_alaw",
     "rms",
@@ -36,6 +38,7 @@ __all__ = [
     "speech_frame",
     "tone_frame",
     "turntaking_fixture",
+    "wideband_fixture",
 ]
 
 SAMPLE_RATE = 8000
@@ -47,6 +50,17 @@ PTIME_MS = 20
 
 FRAME_SAMPLES = SAMPLE_RATE // 1000 * PTIME_MS
 """160 samples per frame."""
+
+WIDEBAND_WIRE_RATE = 16000
+"""Wire rate the wideband scenario negotiates with ``ws_sample_rate``, independent of the call's
+codec. The caller stays G.711 at :data:`SAMPLE_RATE`; the engine resamples in both directions, so
+this is the rate the bot's pipeline and the WebSocket's binary frames run at, and nothing else."""
+
+
+def frame_samples(sample_rate: int = SAMPLE_RATE) -> int:
+    """Return the samples in one :data:`PTIME_MS` frame at ``sample_rate``."""
+    return sample_rate // 1000 * PTIME_MS
+
 
 SAMPLE_WIDTH = 2
 """Bytes per linear PCM sample."""
@@ -64,6 +78,13 @@ finding it in the audio that comes back proves the samples went *through the bot
 around it somewhere inside the engine."""
 
 BOT_MARKER_AMPLITUDE = 3000
+
+BOT_MARKER_HALF_RATE_HZ = BOT_MARKER_HZ * SAMPLE_RATE / WIDEBAND_WIRE_RATE
+"""Where the marker lands if a 16 kHz downlink is encoded into an 8 kHz codec sample-for-sample:
+1200 Hz, the tone played at half speed. This is the exact shape of the downlink-rate defect the
+engine fixed in 0.3.0, and it is silent -- the audio is present, correct and at the wrong pitch --
+so the wideband scenario asserts this bin is *empty* rather than trusting that the right one is
+full."""
 
 CONTROL_HZ = 3300.0
 """A bin the fixture never excites. Comparing the tone bins against this one turns "there is
@@ -124,19 +145,28 @@ def _pack(samples: list[int]) -> bytes:
     )
 
 
-def tone_frame(frame_index: int, tones_hz: tuple[float, ...], amplitude: int) -> bytes:
+def tone_frame(
+    frame_index: int,
+    tones_hz: tuple[float, ...],
+    amplitude: int,
+    sample_rate: int = SAMPLE_RATE,
+) -> bytes:
     """Return one frame of a sum of continuous tones.
 
     Phase is derived from the absolute sample index rather than carried in a state variable, so
-    frames are independent and the waveform is continuous across frame boundaries.
+    frames are independent and the waveform is continuous across frame boundaries. ``sample_rate``
+    is the rate the *frame* is in, which on the wideband scenario is the negotiated wire rate
+    rather than the caller's codec rate -- the frequencies are unchanged, the samples per frame
+    are not.
     """
-    start = frame_index * FRAME_SAMPLES
+    count = frame_samples(sample_rate)
+    start = frame_index * count
     samples = []
-    for offset in range(FRAME_SAMPLES):
+    for offset in range(count):
         index = start + offset
         value = 0.0
         for frequency in tones_hz:
-            value += amplitude * math.sin(2.0 * math.pi * frequency * index / SAMPLE_RATE)
+            value += amplitude * math.sin(2.0 * math.pi * frequency * index / sample_rate)
         samples.append(round(value))
     return _pack(samples)
 
@@ -172,14 +202,14 @@ def speech_frame(frame_index: int, burst_start_frame: int) -> bytes:
     return _pack(samples)
 
 
-def bot_marker_frame(frame_index: int) -> bytes:
-    """Return one frame of the round-trip bot's marker tone."""
-    return tone_frame(frame_index, (BOT_MARKER_HZ,), BOT_MARKER_AMPLITUDE)
+def bot_marker_frame(frame_index: int, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Return one frame of the round-trip bot's marker tone, at the pipeline's own rate."""
+    return tone_frame(frame_index, (BOT_MARKER_HZ,), BOT_MARKER_AMPLITUDE, sample_rate)
 
 
-def bot_speech_frame(frame_index: int) -> bytes:
-    """Return one frame of the turn-taking bot's "voice"."""
-    return tone_frame(frame_index, (BOT_SPEECH_HZ,), BOT_SPEECH_AMPLITUDE)
+def bot_speech_frame(frame_index: int, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Return one frame of the turn-taking bot's "voice", at the pipeline's own rate."""
+    return tone_frame(frame_index, (BOT_SPEECH_HZ,), BOT_SPEECH_AMPLITUDE, sample_rate)
 
 
 ROUNDTRIP_FRAMES = 200
@@ -205,6 +235,17 @@ def roundtrip_fixture() -> Fixture:
         for index in range(ROUNDTRIP_FRAMES)
     )
     return Fixture(name="roundtrip", frames=frames)
+
+
+def wideband_fixture() -> Fixture:
+    """Return the scenario 3 fixture: the round-trip signal again, under the wideband name.
+
+    Deliberately the same caller-side audio as :func:`roundtrip_fixture`, because the caller is
+    the one thing that does *not* change between the two scenarios: it is a G.711 A-law phone at
+    8 kHz either way. The only difference is the wire rate the engine negotiates with the bot, so
+    reusing the signal is what makes the two runs comparable.
+    """
+    return Fixture(name="wideband", frames=roundtrip_fixture().frames)
 
 
 def turntaking_fixture() -> Fixture:

@@ -36,8 +36,15 @@ from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import SiphonFrameSerializer
 
-# The wire rate the engine will announce in `start`. Set `ws_sample_rate` on the offer profile to
-# pick it; leave it out and the engine uses the leg's own codec rate (8000 for G.711).
+# The wire rate the engine will announce in `start`, which is what this pipeline is built to run
+# at so nothing has to be resampled. Leave the offer profile alone and the engine uses the leg's own
+# codec rate (8000 for G.711); from siphon-rtp 0.3.0 a controller picks it independently of the
+# codec with `ws_sample_rate`, in which case set both to the same number:
+#
+#     "profile": {"ws_uri": "ws://127.0.0.1:9001/stream", "ws_sample_rate": 16000}
+#
+# The serializer reads the real rate out of `start` either way and resamples if they disagree; this
+# constant only decides what the pipeline itself runs at.
 WIRE_SAMPLE_RATE = 8000
 
 

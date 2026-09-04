@@ -11,7 +11,7 @@
 # saying what never happened.
 set -eu
 
-SCENARIO="${1:?usage: run_scenario.sh <roundtrip|turntaking>}"
+SCENARIO="${1:?usage: run_scenario.sh <roundtrip|turntaking|wideband>}"
 ARTIFACTS="${ARTIFACTS_DIR:-/harness/artifacts}"
 PROXY="${PROXY_ADDRESS:?PROXY_ADDRESS is required}"
 LOCAL="${UAC_ADDRESS:?UAC_ADDRESS is required}"

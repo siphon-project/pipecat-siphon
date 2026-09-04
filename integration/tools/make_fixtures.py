@@ -83,6 +83,46 @@ def _self_test() -> int:
     if leak_ratio < MINIMUM_TONE_MARGIN:
         failures.append(f"the caller fixture leaks into the marker bin ({leak_ratio:.1f}x)")
 
+    # The wideband scenario asserts the marker's half-rate ghost bin is *empty*, which proves
+    # nothing unless the caller's own fixture is quiet there too. 1200 Hz sits 100 Hz off the
+    # caller's 1300 Hz tone, close enough that this has to be measured rather than assumed.
+    ghost = signals.goertzel_power(coded, signals.BOT_MARKER_HALF_RATE_HZ)
+    ghost_ratio = marker_power / ghost if ghost else float("inf")
+    print(
+        f"caller leakage into the half-rate ghost bin "
+        f"({signals.BOT_MARKER_HALF_RATE_HZ:.0f} Hz): power {ghost:.1f}, "
+        f"marker is {ghost_ratio:.0f}x it"
+    )
+    if ghost_ratio < MINIMUM_TONE_MARGIN:
+        failures.append(
+            f"the caller fixture leaks into the half-rate ghost bin ({ghost_ratio:.1f}x)"
+        )
+
+    # The bot builds its marker at whatever rate the pipeline runs at. At the wideband rate that
+    # is 320 samples a frame rather than 160, and the tone still has to be where the analyser
+    # looks for it -- at 2400 Hz, not at half of it.
+    wide_marker = b"".join(
+        signals.bot_marker_frame(index, signals.WIDEBAND_WIRE_RATE)
+        for index in range(signals.ROUNDTRIP_FRAMES)
+    )
+    wide_power = signals.goertzel_power(
+        wide_marker, signals.BOT_MARKER_HZ, signals.WIDEBAND_WIRE_RATE
+    )
+    wide_control = signals.goertzel_power(
+        wide_marker, signals.CONTROL_HZ, signals.WIDEBAND_WIRE_RATE
+    )
+    wide_ratio = wide_power / wide_control if wide_control else float("inf")
+    print(
+        f"bot marker at {signals.WIDEBAND_WIRE_RATE} Hz: power {wide_power:.1f}, "
+        f"{wide_ratio:.0f}x the control bin"
+    )
+    if wide_ratio < MINIMUM_TONE_MARGIN:
+        failures.append(f"the wideband marker is only {wide_ratio:.1f}x the control bin")
+    expected_bytes = signals.frame_samples(signals.WIDEBAND_WIRE_RATE) * 2
+    actual_bytes = len(signals.bot_marker_frame(0, signals.WIDEBAND_WIRE_RATE))
+    if actual_bytes != expected_bytes:
+        failures.append(f"a wideband marker frame is {actual_bytes} bytes, wanted {expected_bytes}")
+
     turntaking = signals.turntaking_fixture()
     assert turntaking.speech_frames is not None
     burst_start, burst_end = turntaking.speech_frames
@@ -122,6 +162,7 @@ def main() -> int:
     manifest = [
         _write(signals.roundtrip_fixture(), directory),
         _write(signals.turntaking_fixture(), directory),
+        _write(signals.wideband_fixture(), directory),
     ]
     (directory / "fixtures.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for entry in manifest:

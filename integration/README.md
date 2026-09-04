@@ -18,8 +18,8 @@ Everything in that picture is the real thing:
 | Component | What runs |
 |---|---|
 | Caller | `sipp` 3.7 playing a generated RTP capture with `play_pcap_audio` |
-| B2BUA | siphon-sip, built from the checkout beside this repository, answering with `rtpengine.answer_local` |
-| Media engine | siphon-rtp, built from the checkout beside this repository, UDP datapath |
+| B2BUA | siphon-sip, the published release image, answering with `rtpengine.answer_local` |
+| Media engine | siphon-rtp, the published release image, UDP datapath |
 | Bot | a pipecat `Pipeline` behind `SiphonFrameSerializer` from `src/`, on pipecat's own WebSocket server transport |
 | Capture oracle | `tshark`, reading the RTP back out of a capture taken on the caller's own interface |
 
@@ -36,7 +36,7 @@ cd integration
 ./run.sh
 ```
 
-That builds what needs building, brings the stack up, runs both scenarios, tears it down, and
+That builds what needs building, brings the stack up, runs all three scenarios, tears it down, and
 prints pass/fail per scenario. Everything a failure needs is left in `artifacts/`.
 
 ```bash
@@ -46,13 +46,27 @@ prints pass/fail per scenario. Everything a failure needs is left in `artifacts/
 ./run.sh --no-clean               # keep the previous run's artifacts
 ```
 
-Requirements: Docker with the compose plugin, and checkouts of siphon-sip and siphon-rtp beside
-this repository. Point `SIPHON_SIP_PATH` / `SIPHON_RTP_PATH` elsewhere if yours are not there.
-Nothing else is needed on the host: SIPp, tshark and the analyser all live in the UAC image.
+Requirements: Docker with the compose plugin. That is the whole list -- siphon-sip and
+siphon-rtp are pulled as their **published release images**, and SIPp, tshark and the analyser
+live in the UAC image, so a fresh clone of this repository runs the harness with nothing beside
+it. Only the bot and the UAC are built here, from this repository, in seconds.
 
-The first build compiles both Rust projects and takes a while. After that the layer cache makes
-it seconds. `CARGO_BUILD_JOBS` defaults to 4 rather than to whatever cargo picks, because a
-fresh checkout building jemalloc-sys at full parallelism is a known way to lose a build.
+To test a checkout of the engine or the proxy instead -- which is the point of the harness when
+*you* are the one changing them -- name it and that component is built from source:
+
+```bash
+SIPHON_RTP_PATH=../../siphon-rtp ./run.sh    # engine from source, proxy from the release
+SIPHON_SIP_PATH=../../siphon ./run.sh        # proxy from source, engine from the release
+```
+
+That first build compiles a Rust project and takes a while; the layer cache makes later ones
+quick. `CARGO_BUILD_JOBS` defaults to 4 rather than to whatever cargo picks, because a fresh
+checkout building jemalloc-sys at full parallelism is a known way to lose a build. To run against
+a different release without a checkout, set `SIPHON_RTP_IMAGE` / `SIPHON_SIP_IMAGE`.
+
+Scenario 3 needs siphon-rtp **0.3.0+** for `ws_sample_rate` and siphon-sip **1.7.0+** to carry it
+through; the first two scenarios run against anything from 0.2.x on. The pinned defaults are well
+past both.
 
 ## Scenario 1 — audio round trip
 
@@ -106,6 +120,32 @@ on the VAD edge without a round trip (`ws_barge_in`), which is what the 19 ms co
 the serializer's `InterruptionFrame` → `clear` round trip is asserted separately through the
 engine's `mark` reply. Neither one alone would prove the other works.
 
+## Scenario 3 — the negotiated wire rate
+
+The same call as scenario 1, with one flag added to the media profile: `ws_sample_rate: 16000`.
+The caller is unchanged — an 8 kHz G.711 A-law phone playing the same two-tone fixture — so the
+engine resamples on both halves of the leg, 8 → 16 kHz on the uplink and 16 → 8 kHz on the
+downlink before re-encoding, and the bot's pipeline runs at 16 kHz so the serializer resamples
+nothing.
+
+| Assertion | What it rules out |
+|---|---|
+| The `start` envelope announced **16000 Hz**, and every uplink frame is exactly **640 bytes** | A flag that was accepted and ignored. This is also why the assertion reads the rate off the wire rather than out of `proxy/siphon.yaml` |
+| Every uplink frame is *labelled* 16 kHz by the serializer, and the bot's pipeline ran at the same rate | A bridge that framed 20 ms at one rate and announced another, and a run where pipecat quietly resampled instead of the engine |
+| 500 Hz and 1300 Hz come back to the caller, measured by Goertzel against the empty 3300 Hz control bin, as in scenario 1 | The two conversions losing or mangling the caller's own audio |
+| The bot's 2400 Hz marker comes back, **and its half-rate ghost at 1200 Hz does not** | The downlink being rendered at the wrong rate. The bot builds the marker at 16 kHz; if the engine encoded that PCM into the 8 kHz codec sample-for-sample the tone would arrive an octave down, with the audio present and correct-sounding but at the wrong speed and pitch. That is exactly the defect siphon-rtp fixed in 0.3.0, and "the marker is there" does not catch it on its own |
+| Packet count, single SSRC, no sequence gaps, ~50 packets/second, clean teardown | The same things scenario 1 rules out; the rate conversion must not perturb the frame clock |
+
+The half-rate check is the one that earns the scenario. A wire-rate negotiation that silently
+does nothing still passes a connectivity test, and a downlink rendered at the wrong rate still
+passes "there is audio coming back".
+
+Measured on the development machine, against siphon-rtp 0.4.3 and siphon-sip on 1.8.x: the wire
+came up at 16000 Hz with every one of 200 uplink frames at 640 bytes, 500 Hz returned at **28 900x**
+the control bin and 1300 Hz at **29 100x**, the bot's marker at **7 300x** — and the marker sat
+**4 500x** above its 1200 Hz ghost, against a required 20x. 200 downlink packets, one SSRC, zero
+sequence gaps, 50.3 packets/second.
+
 ## Why the timings are trustworthy
 
 Every turn-edge measurement is expressed in **uplink frames**, not seconds. One uplink binary
@@ -148,21 +188,29 @@ docker compose run --rm --entrypoint python3 uac -m tools.analyse roundtrip \
 **Not yet. Run it manually or nightly.** It is deliberately not wired into a workflow.
 
 In its favour: six consecutive full runs (twelve scenario executions) passed with no flakes, a
-warm-cache run takes about a minute for both scenarios, and the measurements are tight and
+warm-cache run takes a couple of minutes for all three, and the measurements are tight and
 repeatable (the VAD edges landed on exactly the predicted frame every time; the barge-in
-latency varied between 11 and 19 ms against a 250 ms budget).
+latency varied between 11 and 19 ms against a 250 ms budget). It has also already earned its
+keep: the first run against siphon-rtp 0.3.0 came back red on scenario 2 because the engine's
+new detector-selection path built the energy gate's trailing hangover in milliseconds instead of
+ptime frames, so `speech_stopped` — the turn endpoint — never arrived inside a five-second call.
+The engine's own unit tests were green throughout; they covered the conversion helper, and the
+bug was in the wiring around it. Fixed in siphon-rtp 0.3.1.
 
 Against it, and the reason it stays manual:
 
-* **It builds two Rust projects from sibling checkouts.** A GitHub runner has neither, so
-  gating on it means pinning published images instead, at which point the harness stops
-  testing the engine you are working on, which is most of the point.
-* **The cold build is long.** Warm it is fast; cold it is two Rust compilations.
 * **It needs `NET_ADMIN`/`NET_RAW`** for the capture, which not every runner allows.
+* **Release images test the release, not your engine.** On a runner the harness would run
+  against the pinned images, which is the right thing for *this* repository (the serializer is
+  what changes here) but means a red run can no longer be blamed on an engine change in flight.
+  That is a feature for a package CI and a limitation for engine work.
+* **The pinned tags go stale.** Nothing fails when a new engine ships; the harness just keeps
+  testing the old one until someone bumps `docker-compose.yaml`.
 
-If it is ever gated, gate it on a self-hosted runner with the sibling checkouts present, as a
-nightly job rather than per-PR, and keep the artifact upload, because the numbers are only
-useful if you can read them after a red run.
+The old objection -- that it built two Rust projects from sibling checkouts a runner does not
+have -- no longer applies: the default path pulls the release images and builds only the bot and
+the UAC. If it is gated, gate it per-PR on the default path and keep the artifact upload, because
+the numbers are only useful if you can read them after a red run.
 
 ## Type checking and linting
 
@@ -183,13 +231,16 @@ here is checked strictly.
   RTP timestamp still advances by one ptime. Pipecat's default `audio_out_10ms_chunks=4` would
   put 40 ms of audio in every packet and play the bot back at double speed; the bot sets it to
   2. This is the single easiest way to break the harness invisibly.
-* **The wire rate is not selectable.** It is the negotiated codec's native decoder rate, so a
-  G.711 leg gives 8 kHz. The bot's pipeline runs at 8 kHz too, which means no resampler runs
-  anywhere, because pipecat's SOXR resampler short-circuits when the rates match. That is
-  deliberate:
-  at VHQ it buffers heavily (the first chunks of a conversion return nothing and output then
-  arrives in bursts), which would blur the barge-in timing. If you change either rate, the
-  barge-in budget needs revisiting.
+* **Scenarios 1 and 2 run at 8 kHz end to end, and scenario 3 is the one that does not.** In the
+  first two the wire follows the negotiated codec, so a G.711 leg gives 8 kHz and the bot's
+  pipeline is set to match. Scenario 3 asks for 16 kHz with `ws_sample_rate` and sets the bot to
+  match *that*. In all three the pipeline rate equals the wire rate, which is the point: pipecat's
+  SOXR resampler short-circuits when the rates are equal, and at VHQ it buffers heavily (the first
+  chunks of a conversion return nothing and output then arrives in bursts), which would blur the
+  barge-in timing and make the frame clock approximate. Any conversion in these runs is the
+  engine's, on the RTP side, where it is frame-exact. If you set a bot's `--sample-rate` away from
+  the rate its scenario negotiates, you are measuring the resampler and the budgets need
+  revisiting.
 * **`answer_local` reads the media profile's `answer:` block**, not `offer:`. The YAML anchors
   in `proxy/siphon.yaml` make both sides the same object so a flag cannot be set on the half
   that is never read.

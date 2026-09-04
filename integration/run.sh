@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# One command: bring the four-way stack up, run both scenarios against it, tear it down.
+# One command: bring the four-way stack up, run every scenario against it, tear it down.
 #
-#   ./run.sh                        # build if needed, run both scenarios, tear down
-#   ./run.sh --scenario roundtrip   # one scenario, for iterating
+#   ./run.sh                        # build if needed, run all three scenarios, tear down
+#   ./run.sh --scenario wideband    # one scenario, for iterating
 #   ./run.sh --keep-up              # leave the stack running afterwards
 #   ./run.sh --no-build             # reuse the images exactly as they are
 #
-# siphon-sip and siphon-rtp are built from the checkouts beside this repository. Point
-# SIPHON_SIP_PATH / SIPHON_RTP_PATH somewhere else if yours are not there.
+# siphon-sip and siphon-rtp come from their published release images, so this works on a fresh
+# clone with nothing beside it. To test a checkout of either instead -- the reason to run this
+# harness at all when you are the one changing the engine -- point it at the source:
+#
+#   SIPHON_RTP_PATH=../../siphon-rtp ./run.sh      # build the engine from that checkout
+#   SIPHON_SIP_PATH=../../siphon ./run.sh          # build the proxy from that checkout
+#
+# Pin a different release without a checkout by setting SIPHON_RTP_IMAGE / SIPHON_SIP_IMAGE.
 #
 # Everything a failed run needs is left in ./artifacts: the captures, both bot traces, the
 # control-plane transcript, SIPp's message and error logs, and every container's log.
@@ -17,10 +23,23 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 COMPOSE=(docker compose -f docker-compose.yaml)
-SERVICES=(engine control-tap proxy bot-echo bot-speaker)
+SERVICES=(engine control-tap proxy bot-echo bot-speaker bot-wideband)
 ARTIFACTS="$(pwd)/artifacts"
 
-scenarios=(roundtrip turntaking)
+# What gets built here versus pulled. The bot and the UAC are always built -- they are this
+# repository. The engine and the proxy are pulled release images unless a checkout was named, in
+# which case that component is built from source and tagged locally so compose picks it up.
+BUILD_SERVICES=(bot-echo uac)
+if [[ -n "${SIPHON_RTP_PATH:-}" ]]; then
+    export SIPHON_RTP_IMAGE="pipecat-siphon-integration/siphon-rtp:local"
+    BUILD_SERVICES+=(engine)
+fi
+if [[ -n "${SIPHON_SIP_PATH:-}" ]]; then
+    export SIPHON_SIP_IMAGE="pipecat-siphon-integration/siphon-sip:local"
+    BUILD_SERVICES+=(proxy)
+fi
+
+scenarios=(roundtrip turntaking wideband)
 build=1
 keep_up=0
 clean=1
@@ -76,10 +95,15 @@ fi
 "${COMPOSE[@]}" down --remove-orphans --timeout 5 >/dev/null 2>&1 || true
 
 if [[ "${build}" -eq 1 ]]; then
+    echo "== pulling the release images =="
+    # Pulled explicitly rather than left to `up`, so a tag that does not exist fails here with
+    # the registry's own message instead of somewhere inside the bring-up.
+    "${COMPOSE[@]}" pull --quiet engine proxy control-tap
+
     echo "== building (cached layers make this quick after the first run) =="
-    # The Rust builds are the long pole and a fresh checkout building jemalloc-sys at full
+    # A Rust build is the long pole and a fresh checkout building jemalloc-sys at full
     # parallelism is a known flake, so cap the job count rather than letting cargo pick.
-    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" "${COMPOSE[@]}" build "${SERVICES[@]}" uac
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" "${COMPOSE[@]}" build "${BUILD_SERVICES[@]}"
 fi
 
 trap teardown EXIT
@@ -92,6 +116,7 @@ echo "== starting the stack =="
     -e PROXY_READY_URL=http://172.28.7.20:8081/admin/ready \
     -e CONTROL_TAP_HOST=172.28.7.15 -e CONTROL_TAP_PORT=8080 \
     -e ROUNDTRIP_BOT_HOST=172.28.7.31 -e TURNTAKING_BOT_HOST=172.28.7.32 \
+    -e WIDEBAND_BOT_HOST=172.28.7.33 \
     -e BOT_PORT=9001 \
     uac
 
