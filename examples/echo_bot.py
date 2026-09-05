@@ -47,6 +47,13 @@ from pipecat_siphon import SiphonFrameSerializer
 # constant only decides what the pipeline itself runs at.
 WIRE_SAMPLE_RATE = 8000
 
+WIRE_PTIME_MS = 20
+"""The engine's packetization time, and the size of one WebSocket frame.
+
+Pipecat's transport writes output in 10 ms chunks and defaults to four of them, so left alone it
+sends 40 ms per frame against a 20 ms wire. One frame per ptime is what the protocol asks for and
+it is the lower-latency shape."""
+
 
 class ParrotProcessor(FrameProcessor):
     """Send the caller's audio straight back into the call, and log the interesting edges."""
@@ -83,6 +90,8 @@ def build_transport(host: str, port: int) -> SingleClientWebsocketServerTranspor
             audio_out_enabled=True,
             audio_in_sample_rate=WIRE_SAMPLE_RATE,
             audio_out_sample_rate=WIRE_SAMPLE_RATE,
+            # One WebSocket frame per ptime, rather than pipecat's default four 10 ms chunks.
+            audio_out_10ms_chunks=WIRE_PTIME_MS // 10,
             serializer=SiphonFrameSerializer(
                 params=SiphonFrameSerializer.InputParams(
                     # The engine's own VAD (profile flag `ws_vad`) drives turn taking, so the
@@ -119,6 +128,11 @@ async def main(host: str, port: int) -> None:
             audio_in_sample_rate=WIRE_SAMPLE_RATE,
             audio_out_sample_rate=WIRE_SAMPLE_RATE,
         ),
+        # This is a server the engine dials into, so sitting idle between calls is the normal
+        # state and not a fault. Pipecat's 300 s default cancels the worker *and* the runner, and
+        # the WebSocket server stops listening: five minutes after a call ends, every later call
+        # is refused at the TCP connect and the engine reports a failed bridge dial.
+        idle_timeout_secs=None,
     )
 
     runner = WorkerRunner()
