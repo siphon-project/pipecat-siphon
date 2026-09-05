@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-05
+
 Nothing in the package itself changed: `src/pipecat_siphon` is byte-identical. Everything below is
 the examples, which is where the defects were — four of them silent, each one presenting as a bot
 that connects, reports healthy and never speaks.
