@@ -84,6 +84,7 @@ ignore = ["D203", "D213"]
 "tests/*" = ["D100", "D101", "D102", "D103", "D104"]
 "examples/*" = ["D100", "D103"]
 "integration/proxy/harness_script.py" = ["ANN", "D103"]
+"examples/quickstart/route.py" = ["ANN", "D103"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -96,11 +97,11 @@ warn_unreachable = true
 # pipecat's `@transport.event_handler(...)` is an untyped decorator; every handler in a pipecat
 # app goes through it, so this is the one strict flag that cannot be satisfied from here.
 disallow_untyped_decorators = false
-# The one file in the tree that cannot be type-checked from here. It is a siphon-sip call
-# script: it runs inside that daemon's embedded interpreter against a `siphon` module that only
-# exists in the daemon's process, and its handler signatures are fixed by that API. Everything
-# else under integration/ is checked strictly, like the package itself.
-exclude = ["integration/proxy/harness_script\\.py"]
+# The two files in the tree that cannot be type-checked from here. Both are siphon-sip call
+# scripts: they run inside that daemon's embedded interpreter against a `siphon` module that only
+# exists in the daemon's process, and their handler signatures are fixed by that API. Everything
+# else under integration/ and examples/ is checked strictly, like the package itself.
+exclude = ["integration/proxy/harness_script\\.py", "examples/quickstart/route\\.py"]
 
 [[tool.mypy.overrides]]
 module = ["audioop", "pipecat.*", "websockets.*"]

@@ -343,6 +343,31 @@ environment and `pip install "pipecat-ai[anthropic,deepgram,cartesia]"`; the ven
 each to swap, and the file explains which knobs are there for latency rather than for taste. The
 turn taking is the engine's, not the pipeline's — there is no VAD analyzer in it at all.
 
+Given `--control-url`, it also connects to siphon's control plane and gets an `end_call` tool, so
+the model can hang up when the conversation is done rather than emitting a magic phrase for
+something else to notice. The example's docstring covers the platform side: the media profile the
+engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
+whether the control channel ever finds its call — the engine expands `{call_id}` in a `ws_uri` to
+the **SIP** Call-ID, so the two channels join on `sip_call_id`, not on the control frame's own
+`call_id`.
+
+`examples/probe.py` speaks the engine's half of the media wire — connect, `start`, stream silence
+— and reports how much audio comes back and how long the first frame took. No phone, no SIP
+stack, no engine. It is the fastest way to tell "the AI is broken" from "the media path is
+broken", because every failure above the media path looks identical from outside: a socket that
+connects, a bot that reports healthy, and silence.
+
+```bash
+python examples/probe.py ws://127.0.0.1:9001/stream
+```
+
+## Quickstart: a real phone number
+
+[`examples/quickstart/`](examples/quickstart/) is the whole thing end to end: siphon-sip registers
+to a SIP provider, inbound calls on that registration are handed to the bot, and the bot can hang
+up. A config file, a routing script and a README. Nothing in it is provider-specific — registration
+is RFC 3261, and every credential comes from the environment.
+
 ## Integration harness
 
 `integration/` holds a four-way harness that runs the whole chain with nothing mocked: SIPp

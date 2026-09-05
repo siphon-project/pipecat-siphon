@@ -1,0 +1,144 @@
+# siphon-sip configuration for the voice-AI quickstart.
+#
+# Registers to an upstream SIP provider, and hands every inbound call on that
+# registration to the pipecat bot in examples/agent_bot.py.
+#
+# Nothing here is provider-specific: registration is RFC 3261 and every ITSP that
+# hands out SIP credentials is driven by the same four values. Fill them in from
+# the environment (`${VAR}` and `${VAR:-default}` are expanded across this whole
+# file) so no credential is ever written into the tree:
+#
+#     export SIP_AOR="sip:12345@sip.provider.example"     # the account, as they gave it
+#     export SIP_REGISTRAR="sip:sip.provider.example"     # where the REGISTER goes
+#     export SIP_USERNAME="12345"                         # auth username
+#     export SIP_PASSWORD="..."                           # auth password
+#     export SIP_PROVIDER_HOST="sip.provider.example"     # their signalling host
+#     export PUBLIC_ADDRESS="203.0.113.10"                # this host, as they can reach it
+#     export AGENT_APP_TOKEN="..."                        # shared with the bot
+#
+# Then: siphon -c examples/quickstart/siphon.yaml
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+# What this node calls itself in Contact and Via. On anything with a NAT in front
+# of it this must be the address the provider can actually reach, not the address
+# of the interface -- a private address here and the provider sends its INVITE
+# into a black hole while the registration itself looks perfectly healthy.
+advertised_address: "${PUBLIC_ADDRESS}"
+
+script:
+  path: "examples/quickstart/route.py"
+
+# ---------------------------------------------------------------------------
+# Outbound registration: siphon as a UAC, keeping a binding alive upstream.
+# ---------------------------------------------------------------------------
+registrant:
+  # Re-REGISTER on the provider's expiry, backing off on failure rather than
+  # hammering them.
+  default_interval: 3600
+  retry_interval: 60
+  max_retry_interval: 300
+  entries:
+    - aor: "${SIP_AOR}"
+      registrar: "${SIP_REGISTRAR}"
+      user: "${SIP_USERNAME}"
+      password: "${SIP_PASSWORD}"
+      # `realm` is derived from the 401 challenge when omitted, which is right
+      # for almost every provider. Set it only if yours challenges with a realm
+      # that differs from the domain in the AoR.
+      transport: "${SIP_TRANSPORT:-udp}"
+
+# ---------------------------------------------------------------------------
+# The provider, as a gateway group. This is what `call.from_gateway("provider")`
+# tests in the routing script, so an INVITE from anywhere else never reaches the
+# bot.
+# ---------------------------------------------------------------------------
+gateway:
+  groups:
+    - name: "provider"
+      destinations:
+        - uri: "sip:${SIP_PROVIDER_HOST}"
+          transport: "${SIP_TRANSPORT:-udp}"
+      # Many providers source calls from a documented range rather than only the
+      # addresses their signalling names resolve to. List the ranges they publish
+      # and membership stays correct regardless of DNS. The default below is the
+      # RFC 5737 documentation range and matches nothing real -- replace it.
+      source_networks:
+        - "${SIP_PROVIDER_NETWORKS:-203.0.113.0/24}"
+
+# ---------------------------------------------------------------------------
+# Media. The bot is the far side of the call; there is no B leg.
+# ---------------------------------------------------------------------------
+media:
+  backend: siphon-rtp          # rtpengine and rtpproxy have no WebSocket bridge
+  siphon_rtp:
+    address: "127.0.0.1:8080"  # siphon-rtp --control
+    timeout_ms: 2000
+
+  profiles:
+    # Deliberately a profile of our own rather than the built-in `voice_ai`. The
+    # built-in sets transport_protocol, ice, dtls, replace, noise_suppression,
+    # echo_cancellation, ws_vad and ws_barge_in -- and none of received_from,
+    # ws_vad_engine, ws_vad_min_speech_ms or ws_sample_rate. The first and the
+    # last of those are what decide whether this works at all.
+    agent:
+      # answer_local and answer-first handover both read the answer half, so the
+      # offer half is never consulted on this path.
+      offer: {}
+      answer:
+        transport_protocol: "RTP/AVP"   # plain RTP toward the provider
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+
+        # Gate media ingress to the address the signalling actually arrived from.
+        # Without this, a caller behind NAT advertises an unroutable address in
+        # its c= line, the gate defaults to an exact match on that address, and
+        # every packet the handset sends is dropped -- on a call whose signalling
+        # is clean from end to end. The bot hears silence and nothing reports an
+        # error anywhere.
+        received_from: true
+
+        noise_suppression: true
+        # Not optional under barge-in. The bot's own voice comes back through the
+        # caller's handset, and a speech detector cannot reject it: echo of
+        # speech is still speech, detected down to roughly -36 dB of echo-return
+        # loss. Without the canceller the bot interrupts itself.
+        echo_cancellation: true
+
+        ws_vad: true
+        ws_barge_in: true
+        # The energy detector answers "is something loud here", so a cough, a
+        # door or one burst of echo cuts the prompt off. The neural detector asks
+        # whether it is speech.
+        ws_vad_engine: neural
+        # ... and this is the leading edge neither detector has by default: the
+        # uplink must read as speech continuously for this long before barge-in
+        # fires. 60-120 ms is the useful range -- long enough to swallow a
+        # transient, short enough that a caller talking over the bot feels heard.
+        ws_vad_min_speech_ms: 100
+
+        # The wire rate toward the bot, resampled from the leg's G.711 in the
+        # engine where it is frame-exact. Must equal PIPELINE_SAMPLE_RATE in
+        # agent_bot.py. Note the canceller and the noise suppressor exist only at
+        # 8 and 16 kHz: any other value here silently leaves the uplink
+        # uncancelled and barge-in then has nothing holding the echo down.
+        ws_sample_rate: 16000
+
+# ---------------------------------------------------------------------------
+# The control plane the bot connects back on, so it can hang up.
+# ---------------------------------------------------------------------------
+control:
+  # Loopback on purpose: a connection here can hang up any call on this node. Put
+  # it on a real interface only behind something that authenticates.
+  listen: "127.0.0.1:9092"
+  apps:
+    - name: "agent-app"          # must equal the handover target and the bot's --control-app
+      token: "${AGENT_APP_TOKEN}"
+      # A controller that dies mid-call hangs the caller up rather than leaving
+      # them connected to a bot that is no longer listening.
+      on_lost: hangup
