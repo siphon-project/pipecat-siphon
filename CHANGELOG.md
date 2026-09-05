@@ -6,6 +6,64 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Nothing in the package itself changed: `src/pipecat_siphon` is byte-identical. Everything below is
+the examples, which is where the defects were — four of them silent, each one presenting as a bot
+that connects, reports healthy and never speaks.
+
+### Fixed
+
+- **The greeting ran against an empty context**, so every call opened with an HTTP 400
+  (`messages: at least one message is required`) and the bot stayed mute until the caller said
+  something. It reads as a dead line, which sends people to the media path. The context is now
+  seeded with a bracketed stage direction. Seeding also *clears* the previous call's transcript,
+  which matters now that the server outlives a call.
+- **`fallbacks` and `betas` were passed through the Anthropic service's `extra`** and could never
+  work. Pipecat does call the beta endpoint, but overwrites `betas` with its own interleaved
+  thinking flag *after* merging `extra`, so `fallbacks` arrived without the beta that would make
+  it legal and every turn 400'd, greeting included. Both keys are dropped, with the constraint
+  named in a comment; fixing it properly means merging `betas` upstream in pipecat.
+- **`--fast` could not have worked** for the same reason — fast mode needs its beta flag on the
+  request, and that flag was being overwritten — so the option is gone rather than left in
+  `--help` promising something it never delivered.
+- **Output frames ignored the negotiated ptime.** Pipecat's transport defaults to four 10 ms
+  chunks, so both examples sent 40 ms per frame against a 20 ms wire. An engine that stamps each
+  received frame as one ptime then advances the RTP timestamp at half the rate of the audio and
+  every packet overlaps its predecessor: impeccable packet by packet, silent on the handset.
+  Recent engine builds drain by samples and rescue it, but one frame per ptime is what the
+  protocol asks for and it is the lower-latency shape.
+- **The pipeline worker cancelled itself after five idle minutes**, taking the runner and the
+  listening socket with it, so every call after the first five-minute gap was refused at the TCP
+  connect. These are servers the engine dials into; idling between calls is the normal state.
+  `idle_timeout_secs=None` in both examples.
+- **`output_config.effort` was a free-standing constant beside `MODEL`.** It is valid on the
+  pinned model and rejected outright by others, so switching models for latency produced a 400 on
+  every turn. Effort is now bound to the model, and an unlisted model sends none.
+- The serializer's wire rate is stated up front rather than left to be discovered from `start`,
+  so no resampler is built for the handful of frames before it arrives and then discarded.
+
+### Added
+
+- **`examples/quickstart/`** — the whole path end to end: siphon-sip registers to a SIP provider,
+  inbound calls on that registration are handed to the bot, and the bot can hang up. Config,
+  routing script and a README of what goes wrong. Provider-neutral; credentials come from the
+  environment.
+- **A control plane in `examples/agent_bot.py`**, given `--control-url`: the model gets an
+  `end_call` tool that says goodbye, waits for the words to actually finish playing, and then
+  drops the line. The tool takes no arguments on purpose — it acts on the call the bot is already
+  on, and an argument would be a model-chosen string reaching a verb that can hang up a stranger.
+  The control connection retries with backoff, so starting the bot before the engine is a routine
+  race rather than an exit.
+- **`examples/probe.py`** — opens the media WebSocket, sends `start`, streams silence and reports
+  how much audio comes back and how soon. No phone, no SIP stack, no engine; it separates "the AI
+  is broken" from "the media path is broken" in seconds.
+- **The platform side is documented**, in the example's docstring and the quickstart config. The
+  engine's built-in `voice_ai` profile sets neither `received_from` (without which a NATed caller
+  is gated out entirely, on a call whose signalling is clean throughout) nor `ws_vad_engine` /
+  `ws_vad_min_speech_ms` (without which barge-in fires on a cough or on one burst of the bot's own
+  echo).
+- Tests for the example's own logic — the farewell wait and the media/control correlation — with
+  the control call faked, so no Rust toolchain enters the CI path.
+
 ## [0.2.0] - 2026-09-04
 
 The first release published to PyPI. `0.1.0` was the initial code drop and never left the

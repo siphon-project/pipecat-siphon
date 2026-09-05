@@ -40,7 +40,15 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "websockets>=13.1",
+    # The agent example's own logic is tested, and importing it pulls the three service classes
+    # it wires together. Not a dependency of the package -- nothing under src/ imports these --
+    # but without them the example's tests would skip in CI rather than run, which is the way a
+    # test suite goes quietly green while the thing it covers rots.
+    "pipecat-ai[anthropic,cartesia,deepgram]>=1.8.0,<2",
 ]
+# Deliberately not in `dev`: the control-plane client is a Rust extension with no wheel for every
+# interpreter, so requiring it would put a Rust toolchain in the CI path. The tests that cover the
+# control plane fake the call handle instead, which is what they should be doing anyway.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pipecat_siphon"]
@@ -76,23 +84,33 @@ ignore = ["D203", "D213"]
 "tests/*" = ["D100", "D101", "D102", "D103", "D104"]
 "examples/*" = ["D100", "D103"]
 "integration/proxy/harness_script.py" = ["ANN", "D103"]
+"examples/quickstart/route.py" = ["ANN", "D103"]
 
 [tool.mypy]
 python_version = "3.11"
 files = ["src", "tests", "examples", "integration"]
+# `examples/` is a flat set of scripts, not a package, so the tests that exercise the agent
+# example import it by bare name. Mirrors the sys.path insert in tests/conftest.py.
+mypy_path = "examples"
 strict = true
 warn_unreachable = true
 # pipecat's `@transport.event_handler(...)` is an untyped decorator; every handler in a pipecat
 # app goes through it, so this is the one strict flag that cannot be satisfied from here.
 disallow_untyped_decorators = false
-# The one file in the tree that cannot be type-checked from here. It is a siphon-sip call
-# script: it runs inside that daemon's embedded interpreter against a `siphon` module that only
-# exists in the daemon's process, and its handler signatures are fixed by that API. Everything
-# else under integration/ is checked strictly, like the package itself.
-exclude = ["integration/proxy/harness_script\\.py"]
+# The two files in the tree that cannot be type-checked from here. Both are siphon-sip call
+# scripts: they run inside that daemon's embedded interpreter against a `siphon` module that only
+# exists in the daemon's process, and their handler signatures are fixed by that API. Everything
+# else under integration/ and examples/ is checked strictly, like the package itself.
+exclude = ["integration/proxy/harness_script\\.py", "examples/quickstart/route\\.py"]
 
 [[tool.mypy.overrides]]
 module = ["audioop", "pipecat.*", "websockets.*"]
+ignore_missing_imports = true
+
+# The control-plane SDK is a PyO3 extension with no stubs, and it is optional besides: only the
+# agent example imports it, and only when the control plane is actually wired up.
+[[tool.mypy.overrides]]
+module = ["siphon_control", "siphon_control.*"]
 ignore_missing_imports = true
 
 # numpy ships stubs that use 3.12-only syntax, which mypy cannot parse while analysing for the
