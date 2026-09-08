@@ -6,3 +6,19 @@
 .ruff_cache
 **/__pycache__
 integration/artifacts
+
+# Credentials, never in an image layer. The build context is the repository root and the bot image
+# copies `examples/`, so anything left next to the compose file is baked in -- and stays in the
+# layer even if a later step deletes it.
+#
+# Every pattern is `**/`-prefixed on purpose. .dockerignore is NOT .gitignore: a bare `.env` here
+# anchors to the context root and would not match `examples/quickstart/.env`, which is precisely
+# where the credentials live. The glob also covers the editor and hand-rolled backups
+# (.env.save, .env.old, .env.bak-*) that a plain `.env` line lets straight through.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local overrides of the shipped config, which carry the provider's real host and credentials.
+**/*.local.yaml
+**/*.local.yml

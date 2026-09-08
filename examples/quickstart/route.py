@@ -35,6 +35,13 @@ CONTROL_APP = os.environ.get("CONTROL_APP", "agent-app")
 """Must match the `control.apps[].name` in siphon.yaml and the bot's `--control-app`."""
 
 
+# No OPTIONS handler here. From siphon-sip 1.8.4 the stack answers an unclaimed OPTIONS itself,
+# with an `Allow` built from the methods it actually supports — better than the hardcoded 200 this
+# script used to send, and it applies to every deployment rather than the ones that remembered.
+# `server.auto_options: false` turns it off for a node that would rather not confirm its own
+# existence to a probe. Every other unhandled method now gets 405 rather than 500.
+
+
 @b2bua.on_invite
 async def route(call):
     """Answer inbound provider calls into the bot; refuse everything else."""

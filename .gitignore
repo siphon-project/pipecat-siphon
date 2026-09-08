@@ -15,3 +15,14 @@ CLAUDE.md
 # Scratch git worktrees — a stray `git add -A` would commit a second copy of the tree.
 /.worktrees/
 /worktrees/
+
+# Local credentials, never committed. The `.env.*` glob is the point: a bare `.env` line leaves
+# the editor and hand-rolled backups (.env.save, .env.old, .env.bak-*) tracked, and those hold
+# exactly the same secrets as the file they were copied from.
+.env
+.env.*
+!.env.example
+
+# Local overrides of a shipped config, which carry the provider's real host and credentials.
+*.local.yaml
+*.local.yml

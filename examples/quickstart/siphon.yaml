@@ -20,18 +20,30 @@
 
 listen:
   udp:
-    - "0.0.0.0:5060"
+    - "0.0.0.0:${SIP_PORT:-5060}"
   tcp:
-    - "0.0.0.0:5060"
+    - "0.0.0.0:${SIP_PORT:-5060}"
 
 # What this node calls itself in Contact and Via. On anything with a NAT in front
 # of it this must be the address the provider can actually reach, not the address
 # of the interface -- a private address here and the provider sends its INVITE
 # into a black hole while the registration itself looks perfectly healthy.
+# The SIP domains this node answers for, and what it uses for loop detection. siphon-sip
+# refuses to start without this -- `missing field \`domain\`` -- so it is not optional.
+#
+# The essential entry is the address the provider actually addresses us at: a registered
+# trunk sends its INVITE to the Contact we registered, whose host is `advertised_address`
+# below. The provider's own host is included because some carriers keep the AoR domain in
+# the request URI instead.
+domain:
+  local:
+    - "${PUBLIC_ADDRESS}"
+    - "${SIP_PROVIDER_HOST}"
+
 advertised_address: "${PUBLIC_ADDRESS}"
 
 script:
-  path: "examples/quickstart/route.py"
+  path: "${ROUTE_SCRIPT:-/etc/siphon/route.py}"
 
 # ---------------------------------------------------------------------------
 # Outbound registration: siphon as a UAC, keeping a binding alive upstream.
@@ -76,7 +88,7 @@ gateway:
 media:
   backend: siphon-rtp          # rtpengine and rtpproxy have no WebSocket bridge
   siphon_rtp:
-    address: "127.0.0.1:8080"  # siphon-rtp --control
+    address: "127.0.0.1:${RTP_CONTROL_PORT:-8080}"  # siphon-rtp --control
     timeout_ms: 2000
 
   profiles:
@@ -110,6 +122,23 @@ media:
         # loss. Without the canceller the bot interrupts itself.
         echo_cancellation: true
 
+        # Reachable from siphon-sip 1.8.4, which moved to siphon-rtp-proto 0.5.
+        #
+        # Reach for these when the canceller is on and the bot still hears itself. A narrowband
+        # leg with a transcoding hop in it can weak-lock: the delay estimator commits an alignment
+        # whose peak prominence is well under its own threshold, cancels against the wrong offset,
+        # and the echo passes through with the canceller reporting itself healthy. Widening the
+        # search is the obvious move and usually the wrong one, because a weak lock well inside the
+        # default window is not a window that is too narrow. The long tail spans the path with the
+        # filter instead and makes no alignment decision at all, so it has nothing to get wrong.
+        # It costs roughly 6x the canceller's per-frame work at a 512 ms tail and ~96 KiB more per
+        # leg, and once it is set the search field sizes the tail rather than a window.
+        echo_long_tail: true
+        echo_delay_search_ms: 512
+        # The residual post-filter, if the linear stage leaves audible echo behind. Costs ~32 ms of
+        # added latency, which is real on a turn-taking bridge.
+        #echo_residual_suppression: false
+
         ws_vad: true
         ws_barge_in: true
         # The energy detector answers "is something loud here", so a cough, a
@@ -135,9 +164,9 @@ media:
 control:
   # Loopback on purpose: a connection here can hang up any call on this node. Put
   # it on a real interface only behind something that authenticates.
-  listen: "127.0.0.1:9092"
+  listen: "127.0.0.1:${CONTROL_PORT:-9092}"
   apps:
-    - name: "agent-app"          # must equal the handover target and the bot's --control-app
+    - name: "${CONTROL_APP:-agent-app}"          # must equal the handover target and the bot's --control-app
       token: "${AGENT_APP_TOKEN}"
       # A controller that dies mid-call hangs the caller up rather than leaving
       # them connected to a bot that is no longer listening.

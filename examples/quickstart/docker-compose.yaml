@@ -1,0 +1,136 @@
+# A real phone number talking to Claude, as three containers.
+#
+#   your phone -> provider -> siphon-sip -> siphon-rtp --(media WebSocket)--> bot
+#                                 |                                          STT -> Claude -> TTS
+#                                 +---------(control WebSocket)-------------> hangup
+#
+# Copy `.env.example` to `.env`, fill in the provider's credentials and the three API keys, then
+# `docker compose up --build`. The README next to this file explains the settings that decide
+# whether it works at all, and the handful of things that go wrong.
+#
+# ── Why host networking ─────────────────────────────────────────────────────────────────────────
+# A registered SIP account only works if the provider can reach the address this node puts in its
+# Contact, and the media only works if it can reach the RTP port range the engine binds. Under a
+# bridge network both sit behind Docker's NAT: the SIP side survives with `advertised_address`, but
+# the media range would need every port in RTP_PORT_MIN..RTP_PORT_MAX published, and publishing a
+# thousand UDP ports costs a userland proxy process per port.
+#
+# The cost is that the three services share one port space with the host. Every port below is
+# therefore an environment variable: if something already owns 5060, move this stack rather than
+# fighting it.
+
+name: pipecat-siphon-quickstart
+
+services:
+
+  # ── The media engine ───────────────────────────────────────────────────────────────────────────
+  # Owns RTP, the jitter buffer, packet loss concealment, transcoding, the VAD that produces the
+  # turn boundaries, and the WebSocket bridge that carries L16 to the bot.
+  engine:
+    # Override to run a locally built engine — e.g. testing an unreleased fix.
+    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:${SIPHON_RTP_VERSION:-0.5.0}}
+    network_mode: host
+    restart: unless-stopped
+    command:
+      # Loopback: only siphon-sip talks to this, on the same host. On a real interface it would let
+      # anyone who reached it steer media.
+      - "--control"
+      - "127.0.0.1:${RTP_CONTROL_PORT:-8080}"
+      # Where media sockets bind. `0.0.0.0` on a directly-reachable host; the specific LAN address
+      # behind NAT, paired with --advertise-ip.
+      - "--relay-bind-ip"
+      - "${MEDIA_BIND_IP:-0.0.0.0}"
+      # What goes into the SDP the provider reads. Emit-only; it does not move the socket bind.
+      - "--advertise-ip"
+      - "${PUBLIC_ADDRESS:?set PUBLIC_ADDRESS in .env}"
+      # A bounded range, so the port forward or security group is something you can write down.
+      - "--port-min"
+      - "${RTP_PORT_MIN:-30000}"
+      - "--port-max"
+      - "${RTP_PORT_MAX:-30999}"
+    environment:
+      RUST_LOG: "${ENGINE_LOG:-info}"
+
+  # ── The bot ────────────────────────────────────────────────────────────────────────────────────
+  # A passive WebSocket server: the engine dials it, per call, at the `ws_uri` the routing script
+  # hands over. It must be listening before a call arrives — the engine dials from inside the answer
+  # and tears the call down if the dial is refused — hence the `depends_on` on the SIP side.
+  bot:
+    build:
+      context: ../..
+      dockerfile: examples/quickstart/Dockerfile
+    image: pipecat-siphon-quickstart/bot:local
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "${BOT_PORT:-9001}"
+      - "--control-url"
+      - "ws://127.0.0.1:${CONTROL_PORT:-9092}/control/ws"
+      - "--control-app"
+      - "${CONTROL_APP:-agent-app}"
+    environment:
+      # The three vendors. No default for any of them: a missing key should stop the bot at startup
+      # with the name of the one that is missing, not at the first call.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}"
+      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:?set DEEPGRAM_API_KEY in .env}"
+      CARTESIA_API_KEY: "${CARTESIA_API_KEY:?set CARTESIA_API_KEY in .env}"
+      CARTESIA_VOICE_ID: "${CARTESIA_VOICE_ID:?set CARTESIA_VOICE_ID in .env}"
+      # Shared with siphon.yaml's control app, so the bot may hang up.
+      SIPHON_CONTROL_TOKEN: "${AGENT_APP_TOKEN}"
+      # Persona and capability, overriding what the example hard-codes.
+      BOT_SYSTEM_PROMPT: "${BOT_SYSTEM_PROMPT:-}"
+      BOT_TRANSFER_TARGET: "${BOT_TRANSFER_TARGET:-}"
+      # Model choices. Empty leaves the example's own defaults.
+      BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
+      BOT_STT_MODEL: "${BOT_STT_MODEL:-}"
+      BOT_STT_LANGUAGE: "${BOT_STT_LANGUAGE:-}"
+      BOT_TTS_MODEL: "${BOT_TTS_MODEL:-}"
+      BOT_SAMPLE_RATE: "${BOT_SAMPLE_RATE:-}"
+      BOT_MIN_INTERRUPT_WORDS: "${BOT_MIN_INTERRUPT_WORDS:-}"
+      BOT_ECHO_GUARD_TAIL: "${BOT_ECHO_GUARD_TAIL:-}"
+
+  # ── The SIP stack ──────────────────────────────────────────────────────────────────────────────
+  # Registers to the provider on startup and routes their inbound INVITEs into the bot. Credentials
+  # reach it through the environment; siphon.yaml expands `${VAR}` across the whole file, so nothing
+  # secret is written into the tree.
+  sip:
+    # Override to run a locally built SIP stack — e.g. testing an unreleased fix, the same
+    # escape hatch the engine has.
+    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:${SIPHON_SIP_VERSION:-1.8.4}}
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - engine
+      - bot
+    volumes:
+      - type: bind
+        source: ./siphon.yaml
+        target: /etc/siphon/siphon.yaml
+        read_only: true
+      - type: bind
+        source: ./route.py
+        target: /etc/siphon/route.py
+        read_only: true
+    environment:
+      SIP_AOR: "${SIP_AOR:?set SIP_AOR in .env}"
+      SIP_REGISTRAR: "${SIP_REGISTRAR:?set SIP_REGISTRAR in .env}"
+      SIP_USERNAME: "${SIP_USERNAME:?set SIP_USERNAME in .env}"
+      SIP_PASSWORD: "${SIP_PASSWORD:?set SIP_PASSWORD in .env}"
+      SIP_PROVIDER_HOST: "${SIP_PROVIDER_HOST:?set SIP_PROVIDER_HOST in .env}"
+      SIP_PROVIDER_NETWORKS: "${SIP_PROVIDER_NETWORKS:?set SIP_PROVIDER_NETWORKS in .env}"
+      SIP_TRANSPORT: "${SIP_TRANSPORT:-udp}"
+      PUBLIC_ADDRESS: "${PUBLIC_ADDRESS}"
+      AGENT_APP_TOKEN: "${AGENT_APP_TOKEN:?set AGENT_APP_TOKEN in .env}"
+      SIP_PORT: "${SIP_PORT:-5060}"
+      RTP_CONTROL_PORT: "${RTP_CONTROL_PORT:-8080}"
+      CONTROL_PORT: "${CONTROL_PORT:-9092}"
+      CONTROL_APP: "${CONTROL_APP:-agent-app}"
+      WS_SAMPLE_RATE: "${WS_SAMPLE_RATE:-16000}"
+      # No compose default for this one: the URI contains `{call_id}`, and a `}` inside a
+      # `${VAR:-default}` terminates the substitution early. It lives in .env instead.
+      BOT_WS_URI: "${BOT_WS_URI}"
+      RUST_LOG: "${SIP_LOG:-info,siphon::rtpengine=debug,siphon::script=debug}"
+    command: ["--config", "/etc/siphon/siphon.yaml"]
