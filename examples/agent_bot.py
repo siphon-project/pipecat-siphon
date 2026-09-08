@@ -508,6 +508,10 @@ class CallResources:
     serializer: SiphonFrameSerializer
     speech: BotSpeechMonitor
     control: ControlPlane
+    # Set after the worker exists, which is after this object is handed to it. A transfer is an
+    # ending for this bot even though it is not an ending for the caller, and ending the pipeline is
+    # how the media socket gets closed.
+    worker: PipelineWorker | None = None
 
 
 async def end_call(params: FunctionCallParams) -> None:
@@ -569,6 +573,14 @@ async def transfer_call(params: FunctionCallParams) -> None:
     except resources.control.error_class as error:
         # The caller hanging up first is the ordinary case, not a fault.
         logger.info(f"transfer rejected ({error}); the caller most likely hung up first")
+        return
+
+    # The REFER hands the caller to someone else, so this bot's leg is finished even though the
+    # call is not. Leaving the pipeline running holds the media socket open, and the leg then sits
+    # there until the engine's media timeout reaps it -- half a minute of a call nobody is on,
+    # during which the referee's NOTIFYs arrive on a dialog this side has stopped caring about.
+    if resources.worker is not None:
+        await resources.worker.queue_frame(EndWorkerFrame())
 
 
 class EchoGuard(FrameProcessor):
@@ -807,6 +819,12 @@ def build_worker(websocket: WebSocket, control: ControlPlane | None) -> Pipeline
         user_params=LLMUserAggregatorParams(user_turn_strategies=build_user_turn_strategies()),
     )
 
+    resources = (
+        CallResources(serializer=serializer, speech=speech_monitor, control=control)
+        if control is not None
+        else None
+    )
+
     worker = PipelineWorker(
         Pipeline(
             [
@@ -828,11 +846,7 @@ def build_worker(websocket: WebSocket, control: ControlPlane | None) -> Pipeline
             audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
             audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         ),
-        app_resources=(
-            CallResources(serializer=serializer, speech=speech_monitor, control=control)
-            if control is not None
-            else None
-        ),
+        app_resources=resources,
         # A worker now lives for exactly one call, so idling is a stuck call rather than a server
         # waiting for work, and the listener no longer depends on it: uvicorn owns the socket and
         # keeps accepting whatever any individual call does. `None` still, because a caller who
@@ -840,6 +854,9 @@ def build_worker(websocket: WebSocket, control: ControlPlane | None) -> Pipeline
         # call instead of the whole bot.
         idle_timeout_secs=None,
     )
+
+    if resources is not None:
+        resources.worker = worker
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(_worker: object, frame: ErrorFrame) -> None:
