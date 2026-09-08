@@ -52,6 +52,13 @@ transport = SingleClientWebsocketServerTransport(
 pipeline = Pipeline([transport.input(), your_processors, transport.output()])
 ```
 
+That transport holds one connection for the life of the process, which is the right shape for
+`examples/echo_bot.py` and the wrong one for a phone number: the engine dials a fresh WebSocket per
+call, so a single-client server is a hard ceiling of one call at a time. For anything that answers
+a real number, serve a WebSocket per call and build the pipeline inside the handler --
+`examples/agent_bot.py` does exactly that with pipecat's `FastAPIWebsocketTransport`. The
+serializer is per call either way; it carries the call's own `start` parameters.
+
 Then point the engine at it, in the `profile` of a native-JSON `offer`:
 
 ```json
@@ -365,8 +372,20 @@ python examples/probe.py ws://127.0.0.1:9001/stream
 
 [`examples/quickstart/`](examples/quickstart/) is the whole thing end to end: siphon-sip registers
 to a SIP provider, inbound calls on that registration are handed to the bot, and the bot can hang
-up. A config file, a routing script and a README. Nothing in it is provider-specific — registration
-is RFC 3261, and every credential comes from the environment.
+up. Nothing in it is provider-specific — registration is RFC 3261, and every credential comes from
+the environment.
+
+It runs as three containers, so a clone, a `.env` and one command is the whole setup:
+
+```bash
+cd examples/quickstart
+cp .env.example .env      # three API keys, the SIP account, the address the provider can reach
+docker compose up --build
+```
+
+There is a by-hand path for the three processes too, and a probe that tells you whether the bot
+answers with audio before you spend a phone call finding out. See
+[`examples/quickstart/README.md`](examples/quickstart/README.md).
 
 ## Integration harness
 

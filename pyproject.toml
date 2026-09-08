@@ -44,7 +44,15 @@ dev = [
     # it wires together. Not a dependency of the package -- nothing under src/ imports these --
     # but without them the example's tests would skip in CI rather than run, which is the way a
     # test suite goes quietly green while the thing it covers rots.
-    "pipecat-ai[anthropic,cartesia,deepgram]>=1.8.0,<2",
+    #
+    # `websocket` is what carries fastapi, which the example serves the per-call media socket on.
+    # It is an extra rather than a base pipecat dependency, so leaving it off does not fail at
+    # install time -- it fails at `import agent_bot`, which is to say at mypy and at every test in
+    # test_agent_example.py. Not `runner`, which would also carry the prebuilt UI package.
+    "pipecat-ai[anthropic,cartesia,deepgram,websocket]>=1.8.0,<2",
+    # The ASGI server the example runs that fastapi app on. Same story: example-only, never
+    # imported from src/, so the published wheel's dependencies are unchanged by either of these.
+    "uvicorn>=0.32,<1",
 ]
 # Deliberately not in `dev`: the control-plane client is a Rust extension with no wheel for every
 # interpreter, so requiring it would put a Rust toolchain in the CI path. The tests that cover the

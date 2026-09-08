@@ -117,29 +117,41 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    EndWorkerFrame,
+    ErrorFrame,
     Frame,
+    InterimTranscriptionFrame,
     LLMRunFrame,
+    TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat.transports.websocket.server import (
-    SingleClientWebsocketServerParams,
-    SingleClientWebsocketServerTransport,
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
 )
 from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+    MinWordsUserTurnStartStrategy,
+)
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
@@ -147,7 +159,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import SiphonFrameSerializer
 
-PIPELINE_SAMPLE_RATE = 16000
+PIPELINE_SAMPLE_RATE = int(os.environ.get("BOT_SAMPLE_RATE", "") or 16000)
 """What the pipeline runs at. Match it to `ws_sample_rate` on the profile and nothing in this
 process resamples: the engine converts once, at the RTP boundary, where it is frame-exact."""
 
@@ -162,7 +174,7 @@ on the handset. Recent engine builds drain the downlink by samples and packetise
 frame correctly, but one frame per ptime is what the protocol asks for and it is the
 lower-latency shape."""
 
-MODEL = "claude-opus-5"
+MODEL = "claude-haiku-4-5"
 """pipecat defaults its Anthropic service to an older model, so this is set explicitly."""
 
 EFFORT_BY_MODEL: dict[str, str | None] = {
@@ -234,6 +246,97 @@ is normal. When it happens, answer what they just said rather than finishing you
 
 Open the call by greeting the caller and asking how you can help."""
 
+SYSTEM_PROMPT = os.environ.get("BOT_SYSTEM_PROMPT") or SYSTEM_PROMPT
+"""Let a deployment replace the persona without editing this file.
+
+The prompt above is the part worth tuning per deployment and the part most likely to differ
+between a demo and something answering real callers, so it should not require a fork of the
+example to change. What it must not lose is the telephone constraints -- speech not prose, no
+formatting, short answers -- because a replacement written as if for a chat window produces
+markdown that the synthesizer then reads aloud, bullet by bullet.
+
+The hangup instructions are appended separately below and are not overridable: they describe a
+capability of this process rather than a persona, and a prompt that omits them leaves the model
+telling callers it cannot end the call.
+"""
+
+
+LLM_MODEL = os.environ.get("BOT_LLM_MODEL", "").strip() or MODEL
+"""The Claude model, overridable per deployment.
+
+Worth choosing deliberately on a phone call. `claude-opus-5` runs adaptive thinking by *default*,
+which is right for hard reasoning and wrong for a receptionist: the caller hears silence while it
+thinks, on every turn. `claude-haiku-4-5` does not think unless asked to and answers this kind of
+short, bounded conversation about as well. If you do want Opus on a call, pair it with a low
+`output_config.effort` rather than leaving the default."""
+
+STT_MODEL = os.environ.get("BOT_STT_MODEL", "").strip() or "nova-3-general"
+"""Deepgram model. Pinned rather than left on pipecat's default, because a phone line is not the
+general case the default is tuned for: 8 kHz, lossy, and frequently not in the language the default
+assumes. Set `BOT_STT_MODEL` to override."""
+
+STT_LANGUAGE = os.environ.get("BOT_STT_LANGUAGE", "").strip() or "multi"
+"""Recognizer language. `multi` by default: a public number takes calls in whatever language the
+caller speaks, and a recognizer pinned to one of them transcribes the rest into confident nonsense.
+Pin a single language only if the line really is single-language."""
+
+TTS_MODEL = os.environ.get("BOT_TTS_MODEL", "").strip() or "sonic-3.6"
+"""Cartesia model. Pinned for the same reason as the recognizer: an example that drifts with a
+vendor default is an example whose latency and voice change without anyone editing it."""
+
+ECHO_GUARD_TAIL_SECONDS = float(os.environ.get("BOT_ECHO_GUARD_TAIL", "") or 0.6)
+"""How long after the bot stops speaking its own echo is still expected to arrive.
+
+Sized from the observed delay -- the echo of a finished sentence turned up ~280 ms later on a
+mobile leg behind a carrier -- with headroom, because the cost of being slightly too long is that a
+caller who interrupts immediately is missed once, and the cost of being too short is the bot
+answering itself, and then answering that.
+
+**Set it to 0 on a leg the engine's canceller has actually locked onto.** siphon-rtp 0.5.0 vetoes a
+turn edge it can show is our own returning audio, which is selective where this is not -- but that
+veto covers the engine's own `speech_started`, and this bot decides its turns from an always-on
+recognizer instead, so it only helps here to the extent that the echo is gone from the *audio*.
+That needs a confident lock, and the engine says whether it has one: run it with
+`siphon_rtp::media=debug` and read the delay report. A weak-lock warning means the echo is passing
+through and this guard is still carrying the call. Measured on a DID-to-mobile leg, 0.5.0 reports
+confidence 5.7 against a threshold of 12."""
+
+MIN_INTERRUPT_WORDS = int(os.environ.get("BOT_MIN_INTERRUPT_WORDS", "") or 2)
+"""How many words the caller must be heard saying before they may interrupt the bot.
+
+One word is enough to interrupt on a clean leg, and far too few on a phone line. Whatever the bot
+says comes back through the handset's earpiece and into its microphone; the engine cancels that
+echo only if it can find it, and on a mobile behind a carrier the round trip can exceed the
+canceller's delay search window. What is left is the bot's own voice arriving as the caller, and a
+single word of it stops the bot mid-sentence, every sentence.
+
+**Set it to 1 on siphon-rtp 0.5.0 or newer with `echo_cancellation` on.** At 1 the bot interrupts
+on the engine's own speech edge rather than waiting for words, and that edge is the one the
+engine's canceller vetoes when it can show the audio is our returning voice -- so the echo is
+handled where the far-end reference is, and a real caller is heard immediately. Above 1 the caller
+waits for the recognizer: measured on a call at 3, interim transcripts arrived 1, 1, 2 then 4 words
+over 3.6 seconds, and the bot talked over the caller for all of it.
+
+This threshold applies *only while the bot is speaking*, so a caller starting a fresh turn is
+unaffected. Two words is enough to swallow the leading fragment of an echo while still letting a
+real "wait, stop" through. Set to 1 to restore pipecat's default behaviour."""
+
+TRANSFER_TARGET = os.environ.get("BOT_TRANSFER_TARGET", "").strip()
+"""Where the transfer_call tool sends the caller. Empty disables the tool entirely.
+
+From the environment and never from the model. The tool therefore takes no arguments: a
+destination the model could name is a destination the *caller* can talk it into naming, and the
+verb on the other end will dial whatever it is given."""
+
+TRANSFER_PROMPT = """
+
+You can also put the caller through to a person with the transfer_call tool. Tell them you are
+transferring them first: the transfer happens as soon as your words have finished playing. Once
+you transfer, the call is no longer yours -- so only do it when the caller has asked for it, or
+when you cannot help and a person can."""
+"""Appended only when a destination is configured, for the same reason as HANGUP_PROMPT: a model
+told it can transfer when it cannot promises the caller a handover that never happens."""
+
 HANGUP_PROMPT = """
 
 When the caller is done, say goodbye and then use the end_call tool to hang up. Say the farewell
@@ -266,11 +369,13 @@ class BotSpeechMonitor(FrameProcessor):
         super().__init__()
         self._quiet = asyncio.Event()
         self._quiet.set()
+        self._quiet_since = time.monotonic()
         self._has_spoken = asyncio.Event()
 
     def reset(self) -> None:
         """Forget the previous call's speech, so a farewell wait cannot satisfy itself early."""
         self._quiet.set()
+        self._quiet_since = time.monotonic()
         self._has_spoken.clear()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -281,7 +386,20 @@ class BotSpeechMonitor(FrameProcessor):
             self._has_spoken.set()
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._quiet.set()
+            self._quiet_since = time.monotonic()
         await self.push_frame(frame, direction)
+
+    def line_is_ours(self, tail_seconds: float) -> bool:
+        """Whether the bot is speaking, or stopped so recently that echo is still arriving.
+
+        The tail is the part that matters. On a leg whose echo the media engine cannot cancel, the
+        bot's own voice comes back *late* -- observed at ~280 ms after it stopped talking. Any guard
+        that only asks "is the bot speaking right now" is looking at the wrong moment and sees
+        nothing.
+        """
+        if not self._quiet.is_set():
+            return True
+        return time.monotonic() - self._quiet_since < tail_seconds
 
     async def wait_until_finished(
         self,
@@ -390,6 +508,10 @@ class CallResources:
     serializer: SiphonFrameSerializer
     speech: BotSpeechMonitor
     control: ControlPlane
+    # Set after the worker exists, which is after this object is handed to it. A transfer is an
+    # ending for this bot even though it is not an ending for the caller, and ending the pipeline is
+    # how the media socket gets closed.
+    worker: PipelineWorker | None = None
 
 
 async def end_call(params: FunctionCallParams) -> None:
@@ -422,6 +544,93 @@ async def end_call(params: FunctionCallParams) -> None:
         logger.info(f"hangup rejected ({error}); the caller most likely hung up first")
 
 
+async def transfer_call(params: FunctionCallParams) -> None:
+    """Say the handover line, wait for it to play, then REFER the caller away.
+
+    Takes no arguments, exactly like `end_call` and for the same reason: it acts on the call the
+    bot is already on and sends it to the one configured destination. A model-chosen destination
+    would be a caller-chosen destination.
+    """
+    resources = params.app_resources
+    if not isinstance(resources, CallResources) or not TRANSFER_TARGET:
+        await params.result_callback({"error": "this call cannot be transferred from here"})
+        return
+
+    control_call = resources.control.call_for(resources.serializer.call_id)
+    if control_call is None:
+        await params.result_callback({"error": "this call cannot be transferred from here"})
+        return
+
+    # Answer before the caller leaves: once they are transferred there is nobody to hear a result.
+    await params.result_callback({"transferring": True})
+
+    if not await resources.speech.wait_until_finished():
+        logger.warning("handover line did not finish within the cap, transferring anyway")
+
+    try:
+        await control_call.transfer(TRANSFER_TARGET)
+        logger.info(f"transferred the call to {TRANSFER_TARGET}")
+    except resources.control.error_class as error:
+        # The caller hanging up first is the ordinary case, not a fault.
+        logger.info(f"transfer rejected ({error}); the caller most likely hung up first")
+        return
+
+    # The REFER hands the caller to someone else, so this bot's leg is finished even though the
+    # call is not. Leaving the pipeline running holds the media socket open, and the leg then sits
+    # there until the engine's media timeout reaps it -- half a minute of a call nobody is on,
+    # during which the referee's NOTIFYs arrive on a dialog this side has stopped caring about.
+    if resources.worker is not None:
+        await resources.worker.queue_frame(EndWorkerFrame())
+
+
+class EchoGuard(FrameProcessor):
+    """Drop transcriptions that arrive while the line is the bot's own.
+
+    The problem this solves is not barge-in tuning, it is that the bot is being transcribed as the
+    caller. On a leg whose echo the media engine's canceller cannot reach, whatever the bot says
+    returns through the handset, the recognizer transcribes it faithfully, and the pipeline treats
+    it as the caller speaking -- interrupting the bot, and then answering it.
+
+    Pipecat's own `MinWordsUserTurnStartStrategy` guards the *interruption*, but only while the bot
+    is speaking. The echo arrives after that, so it slips past. This drops the transcription itself,
+    for as long as the bot is speaking plus a tail long enough to cover the echo's flight time.
+
+    The cost is the same as any half-duplex arrangement and should be understood: a caller who talks
+    over the bot is not heard, and what they said is gone rather than queued. The engine is the
+    right place for this -- siphon-rtp 0.5.0 holds the far-end reference, so it can tell the echo
+    from an interruption where this cannot -- but its veto gates the engine's own turn edge, and
+    this pipeline decides turns from its recognizer. So it helps here only once the echo is gone
+    from the audio, which needs a confident delay lock. Set the tail to 0 when you have one.
+    """
+
+    def __init__(self, speech: BotSpeechMonitor, tail_seconds: float) -> None:
+        """Guard against `speech`'s idea of who holds the line, for `tail_seconds` after it ends."""
+        super().__init__()
+        self._speech = speech
+        self._tail = tail_seconds
+        self._dropped = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Pass everything except a transcription that arrived while the line was ours."""
+        await super().process_frame(frame, direction)
+
+        if (
+            self._tail > 0
+            and isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
+            and self._speech.line_is_ours(self._tail)
+        ):
+            self._dropped += 1
+            # Debug, not info: on a bad leg this fires several times per sentence, and a log that
+            # scrolls is a log nobody reads. The count is what matters.
+            logger.debug(
+                f"echo guard: dropped {frame.__class__.__name__} "
+                f"{getattr(frame, 'text', '')!r} (total {self._dropped})"
+            )
+            return
+
+        await self.push_frame(frame, direction)
+
+
 def build_serializer() -> SiphonFrameSerializer:
     """Build the wire serializer, kept as its own object so the tools can read its `call_id`."""
     return SiphonFrameSerializer(
@@ -440,13 +649,17 @@ def build_serializer() -> SiphonFrameSerializer:
 
 
 def build_transport(
-    host: str, port: int, serializer: SiphonFrameSerializer
-) -> SingleClientWebsocketServerTransport:
-    """Build the WebSocket server transport the engine dials into."""
-    return SingleClientWebsocketServerTransport(
-        host=host,
-        port=port,
-        params=SingleClientWebsocketServerParams(
+    websocket: WebSocket, serializer: SiphonFrameSerializer
+) -> FastAPIWebsocketTransport:
+    """Build the transport for one accepted call.
+
+    One per connection, not one per process. The engine dials a fresh WebSocket per call, so the
+    socket *is* the call: binding a pipeline to it and tearing both down together is what lets this
+    bot answer more than one number, or the same number twice.
+    """
+    return FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
@@ -460,7 +673,9 @@ def build_transport(
 
 def build_llm_service(with_hangup: bool) -> AnthropicLLMService:
     """Build the Claude service, tuned for a conversation happening in real time."""
-    effort = EFFORT_BY_MODEL.get(MODEL)
+    # Keyed on the model actually used, not the default: effort is per-model and Haiku 4.5
+    # rejects it outright with a 400 on every turn, which is silence on every turn.
+    effort = EFFORT_BY_MODEL.get(LLM_MODEL)
     extra: dict[str, Any] = {"output_config": {"effort": effort}} if effort else {}
 
     # Server-side refusal fallbacks belong on a voice route -- a policy refusal mid-call is
@@ -474,8 +689,12 @@ def build_llm_service(with_hangup: bool) -> AnthropicLLMService:
     return AnthropicLLMService(
         api_key=_required_environment_variable("ANTHROPIC_API_KEY", "Claude API key"),
         settings=AnthropicLLMService.Settings(
-            model=MODEL,
-            system_instruction=SYSTEM_PROMPT + (HANGUP_PROMPT if with_hangup else ""),
+            model=LLM_MODEL,
+            system_instruction=(
+                SYSTEM_PROMPT
+                + (HANGUP_PROMPT if with_hangup else "")
+                + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
+            ),
             max_tokens=MAXIMUM_RESPONSE_TOKENS,
             # The system prompt is resent on every turn of the call; caching it is free money.
             enable_prompt_caching=True,
@@ -486,10 +705,13 @@ def build_llm_service(with_hangup: bool) -> AnthropicLLMService:
 
 def build_speech_to_text() -> DeepgramSTTService:
     """Build the recognizer, at the pipeline's rate."""
+    # Both are pinned at import (`... or "<default>"`), so there is no unset case to branch on:
+    # a phone line is 8 kHz, lossy and often not in the language a vendor default assumes, and an
+    # example whose recognizer drifts with that default is an example whose accuracy changes
+    # without anyone editing it.
     return DeepgramSTTService(
         api_key=_required_environment_variable("DEEPGRAM_API_KEY", "speech-to-text key"),
-        # Left on pipecat's own default model rather than pinned here: a model string in an
-        # example is a thing to maintain, and the default is the current streaming one.
+        settings=DeepgramSTTService.Settings(model=STT_MODEL, language=STT_LANGUAGE),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
@@ -500,19 +722,49 @@ def build_text_to_speech() -> CartesiaTTSService:
         api_key=_required_environment_variable("CARTESIA_API_KEY", "text-to-speech key"),
         settings=CartesiaTTSService.Settings(
             voice=_required_environment_variable("CARTESIA_VOICE_ID", "voice to speak with"),
+            model=TTS_MODEL,
         ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
 
-def build_worker(host: str, port: int, control: ControlPlane | None) -> PipelineWorker:
-    """Assemble the whole call: transport, recognizer, model, voice, and the turn machinery."""
+def build_user_turn_strategies() -> UserTurnStrategies:
+    """How a turn opens and closes, for one processor.
+
+    A new object per call site: these carry per-turn state, so two processors cannot share one.
+    """
+    return UserTurnStrategies(
+        # VAD opens a turn when the line is quiet; the word threshold governs interrupting a bot
+        # that is already speaking, which is where an uncancelled echo does its damage.
+        start=(
+            [VADUserTurnStartStrategy()]
+            if MIN_INTERRUPT_WORDS <= 1
+            else [MinWordsUserTurnStartStrategy(min_words=MIN_INTERRUPT_WORDS)]
+        ),
+        stop=[
+            SpeechTimeoutUserTurnStopStrategy(
+                user_speech_timeout=TURN_END_SILENCE_SECONDS,
+                wait_for_transcript=True,
+            )
+        ],
+    )
+
+
+def build_worker(websocket: WebSocket, control: ControlPlane | None) -> PipelineWorker:
+    """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
+
+    Everything here is per call. The services each open their own vendor connection, which is the
+    honest cost of concurrency: N simultaneous calls are N recognizer sockets and N synthesizer
+    sockets, not one shared pool. That is how pipecat is built, and it is why the ceiling is the
+    vendors' rate limits rather than anything in this file.
+    """
     serializer = build_serializer()
-    transport = build_transport(host, port, serializer)
+    transport = build_transport(websocket, serializer)
     speech_to_text = build_speech_to_text()
     llm = build_llm_service(with_hangup=control is not None)
     text_to_speech = build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
+    echo_guard = EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
     # the context carries only the call.
@@ -532,23 +784,45 @@ def build_worker(host: str, port: int, control: ControlPlane | None) -> Pipeline
                         handler=end_call,
                     )
                 ]
+                + (
+                    [
+                        FunctionSchema(
+                            name="transfer_call",
+                            description=(
+                                "Put the caller through to a person. Tell them you are "
+                                "transferring first: it happens as soon as your words have "
+                                "finished playing, and the call is not yours afterwards."
+                            ),
+                            properties={},
+                            required=[],
+                            handler=transfer_call,
+                        )
+                    ]
+                    if TRANSFER_TARGET
+                    else []
+                )
             )
         )
-    aggregators = LLMContextAggregatorPair(context)
-
     # Explicit strategies. Pipecat's defaults would reach for its neural smart-turn analyzer,
     # which is a model download and a second opinion about something the engine has already
     # decided. Start on the engine's speech edge, stop on its endpoint plus the transcript.
-    turn_processor = UserTurnProcessor(
-        user_turn_strategies=UserTurnStrategies(
-            start=[VADUserTurnStartStrategy()],
-            stop=[
-                SpeechTimeoutUserTurnStopStrategy(
-                    user_speech_timeout=TURN_END_SILENCE_SECONDS,
-                    wait_for_transcript=True,
-                )
-            ],
-        ),
+    #
+    # **Both** processors need them, which is the trap. `UserTurnProcessor` is the visible one, but
+    # `LLMUserAggregator` runs turn strategies of its own and it is the one that releases the
+    # context to the model -- so configuring only the processor leaves the analyzer deciding when
+    # the model runs. Measured on a call: the processor's endpoint fired, and the model waited
+    # another 2.7 s for the analyzer to agree, on every turn where it did not agree immediately.
+    # Fresh instances rather than one shared object: a strategy carries per-turn state.
+    turn_processor = UserTurnProcessor(user_turn_strategies=build_user_turn_strategies())
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(user_turn_strategies=build_user_turn_strategies()),
+    )
+
+    resources = (
+        CallResources(serializer=serializer, speech=speech_monitor, control=control)
+        if control is not None
+        else None
     )
 
     worker = PipelineWorker(
@@ -556,6 +830,9 @@ def build_worker(host: str, port: int, control: ControlPlane | None) -> Pipeline
             [
                 transport.input(),
                 speech_to_text,
+                # Between the recognizer and the turn logic on purpose: the echo is dropped before
+                # anything can treat it as the caller starting a turn.
+                echo_guard,
                 turn_processor,
                 aggregators.user(),
                 llm,
@@ -569,21 +846,55 @@ def build_worker(host: str, port: int, control: ControlPlane | None) -> Pipeline
             audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
             audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         ),
-        app_resources=(
-            CallResources(serializer=serializer, speech=speech_monitor, control=control)
-            if control is not None
-            else None
-        ),
-        # This is a server the engine dials into, so sitting idle between calls is the normal
-        # state and not a fault. Pipecat's 300 s default cancels the worker *and* the runner, and
-        # the WebSocket server stops listening: five minutes after a call ends, every later call
-        # is refused at the TCP connect and the engine reports a failed bridge dial.
+        app_resources=resources,
+        # A worker now lives for exactly one call, so idling is a stuck call rather than a server
+        # waiting for work, and the listener no longer depends on it: uvicorn owns the socket and
+        # keeps accepting whatever any individual call does. `None` still, because a caller who
+        # says nothing for five minutes is a caller, not a fault -- but the blast radius is now one
+        # call instead of the whole bot.
         idle_timeout_secs=None,
     )
 
-    @transport.event_handler("on_websocket_ready")
-    async def on_websocket_ready(_transport: object) -> None:
-        logger.info(f"listening on ws://{host}:{port}/ -- point the engine's ws_uri here")
+    if resources is not None:
+        resources.worker = worker
+
+    @worker.event_handler("on_pipeline_error")
+    async def on_pipeline_error(_worker: object, frame: ErrorFrame) -> None:
+        """End the call when a stage fails, rather than leaving the caller on a silent line.
+
+        A vendor that refuses a request -- a recognizer or synthesizer over its concurrency limit,
+        say -- pushes an `ErrorFrame` that is not marked permanent, so the pipeline carries on and
+        the call stays up with a bot that cannot speak. The caller hears nothing, the line stays
+        billed, and the only trace is a log line several layers down. Seen for real: eight
+        simultaneous calls against a plan allowing two, and half of them answered in silence.
+
+        There is no recovery a caller will wait through on a phone call, so the honest outcome is a
+        clean disconnect: a hangup over the control plane if there is one, so they get a BYE rather
+        than a socket closing under them.
+        """
+        processor = getattr(frame, "processor", None)
+        logger.error(
+            f"pipeline error on call {serializer.call_id or '(no call id yet)'}: {frame}"
+            f" -- ending the call rather than leaving it silent"
+            f" (processor {getattr(processor, 'name', '?')},"
+            f" still usable: {getattr(processor, 'is_usable', '?')})"
+        )
+
+        control_call = control.call_for(serializer.call_id) if control is not None else None
+        # `control is not None` is redundant at runtime -- control_call is only ever set through
+        # it -- but the narrowing does not survive the conditional expression, so say it.
+        if control is not None and control_call is not None:
+            try:
+                await control_call.hangup()
+                return
+            except control.error_class as error:
+                # The caller hanging up first is the ordinary case, not a fault.
+                logger.info(f"hangup rejected ({error}); the caller most likely hung up first")
+
+        # No control plane, or it would not take the hangup: end the pipeline instead. The engine
+        # tears the call down when the media socket closes, which is a blunter disconnect but still
+        # a disconnect.
+        await worker.queue_frame(EndWorkerFrame())
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport: object, _client: object) -> None:
@@ -601,21 +912,97 @@ def build_worker(host: str, port: int, control: ControlPlane | None) -> Pipeline
     return worker
 
 
-async def main(host: str, port: int, control: ControlPlane | None) -> None:
-    """Answer calls until the process is stopped."""
-    worker = build_worker(host, port, control)
+async def serve_call(websocket: WebSocket, control: ControlPlane | None) -> None:
+    """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
+    await websocket.accept()
+    worker = build_worker(websocket, control)
     runner = WorkerRunner()
     await runner.add_workers(worker)
+    # Returns when the pipeline ends, which is when the engine closes the socket. Everything the
+    # call owned -- the recognizer and synthesizer connections, the context, the turn state -- goes
+    # with it.
+    await runner.run()
+
+
+def build_app(control: ControlPlane | None) -> FastAPI:
+    """Build the HTTP surface: one WebSocket route the engine dials, once per call."""
+    app = FastAPI()
+
+    @app.websocket("/{path:path}")
+    async def media(websocket: WebSocket) -> None:
+        # Any path. The engine's `ws_uri` carries a `{call_id}` query and whatever path the
+        # deployment chose, and refusing an unexpected one would be a confusing way to fail a call
+        # that is otherwise perfectly formed. The call is identified by the `start` envelope, not
+        # by the URL.
+        try:
+            await serve_call(websocket, control)
+        except WebSocketDisconnect:
+            # The ordinary end of a call: the engine closed first.
+            logger.info("engine closed the media socket")
+        except Exception:
+            # One call's failure must not take the listener with it -- the whole point of moving to
+            # a per-call pipeline is that the other calls in flight are unaffected.
+            logger.exception("call failed")
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+async def main(host: str, port: int, control: ControlPlane | None) -> None:
+    """Answer calls until the process is stopped."""
+    # Said once, at startup, rather than per call. Without it, "why didn't it transfer" has two
+    # indistinguishable answers -- the tool was never registered, or the model chose not to call
+    # it -- and only one of them is a bug.
+    logger.info(
+        f"models: llm={LLM_MODEL} stt={STT_MODEL or 'pipecat default'}"
+        f"/{STT_LANGUAGE or 'default'} tts={TTS_MODEL or 'pipecat default'}"
+    )
+    logger.info(
+        "tools: "
+        + (
+            ", ".join(
+                ["end_call"] + (["transfer_call -> " + TRANSFER_TARGET] if TRANSFER_TARGET else [])
+            )
+            if control is not None
+            else "none (no control plane, so the bot can neither hang up nor transfer)"
+        )
+    )
+    # The turn-taking posture, for the same reason: "it interrupted itself" and "it would not let me
+    # interrupt" are both tuning, and neither is visible from a transcript.
+    logger.info(
+        "turn-taking: "
+        + (
+            f"echo guard {ECHO_GUARD_TAIL_SECONDS:g}s tail"
+            if ECHO_GUARD_TAIL_SECONDS > 0
+            else "echo guard off (the engine's canceller vetoes its own echo from 0.5.0)"
+        )
+        + f", interrupt after {MIN_INTERRUPT_WORDS} word(s)"
+    )
+    logger.info(f"listening on ws://{host}:{port}/ -- point the engine's ws_uri here")
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            build_app(control),
+            host=host,
+            port=port,
+            log_level="warning",
+            # uvicorn's own access log would add a line per call to a log that already says more.
+            access_log=False,
+        )
+    )
 
     if control is None:
-        await runner.run()
+        await server.serve()
         return
 
     # The media path must survive an absent control plane: the engine and this bot restart
     # independently, so "not listening yet" is a routine race and not a reason to exit.
     control_task = asyncio.create_task(control.run_forever())
     try:
-        await runner.run()
+        await server.serve()
     finally:
         control_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
