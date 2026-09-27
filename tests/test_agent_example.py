@@ -36,6 +36,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
 from agent_bot import (
+    EMPTY_TURN_RECOVERY,
     BotSpeechMonitor,
     ControlPlane,
     SharedConstructor,
@@ -913,8 +914,10 @@ class TestPinnedSampling:
         service = agent_bot.build_llm_service(with_hangup=False)
 
         assert isinstance(service, AnthropicLLMService)
-        # No public accessor, and the request that carries it is built inside the streaming call.
-        settings: Any = service._settings
+        # The request that carries it is built inside the streaming call, so the settings are read
+        # back instead. `settings` is public since pipecat 1.12 (this reached into `_settings`
+        # before) but typed as the base class, so the per-provider fields need a loose binding.
+        settings: Any = service.settings
         assert settings.temperature == 0.0
 
     def test_a_seed_is_withheld_from_the_provider_that_has_none(
@@ -929,6 +932,43 @@ class TestPinnedSampling:
         assert "seed" not in agent_bot._sampling_settings("anthropic")
         for provider in ("google", "openai", "local"):
             assert agent_bot._sampling_settings(provider)["seed"] == 7, provider
+
+
+class TestEmptyTurnRecovery:
+    """A caller turn that ends with nothing recognised in it.
+
+    pipecat 1.12 runs the model on one of those rather than leaving the bot silent, which is right
+    on a phone: silence after somebody speaks reads as a dropped call. What it ships is a prompt
+    written for a chat window, and this is a voice route.
+    """
+
+    def test_the_aggregator_is_given_the_recovery_config(self) -> None:
+        params = build_user_aggregator_params()
+
+        assert params.empty_user_turn is EMPTY_TURN_RECOVERY
+
+    def test_the_recovery_line_is_short_enough_to_be_said(self) -> None:
+        """The shipped default is three sentences and asks the model to re-ask its question."""
+        from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
+
+        shipped = EmptyUserTurnConfig().interrupted_prompt
+        ours = EMPTY_TURN_RECOVERY.interrupted_prompt
+
+        assert ours is not None and shipped is not None
+        assert len(ours.split()) < len(shipped.split()) / 2
+
+    def test_a_caller_who_goes_quiet_is_not_prompted(self) -> None:
+        """Same reasoning that leaves `idle_timeout_secs` unset: a pause is a caller thinking."""
+        assert EMPTY_TURN_RECOVERY.idle_prompt is None
+
+    def test_recovery_cannot_repeat(self) -> None:
+        """Cap it at one, because an echo can look exactly like a caller who was not heard.
+
+        On a leg whose echo the engine cannot cancel, the bot's own voice can open a turn whose
+        transcript the echo guard then drops: an interrupted turn with no words in it. One
+        recovery caps that at a single stray ask rather than a loop.
+        """
+        assert EMPTY_TURN_RECOVERY.max_consecutive_recoveries == 1
 
 
 @pytest.fixture
@@ -987,7 +1027,7 @@ class TestEveryProviderBuilds:
 
         service = agent_bot.build_llm_service(with_hangup=False)
 
-        settings: Any = service._settings
+        settings: Any = service.settings
         assert settings.model == agent_bot.DEFAULT_LLM_MODEL[provider]
         # The system prompt reaches every provider, under the one name they all share.
         assert settings.system_instruction.startswith("You are a voice assistant")
@@ -1002,8 +1042,7 @@ class TestEveryProviderBuilds:
 
         service = agent_bot.build_speech_to_text()
 
-        settings: Any = service._settings
-        assert settings.model == agent_bot.DEFAULT_STT_MODEL[provider]
+        assert service.settings.model == agent_bot.DEFAULT_STT_MODEL[provider]
         # `sample_rate` is resolved at setup; what the constructor was told is kept here.
         assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
 
@@ -1015,8 +1054,7 @@ class TestEveryProviderBuilds:
 
         service = agent_bot.build_text_to_speech()
 
-        settings: Any = service._settings
-        assert settings.model == agent_bot.DEFAULT_TTS_MODEL[provider]
+        assert service.settings.model == agent_bot.DEFAULT_TTS_MODEL[provider]
 
     def test_the_openai_voice_is_built_at_the_rate_it_actually_emits(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1050,7 +1088,7 @@ class TestEveryProviderBuilds:
 
         service = agent_bot.build_text_to_speech()
 
-        settings: Any = service._settings
+        settings: Any = service.settings
         assert settings.voice == "a-voice-on-this-account"
 
 
