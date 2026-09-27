@@ -65,10 +65,30 @@ jobs:
       - name: Test
         run: pytest -q
 
+  # ── The package's own pipecat floor ───────────────────────────────────────────────────────
+  # The job above installs `[dev]`, which asks for pipecat 1.12 because the *agent example* uses
+  # the empty-user-turn recovery that arrived in it. The published wheel asks only for 1.8, and a
+  # claim nothing exercises is a claim that quietly stops being true — so the serializer's own
+  # tests run against that floor, with only the extra it needs and none of the example's.
+  #
+  # Just the three package test files: the example and the harness are what want 1.12, and pulling
+  # them in here would test the wrong thing and fail at import.
+  floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install the package at its declared pipecat floor
+        run: pip install -e . "pipecat-ai[websocket]==1.8.1" pytest pytest-asyncio websockets
+      - name: Test the serializer only
+        run: pytest -q tests/test_protocol.py tests/test_serializer.py tests/test_end_to_end.py
+
   # ── Publish to PyPI (Trusted Publishing — OIDC, no token) ─────────────────────────────────
   pypi:
     runs-on: ubuntu-latest
-    needs: [verify-version, gates]
+    needs: [verify-version, gates, floor]
     permissions:
       id-token: write   # OIDC for PyPI Trusted Publishing
     steps:
