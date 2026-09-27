@@ -410,9 +410,9 @@ checkout to build either from source instead. Not part of CI yet; see
 
 | | Verified against |
 |---|---|
-| pipecat | `pipecat-ai` 1.8.1 |
-| siphon-rtp | 0.4.x, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against 0.2.x, 0.3.x and 0.4.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), and the attach/detach bridge lifecycle (0.4.0). None of it changes the wire this package speaks. |
-| siphon-sip | 1.7.0+ for the harness, which is the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
+| pipecat | `pipecat-ai` 1.8.1 and 1.10.0, both legs of the test matrix, on Python 3.11 and 3.13 |
+| siphon-rtp | 0.9.0, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against every release from 0.2.x to 0.9.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), the attach/detach bridge lifecycle (0.4.0), and since then fax, SRTP answer tags, a setup timeout and fuzzing. None of it changes the wire this package speaks. |
+| siphon-sip | 1.9.1 for the harness; 1.7.0 is the floor, being the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
 | Python | 3.13 (declared support 3.11+, matching pipecat's floor) |
 
 The control-frame fixtures under `tests/wire_fixtures.py` are byte-exact strings produced by
