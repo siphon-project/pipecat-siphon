@@ -49,8 +49,8 @@ is broken" in a couple of seconds:
 
 ```
 start sent: stream probe-1, 16000 Hz, 20 ms ptime
-first audio frame after 840 ms
-3.0 s elapsed: 118 audio frames in, 2360 ms of audio, 1 control message
+first audio frame after 3164 ms
+8.0 s elapsed: 148 audio frames in, 2960 ms of audio, 1 control message
 ```
 
 Audio coming back means the whole STT -> Claude -> TTS path works and the greeting fires. Nothing
@@ -79,6 +79,31 @@ docker compose up -d bot
 
 `agent_bot.py` is copied into the image rather than bind-mounted, so an edit to the Python itself
 needs `docker compose up --build bot`.
+
+### Changing who runs which part
+
+The bot does three jobs and picks a provider for each, so they can be mixed:
+
+| variable | choices |
+|---|---|
+| `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local` |
+| `BOT_STT_PROVIDER` | `deepgram`, `google`, `openai`, `local` |
+| `BOT_TTS_PROVIDER` | `cartesia`, `google`, `openai`, `local` |
+
+`BOT_BACKEND` is a preset for all three at once: `cloud` is Claude, Deepgram and Cartesia, `local`
+keeps every model on this host (llama.cpp, faster-whisper, Kokoro) on whichever GPU the image was
+built for. Set a role on its own to override the preset for that role only.
+
+Each provider asks for its own credential and the bot names whatever is missing at startup rather
+than at the first call. Two things catch people out. Gemini and Google's speech APIs are different
+products: `GOOGLE_API_KEY` authenticates the model, and the recognizer and voice want
+`GOOGLE_APPLICATION_CREDENTIALS`, a service-account JSON mounted into the container. And an image
+carries only the libraries it was built with, so a mix outside the two presets needs its extras
+named at build time:
+
+```sh
+BOT_EXTRAS=google,whisper,websocket docker compose build bot
+```
 
 ## Or run the three processes by hand
 

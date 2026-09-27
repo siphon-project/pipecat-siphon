@@ -1,12 +1,15 @@
 # A real phone number talking to Claude, as three containers.
 #
 #   your phone -> provider -> siphon-sip -> siphon-rtp --(media WebSocket)--> bot
-#                                 |                                          STT -> Claude -> TTS
+#                                 |                                          STT -> LLM -> TTS
 #                                 +---------(control WebSocket)-------------> hangup
 #
 # Copy `.env.example` to `.env`, fill in the provider's credentials and the three API keys, then
 # `docker compose up --build`. The README next to this file explains the settings that decide
 # whether it works at all, and the handful of things that go wrong.
+#
+# To keep the models on this host instead, set BOT_BACKEND=local and COMPOSE_PROFILES=local (section
+# 3 of `.env.example`). That adds a fourth container, `llm`, and needs no API keys.
 #
 # ── Why host networking ─────────────────────────────────────────────────────────────────────────
 # A registered SIP account only works if the provider can reach the address this node puts in its
@@ -15,9 +18,8 @@
 # the media range would need every port in RTP_PORT_MIN..RTP_PORT_MAX published, and publishing a
 # thousand UDP ports costs a userland proxy process per port.
 #
-# The cost is that the three services share one port space with the host. Every port below is
-# therefore an environment variable: if something already owns 5060, move this stack rather than
-# fighting it.
+# The cost is that the services share one port space with the host. Every port below is therefore
+# an environment variable: if something already owns 5060, move this stack rather than fighting it.
 
 name: pipecat-siphon-quickstart
 
@@ -28,7 +30,7 @@ services:
   # turn boundaries, and the WebSocket bridge that carries L16 to the bot.
   engine:
     # Override to run a locally built engine — e.g. testing an unreleased fix.
-    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:${SIPHON_RTP_VERSION:-0.5.0}}
+    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:${SIPHON_RTP_VERSION:-0.9.0}}
     network_mode: host
     restart: unless-stopped
     command:
@@ -59,9 +61,16 @@ services:
     build:
       context: ../..
       dockerfile: examples/quickstart/Dockerfile
-    image: pipecat-siphon-quickstart/bot:local
+      args:
+        BOT_BACKEND: "${BOT_BACKEND:-cloud}"
+    # Tagged by backend, so changing BOT_BACKEND builds the other image rather than running this one.
+    image: pipecat-siphon-quickstart/bot:${BOT_BACKEND:-cloud}
     network_mode: host
     restart: unless-stopped
+    # `nvidia` hands the container to NVIDIA's container runtime, which injects the driver and device
+    # nodes faster-whisper needs for the GPU. `runc` is the ordinary runtime, which is all the cloud
+    # path, and a local deployment without a GPU, ever need.
+    runtime: ${BOT_RUNTIME:-runc}
     command:
       - "--host"
       - "127.0.0.1"
@@ -71,19 +80,36 @@ services:
       - "ws://127.0.0.1:${CONTROL_PORT:-9092}/control/ws"
       - "--control-app"
       - "${CONTROL_APP:-agent-app}"
+    volumes:
+      # The local path's model downloads -- Whisper's weights from Hugging Face, Kokoro's from its
+      # releases -- land here once rather than on every container start. Empty on the cloud path.
+      - model-cache:/home/bot/.cache
     environment:
-      # The three vendors. No default for any of them: a missing key should stop the bot at startup
-      # with the name of the one that is missing, not at the first call.
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}"
-      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:?set DEEPGRAM_API_KEY in .env}"
-      CARTESIA_API_KEY: "${CARTESIA_API_KEY:?set CARTESIA_API_KEY in .env}"
-      CARTESIA_VOICE_ID: "${CARTESIA_VOICE_ID:?set CARTESIA_VOICE_ID in .env}"
+      BOT_BACKEND: "${BOT_BACKEND:-cloud}"
+      # Per-role overrides of that preset. Empty leaves the preset's own choice. The image has to
+      # carry the provider's library, so a mix outside the two presets is also a BOT_EXTRAS build.
+      BOT_LLM_PROVIDER: "${BOT_LLM_PROVIDER:-}"
+      BOT_STT_PROVIDER: "${BOT_STT_PROVIDER:-}"
+      BOT_TTS_PROVIDER: "${BOT_TTS_PROVIDER:-}"
+      # Every vendor credential any provider might ask for. None is required at this level, because
+      # which ones are needed depends on the three providers selected: the bot checks its own
+      # selection at startup and names what is missing, which is the same early failure a required
+      # value here used to give.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:-}"
+      CARTESIA_API_KEY: "${CARTESIA_API_KEY:-}"
+      CARTESIA_VOICE_ID: "${CARTESIA_VOICE_ID:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      # Google's speech APIs authenticate as a service account, not with the key above. The path is
+      # inside the container, so the file has to be mounted there; see .env.example.
+      GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS:-}"
       # Shared with siphon.yaml's control app, so the bot may hang up.
       SIPHON_CONTROL_TOKEN: "${AGENT_APP_TOKEN}"
       # Persona and capability, overriding what the example hard-codes.
       BOT_SYSTEM_PROMPT: "${BOT_SYSTEM_PROMPT:-}"
       BOT_TRANSFER_TARGET: "${BOT_TRANSFER_TARGET:-}"
-      # Model choices. Empty leaves the example's own defaults.
+      # Model choices. Empty leaves the example's own defaults for the selected backend.
       BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
       BOT_STT_MODEL: "${BOT_STT_MODEL:-}"
       BOT_STT_LANGUAGE: "${BOT_STT_LANGUAGE:-}"
@@ -91,6 +117,68 @@ services:
       BOT_SAMPLE_RATE: "${BOT_SAMPLE_RATE:-}"
       BOT_MIN_INTERRUPT_WORDS: "${BOT_MIN_INTERRUPT_WORDS:-}"
       BOT_ECHO_GUARD_TAIL: "${BOT_ECHO_GUARD_TAIL:-}"
+      # Deliberately not defaulted to the local server. The bot already points the `local` provider
+      # at 127.0.0.1:8090 on its own, and a value set here would reach *every* provider -- which for
+      # `openai` means sending each turn to localhost instead of the vendor, and getting silence with
+      # no error anywhere. Set it only for a compatible server that is not on the default port.
+      BOT_LLM_BASE_URL: "${BOT_LLM_BASE_URL:-}"
+      BOT_TTS_VOICE: "${BOT_TTS_VOICE:-}"
+      BOT_WHISPER_DEVICE: "${BOT_WHISPER_DEVICE:-}"
+      BOT_WHISPER_COMPUTE_TYPE: "${BOT_WHISPER_COMPUTE_TYPE:-}"
+      # Read by the NVIDIA runtime to decide what to inject. Inert under runc.
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
+  # ── The local LLM (profile `local`) ────────────────────────────────────────────────────────────
+  # llama.cpp's server, answering the OpenAI chat-completions API the bot's local path calls. Only
+  # started with COMPOSE_PROFILES=local, so the cloud stack stays exactly three containers.
+  #
+  # Pinned by digest rather than by the rolling `server-cuda` tag, so the model server does not
+  # change under a deployment nobody touched. That image is built on CUDA 12.8 and declares support
+  # for 535- and 550-series drivers; `docker compose logs llm` shows whether it found the GPU and
+  # offloaded every layer, and that is worth reading once rather than assuming.
+  llm:
+    image: ${LLM_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:0d9738b203c12d96c1157b76482d5c7afa95fd28b2031b0bff912bd457791819}
+    profiles: ["local"]
+    network_mode: host
+    restart: unless-stopped
+    runtime: ${LLM_RUNTIME:-nvidia}
+    command:
+      - "--model"
+      - "/models/model.gguf"
+      # The name the bot asks for. llama-server serves one model, so this only has to agree with
+      # BOT_LLM_MODEL, whose local default is the same word.
+      - "--alias"
+      - "${BOT_LLM_MODEL:-local}"
+      # Loopback: nothing but the bot should reach this.
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "${LLM_PORT:-8090}"
+      # Tool calling in llama-server goes through the model's own chat template, which this enables.
+      # end_call and transfer_call are tools, so hangup and transfer depend on it.
+      - "--jinja"
+      - "--n-gpu-layers"
+      - "${LLM_GPU_LAYERS:-999}"
+      # Split across the slots below: each concurrent call gets LLM_CONTEXT / LLM_PARALLEL tokens.
+      - "--ctx-size"
+      - "${LLM_CONTEXT:-8192}"
+      - "--parallel"
+      - "${LLM_PARALLEL:-2}"
+    volumes:
+      - type: bind
+        source: "${LLM_MODEL_FILE:-./models/model.gguf}"
+        target: /models/model.gguf
+        read_only: true
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    # The image's own check probes localhost:8080, which under host networking is the engine's
+    # control socket, not this server: the probe never reaches llama-server, the container reads as
+    # unhealthy while serving fine, and every interval the engine logs an HTTP request as a malformed
+    # control frame. Point it at the port this server actually listens on.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${LLM_PORT:-8090}/health"]
 
   # ── The SIP stack ──────────────────────────────────────────────────────────────────────────────
   # Registers to the provider on startup and routes their inbound INVITEs into the bot. Credentials
@@ -99,7 +187,7 @@ services:
   sip:
     # Override to run a locally built SIP stack — e.g. testing an unreleased fix, the same
     # escape hatch the engine has.
-    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:${SIPHON_SIP_VERSION:-1.8.4}}
+    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:${SIPHON_SIP_VERSION:-1.9.1}}
     network_mode: host
     restart: unless-stopped
     depends_on:
@@ -135,3 +223,6 @@ services:
       BOT_WS_URI: "${BOT_WS_URI}"
       RUST_LOG: "${SIP_LOG:-info,siphon::rtpengine=debug,siphon::script=debug}"
     command: ["--config", "/etc/siphon/siphon.yaml"]
+
+volumes:
+  model-cache:
