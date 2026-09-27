@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The agent example moves to pipecat 1.12 and answers a turn it could not make out.** Before 1.12
+  a caller turn that ended with nothing recognised in it simply did not run the model, so the bot
+  said nothing — and silence after somebody speaks reads as a dropped call rather than as a missed
+  word. 1.12 runs the model on one of those, and the example keeps that on and replaces the prompt:
+  what ships is three sentences written for a chat window that ask the model to re-ask its own
+  question, and this is a voice route, so it is one spoken sentence instead. A caller who simply
+  goes quiet is still left alone, for the same reason `idle_timeout_secs` is unset — a pause is
+  someone thinking. Recovery is capped at one in a row, which is the guard that matters on a leg
+  whose echo the engine cannot cancel: the bot's own voice can open a turn whose transcript the echo
+  guard then drops, and that is indistinguishable from a caller who was not heard.
+- **The example asks for pipecat 1.12; the package still installs against 1.8.** The serializer does
+  not use anything newer, so the wheel's own requirement is unchanged and its tests now run against
+  that floor in their own CI job rather than the claim going unexercised. `[dev]` asks for 1.12
+  because it is the example's tests that need it.
+
 ### Added
 
 - **A provider per role in the agent example, instead of one backend for all three.** The bot does
