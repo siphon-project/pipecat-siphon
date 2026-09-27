@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The scripted caller's signalling, for every conversation scenario.
+
+    INVITE -> [100/180/183] -> 200 (the engine's address in c=) -> ACK
+    then one of:
+      REFER -> 202 -> NOTIFY sipfrag 200 -> 200 -> BYE -> 200     the bot transferred the caller
+      BYE -> 200                                                   the bot hung up
+      (outcome timeout) BYE -> 200                                 neither happened in time
+
+  SIPp only signals here. The audio is a separate process that binds the port this offer
+  advertises, speaks each line once the bot has gone quiet, and keeps sending silence until SIPp
+  exits: the engine only ends a caller turn while RTP keeps arriving.
+
+  Rendered per call by tools/conversation/sipp_template.py, which fills this file's percent-brace
+  placeholders and leaves SIPp's own [keywords] alone. A REFER the scenario does not expect is still answered:
+  whether the bot should have sent it is for the evaluator to judge from the capture, not a SIP
+  failure that would stop the call before the evidence exists.
+-->
+<scenario name="conversation caller">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:agent@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:agent@harness.example>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: conversation-harness-caller
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP4 [local_ip]
+s=-
+c=IN IP4 [local_ip]
+t=0 0
+m=audio %{caller_media_port} RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="183" optional="true" />
+  <recv response="200" rtd="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 %{engine_address_regexp}"
+            search_in="body"
+            check_it="true"
+            assign_to="engine_address" />
+      <log message="answered engine_address=[$engine_address]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:agent@harness.example>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- A transfer: the target, and that the REFER is in-dialog (it carries our To-tag). -->
+  <recv request="REFER" optional="true" next="transfer">
+    <action>
+      <ereg regexp="Refer-To:[^\r\n]*%{refer_to_regexp}"
+            search_in="msg"
+            check_it="true"
+            assign_to="refer_to" />
+      <ereg regexp="To:[^\r\n]*;tag="
+            search_in="msg"
+            check_it="true"
+            assign_to="refer_in_dialog" />
+      <log message="branch=refer refer_to=[$refer_to]" />
+    </action>
+  </recv>
+
+  <recv request="BYE" timeout="%{outcome_timeout_ms}" ontimeout="caller_hangs_up">
+    <action>
+      <log message="branch=bot_hung_up" />
+    </action>
+  </recv>
+
+  <send next="finished">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <label id="transfer" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 202 Accepted
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- RFC 3515 section 2.4.4: report the transfer's outcome to the referrer. -->
+  <send retrans="500">
+    <![CDATA[
+NOTIFY [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:agent@harness.example>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 NOTIFY
+[routes]
+Event: refer
+Subscription-State: terminated;reason=noresource
+Max-Forwards: 70
+Content-Type: message/sipfrag;version=2.0
+Content-Length: [len]
+
+SIP/2.0 200 OK
+]]>
+  </send>
+
+  <recv response="200" />
+
+  <!-- A blind transfer is done: the transferee releases the original call. -->
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:agent@harness.example>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" next="finished" />
+
+  <label id="caller_hangs_up" />
+
+  <nop>
+    <action>
+      <log message="branch=caller_hung_up" />
+    </action>
+  </nop>
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@harness.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:agent@harness.example>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" />
+
+  <label id="finished" />
+
+  <nop>
+    <action>
+      <log message="finished" />
+    </action>
+  </nop>
+
+</scenario>

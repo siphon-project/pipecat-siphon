@@ -31,7 +31,7 @@ services:
   # answer with c=IN IP4 127.0.0.1 and no RTP on this network could ever reach it. The SIPp
   # scenarios assert on this exact address so that regression fails loudly instead of quietly.
   engine:
-    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:0.4.3}
+    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:0.9.0}
     build:
       context: ${SIPHON_RTP_PATH:-../../siphon-rtp}
       target: runtime
@@ -83,7 +83,7 @@ services:
 
   # ── The B2BUA / proxy under test ─────────────────────────────────────────────────────────
   proxy:
-    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:1.8.1}
+    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:1.9.1}
     build:
       context: ${SIPHON_SIP_PATH:-../../siphon}
     depends_on:

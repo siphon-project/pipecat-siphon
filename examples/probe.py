@@ -10,14 +10,14 @@ engine's half of the wire: connect, send `start`, stream silence, and count what
 A working bot answers with audio within a second or two, because it greets the caller first::
 
     start sent: stream probe-1, 16000 Hz, 20 ms ptime
-    first audio frame after 840 ms
+    first audio frame after 3164 ms
     ...
-    3.0 s elapsed: 118 audio frames in, 2360 ms of audio, 1 control message
+    8.0 s elapsed: 148 audio frames in, 2960 ms of audio, 1 control message
 
 A bot that is broken above the media path answers with nothing at all, and that is the whole
 diagnosis::
 
-    3.0 s elapsed: 0 audio frames in, 0 ms of audio, 0 control messages
+    8.0 s elapsed: 0 audio frames in, 0 ms of audio, 0 control messages
     no audio came back -- the bot accepted the socket and never spoke
 
 Then read the bot's own log: this says where to look, not what is wrong.
@@ -167,7 +167,11 @@ def parse_arguments() -> argparse.Namespace:
     """Parse the target URI and the wire shape to announce."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("uri", help="the bot's media WebSocket, e.g. ws://127.0.0.1:9001/stream")
-    parser.add_argument("--seconds", type=float, default=3.0, help="how long to listen (default 3)")
+    # 8 rather than 3. The first call after a start is the slow one -- the recognizer and the
+    # synthesizer are still opening their sockets and the model has nothing cached -- and a cold
+    # greeting measured over 3 s on a working bot, which this tool then reported as no audio at all.
+    # A false negative here is worse than a slow check: it sends you looking at the media path.
+    parser.add_argument("--seconds", type=float, default=8.0, help="how long to listen (default 8)")
     parser.add_argument(
         "--sample-rate",
         type=int,

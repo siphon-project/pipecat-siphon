@@ -44,7 +44,22 @@ dev = [
     # it wires together. Not a dependency of the package -- nothing under src/ imports these --
     # but without them the example's tests would skip in CI rather than run, which is the way a
     # test suite goes quietly green while the thing it covers rots.
-    "pipecat-ai[anthropic,cartesia,deepgram]>=1.8.0,<2",
+    #
+    # `websocket` is what carries fastapi, which the example serves the per-call media socket on.
+    # It is an extra rather than a base pipecat dependency, so leaving it off does not fail at
+    # install time -- it fails at `import agent_bot`, which is to say at mypy and at every test in
+    # test_agent_example.py. Not `runner`, which would also carry the prebuilt UI package.
+    #
+    # One extra per provider the example can be pointed at, because the tests build every one of
+    # them. `openai` was arriving transitively and is named now that it is a provider in its own
+    # right rather than only the shape the local server speaks. `google` is the heaviest of them by
+    # far -- it brings the Google auth stack, grpcio and cryptography -- and it is here rather than
+    # in the package's own dependencies because nothing under src/ imports any of this: the
+    # published wheel still depends on `pipecat-ai` alone.
+    "pipecat-ai[anthropic,cartesia,deepgram,google,openai,websocket]>=1.8.0,<2",
+    # The ASGI server the example runs that fastapi app on. Same story: example-only, never
+    # imported from src/, so the published wheel's dependencies are unchanged by either of these.
+    "uvicorn>=0.32,<1",
 ]
 # Deliberately not in `dev`: the control-plane client is a Rust extension with no wheel for every
 # interpreter, so requiring it would put a Rust toolchain in the CI path. The tests that cover the
@@ -69,7 +84,7 @@ include = [
     "LICENSE",
     "pyproject.toml",
 ]
-exclude = ["integration/artifacts"]
+exclude = ["integration/artifacts", "integration/conversation/artifacts"]
 
 [tool.ruff]
 line-length = 100
@@ -90,8 +105,9 @@ ignore = ["D203", "D213"]
 python_version = "3.11"
 files = ["src", "tests", "examples", "integration"]
 # `examples/` is a flat set of scripts, not a package, so the tests that exercise the agent
-# example import it by bare name. Mirrors the sys.path insert in tests/conftest.py.
-mypy_path = "examples"
+# example import it by bare name; the harness's `tools` package lives under `integration/` and is
+# imported the same way. Mirrors the sys.path inserts in tests/conftest.py.
+mypy_path = "examples:integration"
 strict = true
 warn_unreachable = true
 # pipecat's `@transport.event_handler(...)` is an untyped decorator; every handler in a pipecat
@@ -101,7 +117,11 @@ disallow_untyped_decorators = false
 # scripts: they run inside that daemon's embedded interpreter against a `siphon` module that only
 # exists in the daemon's process, and their handler signatures are fixed by that API. Everything
 # else under integration/ and examples/ is checked strictly, like the package itself.
-exclude = ["integration/proxy/harness_script\\.py", "examples/quickstart/route\\.py"]
+exclude = [
+    "integration/proxy/harness_script\\.py",
+    "integration/conversation/proxy/route\\.py",
+    "examples/quickstart/route\\.py",
+]
 
 [[tool.mypy.overrides]]
 module = ["audioop", "pipecat.*", "websockets.*"]

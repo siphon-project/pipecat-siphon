@@ -52,6 +52,13 @@ transport = SingleClientWebsocketServerTransport(
 pipeline = Pipeline([transport.input(), your_processors, transport.output()])
 ```
 
+That transport holds one connection for the life of the process, which is the right shape for
+`examples/echo_bot.py` and the wrong one for a phone number: the engine dials a fresh WebSocket per
+call, so a single-client server is a hard ceiling of one call at a time. For anything that answers
+a real number, serve a WebSocket per call and build the pipeline inside the handler --
+`examples/agent_bot.py` does exactly that with pipecat's `FastAPIWebsocketTransport`. The
+serializer is per call either way; it carries the call's own `start` parameters.
+
 Then point the engine at it, in the `profile` of a native-JSON `offer`:
 
 ```json
@@ -365,8 +372,20 @@ python examples/probe.py ws://127.0.0.1:9001/stream
 
 [`examples/quickstart/`](examples/quickstart/) is the whole thing end to end: siphon-sip registers
 to a SIP provider, inbound calls on that registration are handed to the bot, and the bot can hang
-up. A config file, a routing script and a README. Nothing in it is provider-specific — registration
-is RFC 3261, and every credential comes from the environment.
+up. Nothing in it is provider-specific — registration is RFC 3261, and every credential comes from
+the environment.
+
+It runs as three containers, so a clone, a `.env` and one command is the whole setup:
+
+```bash
+cd examples/quickstart
+cp .env.example .env      # three API keys, the SIP account, the address the provider can reach
+docker compose up --build
+```
+
+There is a by-hand path for the three processes too, and a probe that tells you whether the bot
+answers with audio before you spend a phone call finding out. See
+[`examples/quickstart/README.md`](examples/quickstart/README.md).
 
 ## Integration harness
 
@@ -391,9 +410,9 @@ checkout to build either from source instead. Not part of CI yet; see
 
 | | Verified against |
 |---|---|
-| pipecat | `pipecat-ai` 1.8.1 |
-| siphon-rtp | 0.4.x, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against 0.2.x, 0.3.x and 0.4.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), and the attach/detach bridge lifecycle (0.4.0). None of it changes the wire this package speaks. |
-| siphon-sip | 1.7.0+ for the harness, which is the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
+| pipecat | `pipecat-ai` 1.8.1 and 1.10.0, both legs of the test matrix, on Python 3.11 and 3.13 |
+| siphon-rtp | 0.9.0, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against every release from 0.2.x to 0.9.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), the attach/detach bridge lifecycle (0.4.0), and since then fax, SRTP answer tags, a setup timeout and fuzzing. None of it changes the wire this package speaks. |
+| siphon-sip | 1.9.1 for the harness; 1.7.0 is the floor, being the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
 | Python | 3.13 (declared support 3.11+, matching pipecat's floor) |
 
 The control-frame fixtures under `tests/wire_fixtures.py` are byte-exact strings produced by

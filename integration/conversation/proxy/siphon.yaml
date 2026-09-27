@@ -1,0 +1,66 @@
+# siphon-sip configuration for the conversation harness.
+#
+# The `agent` media profile is examples/quickstart/siphon.yaml's, value for value, so a scripted
+# call takes the media path a deployment's calls take: tests/test_conversation_stack.py fails when
+# the two drift apart. Everything else is what an isolated bridge network needs and no more: no
+# registration, no provider group, and a control listener on the harness network, because the bot
+# connects to it from its own container.
+#
+# siphon-sip drops unknown keys silently, which is why the stack's checks are on the behaviour these
+# settings produce rather than on this file.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "harness.example"
+    - "${SIPHON_SIP_ADDRESS}"
+
+advertised_address: "${SIPHON_SIP_ADDRESS}"
+
+script:
+  path: "/harness/proxy/route.py"
+
+admin:
+  listen: "0.0.0.0:8081"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "${SIPHON_RTP_CONTROL}"
+    timeout_ms: 4000
+
+  profiles:
+    # Copied from the quickstart; see the comments there for what each setting is for.
+    agent:
+      offer: {}
+      answer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        received_from: true
+        noise_suppression: true
+        echo_cancellation: true
+        echo_long_tail: true
+        echo_delay_search_ms: 512
+        ws_vad: true
+        ws_barge_in: true
+        ws_vad_engine: neural
+        ws_vad_min_speech_ms: 100
+        ws_sample_rate: 16000
+
+control:
+  # On the harness network rather than loopback: the bot is another container. The network is a
+  # private bridge with nothing else on it.
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "agent-app"
+      token: "${AGENT_APP_TOKEN}"
+      on_lost: hangup
+
+log:
+  level: info
+  format: pretty
