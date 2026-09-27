@@ -14,3 +14,10 @@ from pathlib import Path
 _EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 if str(_EXAMPLES) not in sys.path:
     sys.path.insert(0, str(_EXAMPLES))
+
+# The integration harness's tools are a `tools` package under `integration/`, imported by that name
+# inside the harness's own containers. The call-scenario harness keeps its pure logic there and
+# tests it from here, so the same name has to resolve.
+_INTEGRATION = Path(__file__).resolve().parent.parent / "integration"
+if str(_INTEGRATION) not in sys.path:
+    sys.path.insert(0, str(_INTEGRATION))
