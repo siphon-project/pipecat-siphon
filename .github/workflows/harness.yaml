@@ -1,0 +1,79 @@
+# .github/workflows/harness.yaml — the four-way integration harness, on a schedule.
+#
+# Not on pull requests, for the reasons the release workflow always gave: it wants Docker, it pulls
+# the engine and proxy images, it needs NET_ADMIN/NET_RAW for the capture, and it takes minutes. Put
+# on every pull request it would be the slowest and flakiest check in the repository.
+#
+# But left to run only by hand it is a claim nobody exercises. The compatibility table says which
+# engine release the serializer is verified against, and the thing that verifies it is this. Engine
+# and proxy releases land on their own schedule, independent of this repository, so the drift arrives
+# without a commit here to trigger it — which is exactly what a scheduled run is for.
+#
+# Weekly, plus a button. A failure here is not necessarily this package's fault: it means the wire
+# this package speaks and the engine that speaks it back have diverged, which is worth knowing
+# either way.
+name: Integration harness
+
+on:
+  schedule:
+    # Mondays, early UTC. Nothing depends on the hour; it is off the top of the hour because that is
+    # when GitHub's scheduler is busiest and queues the longest.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "One scenario to run, or empty for all three"
+        required: false
+        type: choice
+        options: ["", "roundtrip", "turntaking", "wideband"]
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    name: SIPp → siphon-sip → siphon-rtp → bot
+    runs-on: ubuntu-latest
+    # Generous: it pulls two images, builds two more, and runs three calls end to end. The point of
+    # the ceiling is to fail rather than hang if the engine never becomes ready.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # The images are public, so no registry login. Pulled as an explicit step so a registry
+      # problem reads as a registry problem rather than as a harness failure.
+      - name: Pull the engine and proxy images
+        run: |
+          set -eu
+          grep -ohE 'ghcr\.io/[a-z0-9/_.-]+:[A-Za-z0-9_.-]+' integration/docker-compose.yaml \
+            | sort -u | tee images.txt
+          while read -r image; do docker pull "$image"; done < images.txt
+
+      - name: Run the harness
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+        run: |
+          set -eu
+          cd integration
+          if [ -n "$SCENARIO" ]; then
+            ./run.sh --scenario "$SCENARIO"
+          else
+            ./run.sh
+          fi
+
+      # The captures and the per-scenario analyses are the whole evidence trail. On a failure they
+      # are the only way to tell "the engine changed" from "the harness broke", and neither is
+      # reconstructable after the runner is gone.
+      - name: Keep the captures and analyses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-artifacts
+          path: integration/artifacts/
+          retention-days: 30
+          if-no-files-found: warn
