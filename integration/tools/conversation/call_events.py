@@ -54,7 +54,20 @@ def _write_line(line: str) -> None:
 
 
 class CallEventObserver(BaseObserver):
-    """Write an event line for each frame of a call that says what the bot did."""
+    """Write an event line for each frame of a call that says what the bot did.
+
+    This one has to see **every** hop a frame makes, not just its first. pipecat's other observers
+    all pass `observe_every_push=False`, which delivers a frame once and then nothing, and every one
+    of them is reporting a frame's *existence*. This one reports where a frame got to: a transcript
+    is `transcript_heard` when the recognizer emits it and `transcript_accepted` only on the hop
+    whose destination is the aggregator, and the difference between those two is precisely what the
+    echo guard dropped. Take the default away and the second event never fires, the harness reads
+    every call as having dropped nothing, and the check that exists to catch a bot being transcribed
+    as its caller passes for the wrong reason.
+
+    So the dedup below is this class's own, on the frame id and on the other half of a broadcast,
+    rather than pipecat's.
+    """
 
     def __init__(
         self,
