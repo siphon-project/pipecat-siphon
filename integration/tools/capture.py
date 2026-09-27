@@ -21,6 +21,7 @@ __all__ = ["RtpPacket", "TsharkError", "read_rtp"]
 _FIELDS = (
     "frame.number",
     "frame.time_relative",
+    "frame.time_epoch",
     "ip.src",
     "ip.dst",
     "udp.srcport",
@@ -43,6 +44,10 @@ class RtpPacket:
 
     number: int
     time: float
+    """Seconds since the first frame of this read. What a span within one capture is measured in."""
+    epoch: float
+    """Seconds since the Unix epoch. The clock the SIP reader uses too, so a packet and a message
+    from the same capture can be ordered against each other; `time` restarts per read and cannot."""
     source_address: str
     destination_address: str
     source_port: int
@@ -62,6 +67,7 @@ def _parse_row(row: str) -> RtpPacket | None:
     (
         number,
         time_relative,
+        time_epoch,
         source_address,
         destination_address,
         source_port,
@@ -78,6 +84,7 @@ def _parse_row(row: str) -> RtpPacket | None:
         return RtpPacket(
             number=int(number),
             time=float(time_relative),
+            epoch=float(time_epoch),
             source_address=source_address,
             destination_address=destination_address,
             source_port=int(source_port),
