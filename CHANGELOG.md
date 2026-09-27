@@ -6,6 +6,102 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A provider per role in the agent example, instead of one backend for all three.** The bot does
+  three jobs, and `BOT_LLM_PROVIDER`, `BOT_STT_PROVIDER` and `BOT_TTS_PROVIDER` each choose who does
+  one of them: `anthropic`, `google` or `openai`, or `local` for a model on the host. `BOT_BACKEND`
+  stays as a preset that sets all three (`cloud` is Claude, Deepgram and Cartesia; `local` keeps
+  everything on the host), so an existing deployment is unaffected. One string for all three roles
+  would have needed a name per combination, and the useful ones are mixed: a hosted model with a
+  local recognizer, or a local model with a hosted voice. Which credentials are required follows
+  from the selection, and the bot still names what is missing at startup rather than at the first
+  call. Note that Gemini and Google's speech APIs are different products with different credentials
+  — `GOOGLE_API_KEY` against `GOOGLE_APPLICATION_CREDENTIALS` — and that an image carries only the
+  libraries it was built with, so a mix outside the two presets needs `BOT_EXTRAS` at build time.
+- **A local backend for the agent example.** `BOT_BACKEND=local` runs the three models on the host
+  instead of the vendors: an OpenAI-compatible LLM server (llama.cpp's `llama-server`, a new `llm`
+  service under the quickstart's `local` compose profile), faster-whisper and Kokoro. The turn
+  strategies, the echo guard and the tools are the same objects on both paths. Whisper and Kokoro
+  each load their model in their constructor and the example builds its services per call, so as
+  shipped every call would pay a model load before the greeting; the local path shares one loaded
+  model per process and loads it at startup instead. The vendor keys are no longer required by
+  compose: the bot checks what its selected backend needs when it starts and names what is missing.
+- **Pinned sampling for the agent example.** `BOT_LLM_TEMPERATURE` sets the model's temperature on
+  both backends and `BOT_LLM_SEED` its seed on the local one; the cloud model takes no seed. Both
+  are unset by default, which leaves each model server's own defaults. Pin them when calls are
+  compared with each other: a scenario repeated a hundred times measures the agent only if the
+  model samples the same way every time.
+- **An observer hook in the agent example.** `run(arguments, observer_factory=...)` builds an
+  observer for each call from that call's serializer, which is what learns the SIP Call-ID, and
+  attaches it to the call's pipeline. The example's own entrypoint passes none.
+
+### Fixed
+
+- **OpenAI's voice would have played a third slow and a fifth flat.** Its speech endpoint emits PCM
+  at one rate and takes no rate parameter, so asking it for the pipeline's 16 kHz does not change
+  the bytes — it only labels 24 kHz audio as 16 kHz, and pipecat warns and carries on. The service
+  is now built at the rate it actually emits and the output transport resamples on the way to the
+  wire, which is the one place in the process that converts.
+- **A probe against a cold bot reported no audio on a working bot.** The window was three seconds
+  and the first greeting of a process takes longer than that: the recognizer and synthesizer are
+  still opening their sockets and the model has nothing cached. Measured at 3.2 s on the default
+  providers, against a 3.0 s window. The default is eight seconds now. A false negative in the tool
+  whose whole job is telling a broken model apart from a broken media path is worse than a slow
+  check, because it sends you to the wrong half.
+- **A pinned seed reached a model whose API has none.** It was gated on the backend being the local
+  one, which was true while only that path spoke the OpenAI API. It is now a property of the
+  provider, so Gemini and OpenAI get the seed and Anthropic, which has no such parameter, does not.
+- **The model could wait five seconds after the caller had finished speaking.** Two processors
+  decided the caller's turn from the same frames: a turn processor, and behind it the aggregator
+  that releases the context to the model. When the recognizer announces a transcription latency
+  (pipecat assumes one second for a service that sets none) and the word count opens the turn on
+  the transcript, the processor cancels its pending end-of-turn timer before it announces the
+  start, and that cancellation yields. The aggregator handles the transcript in the gap, ahead of
+  the turn it belongs to, and then cannot end that turn: it waited out pipecat's five-second
+  fallback. Measured on a call, the processor ended the turn 200 ms after the caller said goodbye
+  and the model was asked 5.0 s after that. Having the aggregator follow the processor's
+  decisions instead of repeating them stalls the same way. The turn processor is gone, and the
+  aggregator runs the strategies itself.
+- **The echo guard dropped the second half of a sentence.** A caller who said "my name is", paused,
+  and said the name lost the name. Every caller turn interrupts, the interruption sends the engine
+  a `clear`, and the engine acknowledges each one with a mark whether or not anything was playing.
+  The serializer reports that mark as the bot stopping, so the example's speech monitor restarted
+  its echo tail while the bot had been silent for seconds, and the guard discarded whatever the
+  caller said in the next 0.8 s. The monitor now takes a stop as an edge only after the bot has
+  actually spoken.
+- **The bot said it was hanging up or transferring, and then did not.** The prompt and the tool
+  descriptions asked for the words first and the tool after them. Models served locally took that
+  as two turns: they spoke the line and stopped. Replayed from a call, a 4B and a 30B model both
+  made 0 of 5 hangups and 0 of 5 transfers. The prompt now asks for the tool first and the words
+  after it returns, which pipecat already supports by running the model again on the tool's
+  result; the same replay made 10 of 10 of each, with the goodbye and the handover line spoken by
+  that second reply. The farewell wait gives that reply longer to start, because it now includes
+  a second pass through the model.
+- **A transfer that completed was logged as failed.** The verdict was read from the status code
+  alone, and a completed transfer can arrive with reason OK and no code. The verdict's kind now
+  decides, and the code is reported alongside it when there is one.
+- **The bot could hang up just before its goodbye played.** The farewell wait counted any speech
+  earlier in the call as the farewell having started, so with the tool called before the goodbye
+  it took the silence in between for the end of it. Measured on a call: the line went 40 ms before
+  the goodbye would have played. Only speech that starts after the tool fires counts now.
+
+### Changed
+
+- **The agent example waits for the rest of a sentence the caller stopped in the middle of, on
+  both backends.** A caller who said "my name is", paused and then said the name was answered
+  after the first half: the turn ended on a fixed 0.2 s of silence, and the name arrived while the
+  bot was talking, where the echo guard dropped it. A turn that would end on an English transcript
+  stopping on a word a sentence cannot end on ("is", "the", "to", "and", "my" and a few more) is
+  now held open for up to 1.5 s, and speech resuming in that time joins the same turn; anything
+  else ends exactly as before. The end of the turn is still decided by pipecat's speech-timeout
+  strategy, which the hold wraps rather than replaces, so a transcript the recognizer is still
+  delivering is still waited for. Whether the word list applies is decided per transcript: by the
+  language the recognizer reports for it, or by the configured language when it reports none, so a
+  recognizer set to `multi` that reports nothing is never held. pipecat's bundled smart-turn model
+  was tried first and misjudged phone-band speech both ways: "my name is" passed through an 8 kHz
+  channel read as finished, and a recorded "goodbye" as unfinished.
+
 ## [0.2.1] - 2026-09-05
 
 Nothing in the package itself changed: `src/pipecat_siphon` is byte-identical. Everything below is
