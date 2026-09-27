@@ -1,0 +1,26 @@
+# .github/dependabot.yml — keep the actions the workflows run up to date.
+#
+# GitHub Actions only, deliberately. A workflow is code from other people that runs with this
+# repository's token, and `actions/checkout@v7` is a moving tag: whoever controls it controls that
+# step. Something has to notice when those releases happen, and nobody reads a workflow file for fun.
+#
+# Not Python. The package's own dependency is a single range (`pipecat-ai>=1.8.0,<2`) and moving
+# inside it is a decision about what the serializer is verified against, which is what the test
+# matrix and the compatibility table are for — not something to take from a bot on a weekly cadence.
+# Dependabot would open a pull request per release of a fast-moving package and each one would need
+# the same judgement anyway.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    # Grouped, so a month with three action releases is one pull request to review rather than three.
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels: ["dependencies"]
+    open-pull-requests-limit: 3

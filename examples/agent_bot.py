@@ -168,6 +168,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_start.base_user_turn_start_strategy import BaseUserTurnStartStrategy
@@ -1614,8 +1615,36 @@ def build_user_aggregator_params() -> LLMUserAggregatorParams:
     defaults, which choose one way of opening and closing a turn for every backend, and the two
     backends here need different ones: see `build_user_turn_strategies`.
     """
-    return LLMUserAggregatorParams(user_turn_strategies=build_user_turn_strategies())
+    return LLMUserAggregatorParams(
+        user_turn_strategies=build_user_turn_strategies(),
+        empty_user_turn=EMPTY_TURN_RECOVERY,
+    )
 
+
+EMPTY_TURN_RECOVERY = EmptyUserTurnConfig(
+    # Said out loud, so it is one sentence rather than pipecat's three. Its own default explains the
+    # situation to the model at chat length and asks it to repeat any question the caller may have
+    # missed, which on a phone turns a missed word into a speech.
+    interrupted_prompt=(
+        "The caller said something while you were talking and it was not recognised. "
+        "Ask them to say it again, in one short sentence."
+    ),
+    # Left off. A caller who goes quiet is a caller thinking, not a fault, and the same reasoning
+    # keeps `idle_timeout_secs` unset on the worker: prompting them to speak would talk over them
+    # just as they started. pipecat leaves this off by default too.
+    idle_prompt=None,
+    # One. This is the guard that matters here, because on a leg whose echo the engine cannot cancel
+    # the bot's own voice can open a turn, and the echo guard then drops the transcript -- which is
+    # an interrupted turn with no words in it, indistinguishable from a caller who was not heard. At
+    # one recovery the worst case is a single "say that again" the caller did not ask for; higher,
+    # and the bot could sit there asking its own echo to repeat itself.
+    max_consecutive_recoveries=1,
+)
+"""What to do about a caller turn that ends with nothing recognised in it.
+
+New in pipecat 1.12 and on by default, which is the right default for a phone call: before it, an
+interruption the recognizer could not make out left the bot silent, and silence after someone speaks
+reads as a dropped call. The prompt is replaced rather than the feature disabled."""
 
 ObserverFactory = Callable[[SiphonFrameSerializer], BaseObserver]
 """Builds an observer for one call. It is handed the call's serializer, which is what learns the

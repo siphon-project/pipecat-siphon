@@ -39,31 +39,13 @@ jobs:
             exit 1
           fi
 
-  # ── The gates, on both ends of the supported range ────────────────────────────────────────
-  # The floor is what breaks first on a dependency bump, so it is tested rather than declared.
-  # The integration harness is deliberately not here: it wants Docker, NET_ADMIN/NET_RAW for the
-  # capture and a couple of minutes, and it tests the engine as much as this package — see
-  # integration/README.md for the argument.
+  # ── The same gates a pull request runs ────────────────────────────────────────────────────
+  # Shared with `ci.yaml` rather than copied, so a tag cannot pass a weaker set of checks than the
+  # pull request that produced it. The integration harness is deliberately not among them: it wants
+  # Docker, NET_ADMIN/NET_RAW for the capture and a couple of minutes, and it tests the engine as
+  # much as this package, so it runs on its own schedule — see `harness.yaml`.
   gates:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.13"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: pip install -e ".[dev]"
-      - name: Lint
-        run: |
-          ruff check .
-          ruff format --check .
-      - name: Type-check
-        run: mypy
-      - name: Test
-        run: pytest -q
+    uses: ./.github/workflows/gates.yaml
 
   # ── Publish to PyPI (Trusted Publishing — OIDC, no token) ─────────────────────────────────
   pypi:

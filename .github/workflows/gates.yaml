@@ -1,0 +1,113 @@
+# .github/workflows/gates.yaml — the checks every change has to pass, defined once.
+#
+# Called by `ci.yaml` on every push and pull request, and by `release.yaml` before it publishes.
+# One definition rather than two, because two drift: the release used to carry its own copy, and a
+# gate that is only in the release copy is a gate a pull request never runs.
+#
+# `workflow_call` and nothing else, so this never runs on its own.
+name: Gates
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Lint, types and tests, at both ends of the supported Python range ──────────────────────
+  gates:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Both ends report, rather than the first failure hiding the other end's state.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          # pipecat resolves slowly and pulls a lot; without this every run re-downloads it.
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Format
+        # Separate from the lint step on purpose: `ruff check` does not catch formatting, and a
+        # single "Lint" step that fails tells you less than the two names do.
+        run: ruff format --check .
+      - name: Type-check
+        run: mypy
+      - name: Test
+        run: pytest -q
+
+  # ── The package's own pipecat floor ───────────────────────────────────────────────────────
+  # The job above installs `[dev]`, which asks for pipecat 1.12 because the *agent example* uses
+  # the empty-user-turn recovery that arrived in it. The published wheel asks only for 1.8, and a
+  # claim nothing exercises is a claim that quietly stops being true — so the serializer's own
+  # tests run against that floor, with only the extra it needs and none of the example's.
+  #
+  # Just the three package test files: the example and the harness are what want 1.12, and pulling
+  # them in here would test the wrong thing and fail at import.
+  floor:
+    name: Package at its pipecat floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the package at its declared pipecat floor
+        run: pip install -e . "pipecat-ai[websocket]==1.8.1" pytest pytest-asyncio websockets
+      - name: Test the serializer only
+        run: pytest -q tests/test_protocol.py tests/test_serializer.py tests/test_end_to_end.py
+
+  # ── The wheel and the sdist have to build, and carry what they claim ──────────────────────
+  # Cheap, and it catches the packaging mistakes that are otherwise found at release: a module
+  # missing from the wheel, or the sdist sweeping in a harness run's artefacts.
+  build:
+    name: Build and inspect the distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build
+      - name: Check the metadata renders on PyPI
+        run: twine check dist/*
+      - name: The wheel must carry the package and its type marker
+        run: |
+          set -eu
+          wheel="$(ls dist/*.whl)"
+          python - "$wheel" <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          required = [
+              "pipecat_siphon/__init__.py",
+              "pipecat_siphon/protocol.py",
+              "pipecat_siphon/serializer.py",
+              "pipecat_siphon/py.typed",
+          ]
+          missing = [name for name in required if name not in names]
+          if missing:
+              sys.exit(f"wheel is missing {missing}")
+          print(f"wheel carries {len(names)} entries, including py.typed")
+          PY
+      - name: The sdist must not carry a harness run's artefacts
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          if tar -tzf "$sdist" | grep -E "integration/artifacts/"; then
+            echo "::error::the sdist carries integration/artifacts — check the exclude in pyproject.toml"
+            exit 1
+          fi
+          echo "sdist is free of harness artefacts"

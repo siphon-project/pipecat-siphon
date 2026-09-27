@@ -133,6 +133,18 @@ class TestOneEventPerFrame:
 
         assert pipeline.lines == []
 
+    async def test_the_observer_asks_for_every_hop(self) -> None:
+        """Dedup is this class's own, so pipecat must keep delivering the later hops.
+
+        pipecat's own observers all pass `observe_every_push=False`, which delivers each frame once
+        and then nothing. This one cannot: `transcript_accepted` fires on the hop into the
+        aggregator, which is never a frame's first, so turning that flag off would leave the harness
+        reading every call as having dropped nothing at all.
+        """
+        observer = CallEventObserver(call_id=lambda: "call-1", write=lambda _line: None)
+
+        assert observer.observe_every_push is True
+
 
 class TestWhatTheBotDid:
     async def test_speech_edges_turns_and_speaking(self) -> None:

@@ -1,0 +1,30 @@
+# .github/workflows/ci.yaml — the gates, on every push and every pull request.
+#
+# This did not exist until now: the only workflow in the repository ran on tag push, so a pull
+# request reported no checks at all and whatever was in it reached `main` on the strength of
+# somebody having run the suite locally. Releases were gated; changes were not.
+#
+# The checks themselves live in `gates.yaml` and are shared with the release, so the thing a pull
+# request passes and the thing a tag passes are the same thing.
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  # So a red `main` can be re-run once the cause is fixed elsewhere (a yanked dependency, say)
+  # without an empty commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch. Pushing twice to a pull request cancels the first run rather than paying for
+# a result about code nobody will merge.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    uses: ./.github/workflows/gates.yaml

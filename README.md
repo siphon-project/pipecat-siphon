@@ -1,17 +1,17 @@
 # pipecat-siphon
 
-A [pipecat](https://github.com/pipecat-ai/pipecat) frame serializer for the **siphon-rtp media
-WebSocket protocol**.
+A [pipecat](https://github.com/pipecat-ai/pipecat) frame serializer for the media WebSocket
+protocol of the **SIPhon RTP engine (siphon-rtp)**.
 
-siphon-rtp is a media engine that can bridge a call leg's audio to an external WebSocket server:
+The SIPhon RTP engine is a media engine that can bridge a call leg's audio to an external WebSocket server:
 it decodes RTP to linear PCM, streams it up, and encodes PCM coming back down into RTP toward the
 caller. Your bot never touches RTP, jitter buffers, or codecs. This package is the small adapter
 that lets a pipecat pipeline read and write that wire.
 
-siphon-rtp keeps its own native wire on purpose. Every telephony vendor has a different one, and
+The SIPhon RTP engine keeps its own native wire on purpose. Every telephony vendor has a different one, and
 serializers exist precisely so an engine does not have to pretend to be somebody else. There is no
 Twilio/Telnyx emulation mode here, and there will not be one. The adapter lives on this side, and
-it is small: siphon-rtp's binary-L16-plus-JSON-envelope wire is *simpler* than the base64-in-JSON
+it is small: the engine's binary-L16-plus-JSON-envelope wire is *simpler* than the base64-in-JSON
 formats pipecat already ships support for.
 
 Pipecat's contributing guide directs new service and transport integrations to
@@ -28,7 +28,7 @@ It depends on `pipecat-ai>=1.8.0,<2` and nothing else. Python 3.11 or newer, mat
 
 ## The shape of the integration
 
-**The engine dials out.** siphon-rtp is the WebSocket *client*; your bot is the *server*. So the
+**The engine dials out.** The SIPhon RTP engine is the WebSocket *client*; your bot is the *server*. So the
 example under `examples/` stands up a server and waits, rather than connecting anywhere.
 
 ```python
@@ -82,7 +82,7 @@ both; on a tee it refuses to write audio back, because the engine would not inje
 A takeover makes the engine the caller's *only* peer, so the engine has to terminate whatever the
 caller negotiated and say so in the answer it writes back. `answer_local` writes that answer itself;
 `offer`/`answer` rewrites it from the B leg's SDP, and a takeover call has no B leg. So the verb
-decides what the caller may be (siphon-rtp 0.3.0):
+decides what the caller may be (SIPhon RTP engine 0.3.0):
 
 | Caller's `m=audio` | `offer` + `answer` | `answer_local` |
 |---|---|---|
@@ -105,7 +105,7 @@ whether the caller is a plaintext SIP phone or a WebRTC endpoint.
 ## Attaching a bot to a call that is already up
 
 `ws_uri` puts a bot on the call at negotiation time and keeps it there until the call ends. From
-siphon-rtp **0.4.0** a controller can also do it mid-call, with two verbs:
+SIPhon RTP engine **0.4.0** a controller can also do it mid-call, with two verbs:
 
 * **`attach_ws_bridge`** (`call_id`, `from_tag`, `ws_uri`) on a call that has no bridge takes a live
   two-party relay over: leg A's audio goes to your bot and the A↔B path is unwired, so the other
@@ -157,7 +157,7 @@ The first text frame is always `start`:
 the stream, and it is authoritative. Never assume 8000. Frame against the number `start` gives you,
 and expect it to differ from what your pipeline runs at.
 
-From siphon-rtp **0.3.0** that rate is selectable independently of the call's codec, so an 8 kHz
+From SIPhon RTP engine **0.3.0** that rate is selectable independently of the call's codec, so an 8 kHz
 G.711 caller can stream 16 kHz L16 to a bot that wants wideband input:
 
 | Knob | Where it goes |
@@ -172,7 +172,7 @@ you did not ask for. Leave the knob out and the wire follows the leg's codec rat
 16000 for G.722/AMR-WB) with no conversion built at all, exactly as before 0.3.0.
 
 **Set it to whatever your pipeline runs at.** The conversion then happens in the engine instead of
-here, which is the better place for it: siphon-rtp resamples frame by frame at the RTP boundary with
+here, which is the better place for it: the SIPhon RTP engine resamples frame by frame at the RTP boundary with
 nothing held back, while pipecat's SOXR stream resampler at VHQ swallows the first few chunks and
 then delivers in bursts. Same audio, steadier timing, and one less stage between the caller and the
 model.
@@ -223,7 +223,7 @@ voice, and silencing a channel would be a stranger default than duplicating it.
 | `error` (`fatal: true`) | `CancelWorkerFrame` | Logged at `error`, then the pipeline is cancelled. The engine closes the socket after a fatal error, so this has to be the frame that ends things. |
 | `error` (`fatal: false`) | `ErrorFrame` | Logged at `error` and surfaced; the stream continues. |
 | `event` | *(none)* | Logged at `debug`. Opaque passthrough, so there is no frame it maps to. |
-| `play_start`, `play_stop`, `clear` | *(none)* | Server-to-engine verbs. If one arrives *from* the engine the peer is not siphon-rtp, so it is logged and ignored rather than acted on. |
+| `play_start`, `play_stop`, `clear` | *(none)* | Server-to-engine verbs. If one arrives *from* the engine the peer is not the SIPhon RTP engine, so it is logged and ignored rather than acted on. |
 | malformed / truncated | *(none)* | Logged at `warning` and dropped. The socket is untrusted input; `deserialize` never raises. |
 
 ### Pipecat → engine (`serialize`)
@@ -281,7 +281,7 @@ offer rather than quietly falling back to the one you were avoiding.
 the neural one included, so on a handsfree or loudspeaker endpoint the bot's own voice returning up
 the caller's uplink reads as the caller interrupting.
 
-**If you are pinned to siphon-rtp 0.3.0, upgrade.** That release counted the energy detector's
+**If you are pinned to SIPhon RTP engine 0.3.0, upgrade.** That release counted the energy detector's
 trailing hangover in milliseconds rather than in ptime frames, so `speech_stopped` — and the
 `VADUserStoppedSpeakingFrame` this serializer emits from it — landed twenty times too late at a
 20 ms ptime, i.e. never inside a normal turn, while `speech_started` and barge-in kept working and
@@ -350,7 +350,7 @@ environment and `pip install "pipecat-ai[anthropic,deepgram,cartesia]"`; the ven
 each to swap, and the file explains which knobs are there for latency rather than for taste. The
 turn taking is the engine's, not the pipeline's — there is no VAD analyzer in it at all.
 
-Given `--control-url`, it also connects to siphon's control plane and gets an `end_call` tool, so
+Given `--control-url`, it also connects to the SIPhon SIP engine's control plane and gets an `end_call` tool, so
 the model can hang up when the conversation is done rather than emitting a magic phrase for
 something else to notice. The example's docstring covers the platform side: the media profile the
 engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
@@ -370,7 +370,7 @@ python examples/probe.py ws://127.0.0.1:9001/stream
 
 ## Quickstart: a real phone number
 
-[`examples/quickstart/`](examples/quickstart/) is the whole thing end to end: siphon-sip registers
+[`examples/quickstart/`](examples/quickstart/) is the whole thing end to end: the SIPhon SIP engine (siphon-sip) registers
 to a SIP provider, inbound calls on that registration are handed to the bot, and the bot can hang
 up. Nothing in it is provider-specific — registration is RFC 3261, and every credential comes from
 the environment.
@@ -390,7 +390,8 @@ answers with audio before you spend a phone call finding out. See
 ## Integration harness
 
 `integration/` holds a four-way harness that runs the whole chain with nothing mocked: SIPp
-places a call through siphon-sip, siphon-rtp bridges the leg to a pipecat bot using this
+places a call through the SIPhon SIP engine (siphon-sip), the SIPhon RTP
+engine (siphon-rtp) bridges the leg to a pipecat bot using this
 serializer, and the assertions are on the audio that comes back rather than on the socket being
 open. Three scenarios: a known signal survives the round trip, checked spectrally against a tshark
 capture; the engine's VAD edges land where the fixture puts them and barge-in flushes the bot's
@@ -401,7 +402,7 @@ over an 8 kHz G.711 leg and the audio has to come back at the pitch it went out 
 cd integration && ./run.sh
 ```
 
-It needs Docker and nothing else: siphon-sip and siphon-rtp are pulled as their published
+It needs Docker and nothing else: both SIPhon engines are pulled as their published
 release images, so this runs on a fresh clone. Point `SIPHON_RTP_PATH` / `SIPHON_SIP_PATH` at a
 checkout to build either from source instead. Not part of CI yet; see
 [`integration/README.md`](integration/README.md).
@@ -410,9 +411,9 @@ checkout to build either from source instead. Not part of CI yet; see
 
 | | Verified against |
 |---|---|
-| pipecat | `pipecat-ai` 1.8.1 and 1.10.0, both legs of the test matrix, on Python 3.11 and 3.13 |
-| siphon-rtp | 0.9.0, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against every release from 0.2.x to 0.9.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), the attach/detach bridge lifecycle (0.4.0), and since then fax, SRTP answer tags, a setup timeout and fuzzing. None of it changes the wire this package speaks. |
-| siphon-sip | 1.9.1 for the harness; 1.7.0 is the floor, being the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
+| pipecat | `pipecat-ai` 1.12.0 on Python 3.11 and 3.13, whole suite. The package's own floor, 1.8.1, is tested too, with the serializer's tests alone — the agent example asks for 1.12 because it uses the empty-user-turn recovery that arrived there, but this package does not, so the wheel still installs against 1.8. |
+| SIPhon RTP engine (siphon-rtp) | 0.9.0, end to end through the harness under `integration/`. The bridge protocol lives in `crates/siphon-rtp-media/src/bridge/protocol.rs`, and that file has not been touched since before 0.2.0 — its diff across every release since is empty — so the same bytes work against every release from 0.2.x to 0.9.x alike. What those releases add is surface a *controller* uses: the wire-rate and detector knobs (0.3.0), callers a takeover can terminate (0.3.0), the attach/detach bridge lifecycle (0.4.0), and since then fax, SRTP answer tags, a setup timeout and fuzzing. None of it changes the wire this package speaks. |
+| SIPhon SIP engine (siphon-sip) | 1.9.1 for the harness; 1.7.0 is the floor, being the release that carries `ws_sample_rate` and the other 0.3.0 profile flags through to the engine. Not a dependency of this package — the serializer never sees the signalling side. |
 | Python | 3.13 (declared support 3.11+, matching pipecat's floor) |
 
 The control-frame fixtures under `tests/wire_fixtures.py` are byte-exact strings produced by
@@ -433,6 +434,12 @@ uv pip install -e ".[dev]"
 .venv/bin/ruff format --check .
 .venv/bin/mypy
 ```
+
+## Maintainer
+
+pipecat-siphon is maintained by SIPhon's maintainer at
+**[Real Time Telecom B.V.](https://realtime-telecom.nl)**, the founding sponsor of the SIPhon
+project. Commercial support is available through RTT.
 
 ## License
 
