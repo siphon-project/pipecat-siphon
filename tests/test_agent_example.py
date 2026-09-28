@@ -36,6 +36,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
 from agent_bot import (
+    DEFAULT_SYSTEM_PROMPT,
     EMPTY_TURN_RECOVERY,
     BotSpeechMonitor,
     ControlPlane,
@@ -45,6 +46,7 @@ from agent_bot import (
     is_english,
     missing_environment,
     refuse_an_unknown_backend,
+    resolve_system_prompt,
 )
 
 # Short enough that the suite stays fast, long enough not to race the event loop.
@@ -423,6 +425,58 @@ class TestMissingEnvironment:
         assert missing_environment({"llm": "google", "stt": "local", "tts": "local"}, {}) == [
             "GOOGLE_API_KEY"
         ]
+
+
+class TestResolveSystemPrompt:
+    """Where the persona comes from: the example's own, an inline value, or a file."""
+
+    def test_nothing_set_is_the_example_default(self) -> None:
+        assert resolve_system_prompt({}) == DEFAULT_SYSTEM_PROMPT
+
+    def test_empty_values_are_unset(self) -> None:
+        """Compose passes an unset variable through as an empty string, not as an absent one."""
+        environment = {"BOT_SYSTEM_PROMPT": "", "BOT_SYSTEM_PROMPT_FILE": "  "}
+        assert resolve_system_prompt(environment) == DEFAULT_SYSTEM_PROMPT
+
+    def test_an_inline_prompt_replaces_the_default(self) -> None:
+        environment = {"BOT_SYSTEM_PROMPT": "You are the front desk of a bike shop."}
+        assert resolve_system_prompt(environment) == "You are the front desk of a bike shop."
+
+    def test_a_prompt_file_replaces_the_default(self, tmp_path: Path) -> None:
+        prompt = tmp_path / "persona.txt"
+        prompt.write_text("You are the front desk of a bike shop.\n\nAsk one question at a time.\n")
+        environment = {"BOT_SYSTEM_PROMPT_FILE": str(prompt)}
+        assert resolve_system_prompt(environment) == (
+            "You are the front desk of a bike shop.\n\nAsk one question at a time."
+        )
+
+    def test_both_at_once_is_refused(self, tmp_path: Path) -> None:
+        """Neither silently winning: a stale line in .env would otherwise override the file."""
+        prompt = tmp_path / "persona.txt"
+        prompt.write_text("From the file.")
+        environment = {"BOT_SYSTEM_PROMPT": "Inline.", "BOT_SYSTEM_PROMPT_FILE": str(prompt)}
+        with pytest.raises(ValueError, match="BOT_SYSTEM_PROMPT and BOT_SYSTEM_PROMPT_FILE"):
+            resolve_system_prompt(environment)
+
+    def test_a_missing_file_is_refused_by_name(self, tmp_path: Path) -> None:
+        """A typo in the path must stop the bot, not fall back to the default persona."""
+        missing = tmp_path / "no-such-persona.txt"
+        with pytest.raises(ValueError, match=r"no-such-persona\.txt"):
+            resolve_system_prompt({"BOT_SYSTEM_PROMPT_FILE": str(missing)})
+
+    def test_an_empty_file_is_refused(self, tmp_path: Path) -> None:
+        prompt = tmp_path / "persona.txt"
+        prompt.write_text("\n  \n")
+        with pytest.raises(ValueError, match="empty"):
+            resolve_system_prompt({"BOT_SYSTEM_PROMPT_FILE": str(prompt)})
+
+    def test_the_shipped_demo_persona_loads(self) -> None:
+        demo = Path(__file__).parent.parent / "examples" / "prompts" / "escalation_demo.txt"
+        prompt = resolve_system_prompt({"BOT_SYSTEM_PROMPT_FILE": str(demo)})
+        # A replacement persona has to keep the telephone rules the default carries, or the
+        # synthesizer reads markdown aloud.
+        assert "formatting" in prompt
+        assert "interrupt" in prompt
 
 
 class TestServiceImportsAreLazy:
