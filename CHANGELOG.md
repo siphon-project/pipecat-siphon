@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-28
+
+Nothing in the package itself changed: `src/pipecat_siphon` is byte-identical to 0.2.1. What is new
+is the examples, CI, and the README that PyPI shows.
+
 ### Added
 
 - **The agent example reads its persona from a file, `BOT_SYSTEM_PROMPT_FILE`, and ships one.** A
