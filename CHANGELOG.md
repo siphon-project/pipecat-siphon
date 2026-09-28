@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The agent example reads its persona from a file, `BOT_SYSTEM_PROMPT_FILE`, and ships one.** A
+  persona worth writing runs to paragraphs, which one `.env` line carries badly. The file is read on
+  every call, and the quickstart mounts `examples/prompts/` over the image's copy, so a persona can
+  be tuned between calls without a restart. Setting both it and `BOT_SYSTEM_PROMPT` stops the bot at
+  startup rather than letting one silently win, as does a path that cannot be read. The shipped
+  `escalation_demo.txt` is a shop's customer line that offers a fix once and then transfers a caller
+  who insists on the manager, which exercises barge-in and `transfer_call` in one call.
+
 ### Changed
 
 - **The agent example moves to pipecat 1.12 and answers a turn it could not make out.** Before 1.12

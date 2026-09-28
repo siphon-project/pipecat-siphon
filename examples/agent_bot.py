@@ -134,6 +134,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 import uvicorn
@@ -272,7 +273,8 @@ The client supervises its own reconnects once established, but the *first* conne
 engine is not listening yet. Gathered naively with the pipeline that exception takes the media
 path down with it and the process exits on a routine restart-ordering race."""
 
-SYSTEM_PROMPT = """You are a voice assistant on a telephone call. You are talking, not writing.
+DEFAULT_SYSTEM_PROMPT = """\
+You are a voice assistant on a telephone call. You are talking, not writing.
 
 Keep answers to one or two sentences unless you are explicitly asked for detail. Ask one question
 at a time. Never use markdown, bullet points, headings, emoji or any other formatting: everything
@@ -282,20 +284,48 @@ The caller can interrupt you at any time and you will be cut off mid-sentence wh
 is normal. When it happens, answer what they just said rather than finishing your last thought.
 
 Open the call by greeting the caller and asking how you can help."""
+"""The persona when the deployment does not supply one. See `resolve_system_prompt`."""
 
-SYSTEM_PROMPT = os.environ.get("BOT_SYSTEM_PROMPT") or SYSTEM_PROMPT
-"""Let a deployment replace the persona without editing this file.
 
-The prompt above is the part worth tuning per deployment and the part most likely to differ
-between a demo and something answering real callers, so it should not require a fork of the
-example to change. What it must not lose is the telephone constraints -- speech not prose, no
-formatting, short answers -- because a replacement written as if for a chat window produces
-markdown that the synthesizer then reads aloud, bullet by bullet.
+def resolve_system_prompt(environment: Mapping[str, str]) -> str:
+    """Pick the persona: `BOT_SYSTEM_PROMPT`, the file at `BOT_SYSTEM_PROMPT_FILE`, or the default.
 
-The hangup instructions are appended separately below and are not overridable: they describe a
-capability of this process rather than a persona, and a prompt that omits them leaves the model
-telling callers it cannot end the call.
-"""
+    Lets a deployment replace the persona without editing this file. The persona is the part worth
+    tuning per deployment and the part most likely to differ between a demo and something answering
+    real callers, so it should not require a fork of the example to change. What it must not lose
+    is the telephone constraints -- speech not prose, no formatting, short answers -- because a
+    replacement written as if for a chat window produces markdown that the synthesizer then reads
+    aloud, bullet by bullet.
+
+    The hangup instructions are appended separately and are not overridable: they describe a
+    capability of this process rather than a persona, and a prompt that omits them leaves the model
+    telling callers it cannot end the call.
+
+    The file form exists because a persona worth writing runs to paragraphs, which a single `.env`
+    line carries badly. It is read on every call rather than once, so a persona can be tuned between
+    calls without a restart. `examples/prompts/escalation_demo.txt` is one.
+
+    Raises:
+        ValueError: If both are set, or the file cannot be read or holds nothing.
+
+    """
+    inline = environment.get("BOT_SYSTEM_PROMPT", "").strip()
+    path = environment.get("BOT_SYSTEM_PROMPT_FILE", "").strip()
+    if inline and path:
+        # Neither silently wins: a line left in .env from an earlier run would otherwise override
+        # the file being edited, and every change to it would appear to do nothing.
+        raise ValueError("BOT_SYSTEM_PROMPT and BOT_SYSTEM_PROMPT_FILE are both set; unset one")
+    if inline:
+        return inline
+    if not path:
+        return DEFAULT_SYSTEM_PROMPT
+    try:
+        prompt = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"BOT_SYSTEM_PROMPT_FILE {path!r} cannot be read: {error}") from error
+    if not prompt:
+        raise ValueError(f"BOT_SYSTEM_PROMPT_FILE {path!r} is empty")
+    return prompt
 
 
 LLM_PROVIDERS = ("anthropic", "google", "openai", "local")
@@ -1328,7 +1358,7 @@ def preload_local_models() -> None:
 def build_llm_service(with_hangup: bool) -> LLMService[Any]:
     """Build the LLM service for the selected backend, tuned for a conversation in real time."""
     system_instruction = (
-        SYSTEM_PROMPT
+        resolve_system_prompt(os.environ)
         + (HANGUP_PROMPT if with_hangup else "")
         + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
     )
@@ -1870,6 +1900,7 @@ async def main(
     try:
         refuse_an_unknown_backend(BACKEND)
         missing = missing_environment(providers, os.environ)
+        resolve_system_prompt(os.environ)
     except ValueError as error:
         sys.exit(str(error))
     if missing:

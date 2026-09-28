@@ -77,6 +77,17 @@ echo 'BOT_SYSTEM_PROMPT=You are the front desk of a bike shop. Keep it to a sent
 docker compose up -d bot
 ```
 
+A persona longer than a line goes in a file under `examples/prompts/`, which is mounted into the
+container and read on every call, so an edit takes effect on the next call without a restart.
+`escalation_demo.txt` is a shop's customer line that tries once to solve a refund itself and then
+puts a caller who insists through to the manager; it needs a transfer destination:
+
+```sh
+echo 'BOT_SYSTEM_PROMPT_FILE=/app/examples/prompts/escalation_demo.txt' >> .env
+echo 'BOT_TRANSFER_TARGET=sip:manager@example.com' >> .env
+docker compose up -d bot
+```
+
 `agent_bot.py` is copied into the image rather than bind-mounted, so an edit to the Python itself
 needs `docker compose up --build bot`.
 

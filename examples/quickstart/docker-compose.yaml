@@ -84,6 +84,9 @@ services:
       # The local path's model downloads -- Whisper's weights from Hugging Face, Kokoro's from its
       # releases -- land here once rather than on every container start. Empty on the cloud path.
       - model-cache:/home/bot/.cache
+      # The shipped personas, mounted over the copy baked into the image so an edit to one takes
+      # effect on the next call: the bot reads BOT_SYSTEM_PROMPT_FILE per call, not once.
+      - ../prompts:/app/examples/prompts:ro
     environment:
       BOT_BACKEND: "${BOT_BACKEND:-cloud}"
       # Per-role overrides of that preset. Empty leaves the preset's own choice. The image has to
@@ -108,6 +111,7 @@ services:
       SIPHON_CONTROL_TOKEN: "${AGENT_APP_TOKEN}"
       # Persona and capability, overriding what the example hard-codes.
       BOT_SYSTEM_PROMPT: "${BOT_SYSTEM_PROMPT:-}"
+      BOT_SYSTEM_PROMPT_FILE: "${BOT_SYSTEM_PROMPT_FILE:-}"
       BOT_TRANSFER_TARGET: "${BOT_TRANSFER_TARGET:-}"
       # Model choices. Empty leaves the example's own defaults for the selected backend.
       BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
