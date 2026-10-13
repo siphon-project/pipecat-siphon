@@ -46,6 +46,7 @@ from agent_bot import (
     is_english,
     missing_environment,
     refuse_an_unknown_backend,
+    refuse_missing_google_cloud_credentials,
     resolve_system_prompt,
 )
 
@@ -401,8 +402,13 @@ class TestMissingEnvironment:
         with pytest.raises(ValueError, match="BOT_LLM_PROVIDER 'antropic'"):
             missing_environment({**CLOUD_PROVIDERS, "llm": "antropic"}, {})
 
-    def test_gemini_needs_its_own_key_and_google_speech_needs_a_service_account(self) -> None:
-        """One vendor, two products, two credentials: an API key is not a service account."""
+    def test_gemini_needs_its_own_key_and_google_speech_needs_no_variable(self) -> None:
+        """One vendor, two products: Gemini takes a key, the speech APIs an identity.
+
+        The identity is application default credentials, which on a Google Cloud VM come from the
+        metadata server with no variable set at all, so no variable may be demanded for it.
+        `TestGoogleCloudCredentials` covers the check that replaces one.
+        """
         assert missing_environment({"llm": "google", "stt": "deepgram", "tts": "cartesia"}, {}) == [
             "GOOGLE_API_KEY",
             "DEEPGRAM_API_KEY",
@@ -411,7 +417,6 @@ class TestMissingEnvironment:
         ]
         assert missing_environment({"llm": "anthropic", "stt": "google", "tts": "google"}, {}) == [
             "ANTHROPIC_API_KEY",
-            "GOOGLE_APPLICATION_CREDENTIALS",
         ]
 
     def test_one_provider_in_two_roles_asks_for_its_key_once(self) -> None:
@@ -425,6 +430,87 @@ class TestMissingEnvironment:
         assert missing_environment({"llm": "google", "stt": "local", "tts": "local"}, {}) == [
             "GOOGLE_API_KEY"
         ]
+
+
+class TestGoogleCloudCredentials:
+    """Google's speech APIs start on whatever application default credentials resolve to.
+
+    `google.auth.default` is replaced rather than run: off Google Cloud it probes the metadata
+    server, which is a network call and seconds of timeout, and its answer depends on the host.
+    """
+
+    @staticmethod
+    def _resolve_to(monkeypatch: pytest.MonkeyPatch, project: str | None) -> list[dict[str, Any]]:
+        """Make application default credentials resolve, to `project`; return the calls made."""
+        import google.auth
+
+        calls: list[dict[str, Any]] = []
+
+        def default(**keyword_arguments: Any) -> tuple[object, str | None]:
+            calls.append(keyword_arguments)
+            return object(), project
+
+        monkeypatch.setattr(google.auth, "default", default)
+        return calls
+
+    @staticmethod
+    def _resolve_to_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+        import google.auth
+        from google.auth.exceptions import DefaultCredentialsError
+
+        def default(**_keyword_arguments: Any) -> tuple[object, str | None]:
+            raise DefaultCredentialsError("Your default credentials were not found.")  # type: ignore[no-untyped-call]
+
+        monkeypatch.setattr(google.auth, "default", default)
+
+    def test_a_metadata_server_identity_is_enough(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A VM's service account, with no variable and no key file anywhere, starts the bot."""
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        calls = self._resolve_to(monkeypatch, "test-project")
+
+        refuse_missing_google_cloud_credentials(
+            {"llm": "anthropic", "stt": "google", "tts": "google"}
+        )
+
+        # Asked once for both roles, with the scope pipecat's services ask for.
+        assert calls == [{"scopes": ["https://www.googleapis.com/auth/cloud-platform"]}]
+
+    def test_no_credentials_names_both_ways_to_provide_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._resolve_to_nothing(monkeypatch)
+
+        with pytest.raises(ValueError) as raised:
+            refuse_missing_google_cloud_credentials(
+                {"llm": "anthropic", "stt": "deepgram", "tts": "google"}
+            )
+
+        message = str(raised.value)
+        assert "GOOGLE_APPLICATION_CREDENTIALS" in message
+        assert "metadata server" in message
+        assert "tts=google" in message
+
+    def test_the_recognizer_also_needs_a_project(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The recognizer refuses credentials that name no project; the voice does not."""
+        self._resolve_to(monkeypatch, None)
+
+        refuse_missing_google_cloud_credentials(
+            {"llm": "anthropic", "stt": "deepgram", "tts": "google"}
+        )
+        with pytest.raises(ValueError, match="GOOGLE_CLOUD_PROJECT"):
+            refuse_missing_google_cloud_credentials(
+                {"llm": "anthropic", "stt": "google", "tts": "cartesia"}
+            )
+
+    def test_a_selection_without_google_speech_never_asks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gemini is not the speech APIs: its key is all it needs, and the probe costs seconds."""
+        calls = self._resolve_to(monkeypatch, "test-project")
+
+        refuse_missing_google_cloud_credentials({"llm": "google", "stt": "local", "tts": "local"})
+
+        assert calls == []
 
 
 class TestResolveSystemPrompt:

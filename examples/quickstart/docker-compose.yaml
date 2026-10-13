@@ -104,8 +104,9 @@ services:
       CARTESIA_VOICE_ID: "${CARTESIA_VOICE_ID:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
-      # Google's speech APIs authenticate as a service account, not with the key above. The path is
-      # inside the container, so the file has to be mounted there; see .env.example.
+      # Google's speech APIs authenticate as a service account, not with the key above. Unset on a
+      # Google Cloud VM, where the metadata server provides one. Otherwise the path is inside the
+      # container, so the file has to be mounted there; see .env.example.
       GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS:-}"
       # Shared with siphon.yaml's control app, so the bot may hang up.
       SIPHON_CONTROL_TOKEN: "${AGENT_APP_TOKEN}"

@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The agent example takes Google's application default credentials for speech.** With
+  `stt` or `tts` set to `google` it demanded `GOOGLE_APPLICATION_CREDENTIALS`, which forced a
+  service-account key file onto a Google Cloud VM that already has an identity from the metadata
+  server. Startup now asks `google.auth.default()` instead, and with no credentials at all still
+  stops, naming both the variable and the metadata server. The recognizer also needs a project, so
+  credentials that name none stop it too, pointing at `GOOGLE_CLOUD_PROJECT`.
+
 ## [0.2.2] - 2026-09-28
 
 Nothing in the package itself changed: `src/pipecat_siphon` is byte-identical to 0.2.1. What is new

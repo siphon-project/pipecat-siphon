@@ -107,8 +107,10 @@ built for. Set a role on its own to override the preset for that role only.
 
 Each provider asks for its own credential and the bot names whatever is missing at startup rather
 than at the first call. Two things catch people out. Gemini and Google's speech APIs are different
-products: `GOOGLE_API_KEY` authenticates the model, and the recognizer and voice want
-`GOOGLE_APPLICATION_CREDENTIALS`, a service-account JSON mounted into the container. And an image
+products: `GOOGLE_API_KEY` authenticates the model, and the recognizer and voice use application
+default credentials, which on a Google Cloud VM are the instance's own service account with nothing
+to set, and elsewhere `GOOGLE_APPLICATION_CREDENTIALS`, a service-account JSON mounted into the
+container. And an image
 carries only the libraries it was built with, so a mix outside the two presets needs its extras
 named at build time:
 
