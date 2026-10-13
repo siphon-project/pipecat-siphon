@@ -27,6 +27,14 @@ All notable changes to this project are documented here. The format follows
   server. Startup now asks `google.auth.default()` instead, and with no credentials at all still
   stops, naming both the variable and the metadata server. The recognizer also needs a project, so
   credentials that name none stop it too, pointing at `GOOGLE_CLOUD_PROJECT`.
+- **A transfer the caller's phone refused left the caller on a silent line.** `transfer_call` ended
+  the bot as soon as the REFER was sent, and many phones refuse a REFER from the network (`405`,
+  `403`), so the caller sat in silence until the node hung up. The bot now keeps the call until the
+  verdict: a completed transfer, or the call ending (`call_ended`, which a phone that BYEs its old
+  leg right after dialling the destination also produces), ends it as before; a failed one, or no
+  verdict within `BOT_TRANSFER_VERDICT_TIMEOUT` (60 s), is put to the model, which tells the caller
+  and carries on. The caller's words are held from the model while the transfer is decided, and a
+  second transfer asked for in that time is refused.
 
 ## [0.2.2] - 2026-09-28
 
