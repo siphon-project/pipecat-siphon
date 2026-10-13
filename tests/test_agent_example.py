@@ -2265,3 +2265,535 @@ class TestFollowTheCaller:
 
         assert _switches(pushed) == []
         assert controller.current == "nl"
+
+
+# The caller's number on these calls. Country code 999 is unassigned, so this is nobody's number.
+CALLER = "99900000001"
+
+
+class TestCallerNumberFromTheStreamUrl:
+    """The number in the media socket's `caller` query parameter, and nothing that is not one."""
+
+    @pytest.mark.parametrize("value", ["999000", CALLER, "999000000000001"])
+    def test_six_to_fifteen_digits_is_a_number(self, value: str) -> None:
+        from agent_bot import parse_caller
+
+        assert parse_caller(value) == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            "",
+            "99900",
+            "9990000000000001",
+            "+99900000001",
+            "999 000 00001",
+            "99900000001\n",
+            "9990000000a",
+            # Arabic-Indic digits: `str.isdigit` says yes, and a URL path should never see them.
+            "٩٩٩٠٠٠٠٠٠٠١",
+        ],
+    )
+    def test_anything_else_is_absent(self, value: str | None) -> None:
+        from agent_bot import parse_caller
+
+        assert parse_caller(value) is None
+
+    def test_a_logged_number_shows_only_its_last_digits(self) -> None:
+        from agent_bot import mask_number
+
+        masked = mask_number(CALLER)
+        assert masked.endswith("01")
+        assert CALLER[:-2] not in masked
+        assert len(masked) == len(CALLER)
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ({"call": "abc", "caller": CALLER}, CALLER),
+            ({"call": "abc", "caller": "+1"}, None),
+            ({}, None),
+        ],
+    )
+    async def test_the_media_route_hands_the_call_its_caller(
+        self, monkeypatch: pytest.MonkeyPatch, query: dict[str, str], expected: str | None
+    ) -> None:
+        from fastapi.routing import APIWebSocketRoute
+
+        import agent_bot
+
+        served: list[str | None] = []
+
+        async def serve_call(
+            _websocket: object,
+            _control: object,
+            _observer_factory: object = None,
+            caller: str | None = None,
+        ) -> None:
+            served.append(caller)
+
+        monkeypatch.setattr(agent_bot, "serve_call", serve_call)
+        app = agent_bot.build_app(None)
+        route = next(route for route in app.routes if isinstance(route, APIWebSocketRoute))
+        websocket: Any = SimpleNamespace(query_params=query)
+
+        await route.endpoint(websocket)
+
+        assert served == [expected]
+
+
+def _account(**overrides: Any) -> dict[str, Any]:
+    """Build a lookup answer for a made-up account, plus `overrides`."""
+    body: dict[str, Any] = {
+        "name": "Test User",
+        "plan": "Basic",
+        "balance": 12.5,
+        "open_tickets": 1,
+    }
+    body.update(overrides)
+    return body
+
+
+class _FakeHttpService:
+    """A loopback HTTP server answering each path with a configured status, body and delay."""
+
+    def __init__(self) -> None:
+        self.answers: dict[str, tuple[int, Any, float]] = {}
+        self.requests: list[tuple[str, dict[str, str]]] = []
+        self.base_url = ""
+        self._server: Any = None
+
+    def answer(
+        self, path: str, status: int, body: Any = None, delay: float = 0.0, raw: bytes | None = None
+    ) -> None:
+        self.answers[path] = (status, raw if raw is not None else body, delay)
+
+    async def start(self) -> str:
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+
+        async def handle(request: web.Request) -> web.StreamResponse:
+            self.requests.append((request.path, dict(request.query)))
+            status, body, delay = self.answers.get(request.path, (404, None, 0.0))
+            if delay:
+                await asyncio.sleep(delay)
+            if body is None:
+                return web.Response(status=status)
+            if isinstance(body, bytes):
+                return web.Response(status=status, body=body, content_type="text/html")
+            return web.json_response(body, status=status)
+
+        app = web.Application()
+        app.router.add_get("/{tail:.*}", handle)
+        self._server = TestServer(app, host="127.0.0.1")
+        await self._server.start_server()
+        return str(self._server.make_url("")).rstrip("/")
+
+    async def close(self) -> None:
+        if self._server is not None:
+            await self._server.close()
+
+
+@pytest.fixture
+async def http_service() -> Any:
+    """Serve fake answers on loopback for the duration of one test."""
+    service = _FakeHttpService()
+    service.base_url = await service.start()
+    yield service
+    await service.close()
+
+
+class _ResultOnly:
+    """The parts of `FunctionCallParams` a lookup tool reads."""
+
+    def __init__(self, arguments: dict[str, Any] | None = None) -> None:
+        self.arguments = arguments or {}
+        self.results: list[Any] = []
+
+    async def result_callback(self, result: Any, **_keyword_arguments: Any) -> None:
+        self.results.append(result)
+
+
+ACCOUNT_PATH = f"/customers/{CALLER}"
+
+
+async def _ask_caller_lookup(base_url: str, caller: str | None) -> dict[str, Any]:
+    from agent_bot import CallerLookup
+
+    call = _ResultOnly()
+    await CallerLookup(base_url + "/customers/{caller}", caller).caller_lookup(call)  # type: ignore[arg-type]
+    assert len(call.results) == 1
+    result: dict[str, Any] = call.results[0]
+    return result
+
+
+class TestCallerLookupTool:
+    """The model can ask for the caller's own details, and only theirs."""
+
+    async def test_no_caller_on_the_call_is_not_available(self, http_service: Any) -> None:
+        result = await _ask_caller_lookup(http_service.base_url, None)
+
+        assert result["available"] is False
+        assert http_service.requests == [], "looked somebody up without a number"
+
+    async def test_the_answer_is_passed_through(self, http_service: Any) -> None:
+        http_service.answer(ACCOUNT_PATH, 200, _account())
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert http_service.requests[0][0] == ACCOUNT_PATH
+        assert result == {"available": True, "details": _account()}
+
+    async def test_one_level_of_lists_and_objects_is_kept(self, http_service: Any) -> None:
+        http_service.answer(
+            ACCOUNT_PATH,
+            200,
+            _account(
+                tags=["new", 3, True, None, {"too": "deep"}, ["deeper"]],
+                address={"city": "Testville", "floor": 2, "extra": {"too": "deep"}, "none": None},
+                note=None,
+                history={"deep": {"er": 1}},
+            ),
+        )
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        details = result["details"]
+        assert details["tags"] == ["new", 3, True]
+        assert details["address"] == {"city": "Testville", "floor": 2}
+        assert "note" not in details
+        assert details["history"] == {}
+
+    async def test_an_answer_over_the_cap_is_not_available(self, http_service: Any) -> None:
+        http_service.answer(ACCOUNT_PATH, 200, _account(notes="x" * 3000))
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert result["available"] is False
+
+    async def test_an_unknown_caller(self, http_service: Any) -> None:
+        http_service.answer(ACCOUNT_PATH, 404)
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert result["available"] is False
+        assert "not known" in result["reason"]
+
+    @pytest.mark.parametrize("status", [401, 500, 503])
+    async def test_any_other_failure_status_is_not_available(
+        self, http_service: Any, status: int
+    ) -> None:
+        http_service.answer(ACCOUNT_PATH, status, {"error": "boom"})
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert result["available"] is False
+
+    async def test_an_answer_that_is_not_an_object_is_not_available(
+        self, http_service: Any
+    ) -> None:
+        http_service.answer(ACCOUNT_PATH, 200, ["not", "an", "object"])
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert result["available"] is False
+
+    async def test_an_answer_that_is_not_json_is_not_available(self, http_service: Any) -> None:
+        http_service.answer(ACCOUNT_PATH, 200, raw=b"<html>not json</html>")
+
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert result["available"] is False
+
+    async def test_a_slow_answer_is_given_up_on(
+        self, http_service: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_TIMEOUT_SECONDS", 0.1)
+        http_service.answer(ACCOUNT_PATH, 200, _account(), delay=1.0)
+
+        started = time.monotonic()
+        result = await _ask_caller_lookup(http_service.base_url, CALLER)
+
+        assert time.monotonic() - started < 0.9, "the timeout did not bound the lookup"
+        assert result["available"] is False
+
+    async def test_nothing_listening_is_not_available(self) -> None:
+        # Port 9 on loopback: discard, which nothing in a test environment serves.
+        result = await _ask_caller_lookup("http://127.0.0.1:9", CALLER)
+
+        assert result["available"] is False
+
+    async def test_the_number_is_never_logged_whole(self, http_service: Any) -> None:
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+        try:
+            for status in (200, 404, 503):
+                http_service.answer(ACCOUNT_PATH, status, _account() if status == 200 else None)
+                await _ask_caller_lookup(http_service.base_url, CALLER)
+            await _ask_caller_lookup("http://127.0.0.1:9", CALLER)
+        finally:
+            logger.remove(sink)
+
+        assert lines, "nothing was logged at all, so this test proves nothing"
+        assert not [line for line in lines if CALLER in line]
+
+    def test_the_tool_takes_no_arguments_and_says_what_it_is_for(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_DESCRIPTION", "Look up the caller's plan.")
+        lookup = agent_bot.CallerLookup("http://127.0.0.1:9/customers/{caller}", CALLER)
+        offered = {
+            schema.name: schema
+            for schema in agent_bot.build_tool_schemas(False, None, caller_lookup=lookup)
+        }
+
+        assert set(offered) == {"caller_lookup"}
+        assert offered["caller_lookup"].properties == {}
+        assert offered["caller_lookup"].required == []
+        assert offered["caller_lookup"].description == "Look up the caller's plan."
+
+    def test_a_url_with_nowhere_to_put_the_number_is_refused(self) -> None:
+        from agent_bot import refuse_a_caller_lookup_url_without_the_caller
+
+        with pytest.raises(ValueError, match="BOT_CALLER_LOOKUP_URL"):
+            refuse_a_caller_lookup_url_without_the_caller("https://accounts.example.invalid/me")
+        refuse_a_caller_lookup_url_without_the_caller("")
+        refuse_a_caller_lookup_url_without_the_caller(
+            "https://accounts.example.invalid/customers/{caller}"
+        )
+
+
+def _record_tool_lists(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Build calls around stand-ins, and record the name of every tool each call offers."""
+    import agent_bot
+
+    TestObserverHook._stub_the_call(monkeypatch)
+    offered: list[list[str]] = []
+    original = agent_bot.build_tool_schemas
+
+    def recording(*arguments: Any, **keyword_arguments: Any) -> Any:
+        tools = original(*arguments, **keyword_arguments)
+        offered.append([tool.name for tool in tools])
+        return tools
+
+    monkeypatch.setattr(agent_bot, "build_tool_schemas", recording)
+    return offered
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestLookupToolsAreOfferedOnlyWhenConfigured:
+    """Neither lookup is offered, nor promised in the prompt, unless the deployment turned it on."""
+
+    def test_without_a_lookup_url_there_is_no_caller_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        offered = _record_tool_lists(monkeypatch)
+        websocket: Any = object()
+
+        agent_bot.build_worker(websocket, None, caller=CALLER)
+
+        assert offered == [[]]
+
+    def test_with_both_configured_both_are_offered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "http://127.0.0.1:9/customers/{caller}")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", True)
+        offered = _record_tool_lists(monkeypatch)
+        websocket: Any = object()
+
+        # Offered without a caller too: the tool then says it cannot see the line, which is what
+        # the caller should hear, rather than the bot not knowing it could ever look.
+        agent_bot.build_worker(websocket, None, caller=None)
+
+        assert offered == [["caller_lookup", "weather"]]
+
+    def test_the_prompt_mentions_only_what_is_offered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        neither: Any = agent_bot.build_llm_service(with_hangup=False).settings
+        assert neither.system_instruction == agent_bot.resolve_system_prompt({})
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "http://127.0.0.1:9/customers/{caller}")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", True)
+        both: Any = agent_bot.build_llm_service(with_hangup=False).settings
+        assert "caller_lookup" in both.system_instruction
+        assert "weather" in both.system_instruction
+
+    @pytest.mark.parametrize(
+        ("value", "enabled"),
+        [("", False), ("off", False), ("false", False), ("on", True), ("true", True)],
+    )
+    def test_the_weather_switch(self, value: str, enabled: bool) -> None:
+        from agent_bot import is_switched_on
+
+        assert is_switched_on(value) is enabled
+
+
+GEOCODING_PATH = "/v1/search"
+FORECAST_PATH = "/v1/forecast"
+
+
+@pytest.fixture
+def weather_service(http_service: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Point the weather tool's two endpoints at the loopback fake."""
+    import agent_bot
+
+    monkeypatch.setattr(agent_bot, "WEATHER_GEOCODING_URL", http_service.base_url + GEOCODING_PATH)
+    monkeypatch.setattr(agent_bot, "WEATHER_FORECAST_URL", http_service.base_url + FORECAST_PATH)
+    return http_service
+
+
+async def _ask_weather(place: Any) -> dict[str, Any]:
+    from agent_bot import report_weather
+
+    call = _ResultOnly({"place": place})
+    await report_weather(call)  # type: ignore[arg-type]
+    assert len(call.results) == 1
+    result: dict[str, Any] = call.results[0]
+    return result
+
+
+class TestWeatherTool:
+    """The model can say what the weather is like in a place it names."""
+
+    async def test_the_current_weather_in_a_place(self, weather_service: Any) -> None:
+        weather_service.answer(
+            GEOCODING_PATH,
+            200,
+            {
+                "results": [
+                    {
+                        "name": "Testville",
+                        "country": "Testland",
+                        "latitude": 1.5,
+                        "longitude": -2.25,
+                    }
+                ]
+            },
+        )
+        weather_service.answer(
+            FORECAST_PATH,
+            200,
+            {
+                "current": {
+                    "time": "2026-10-13T09:30",
+                    "temperature_2m": 17.6,
+                    "weather_code": 61,
+                    "wind_speed_10m": 12.4,
+                }
+            },
+        )
+
+        result = await _ask_weather("Testville")
+
+        assert result == {
+            "available": True,
+            "place": "Testville, Testland",
+            "temperature_celsius": 18,
+            "conditions": "light rain",
+            "wind_kilometres_per_hour": 12,
+            "observed_at": "2026-10-13T09:30",
+        }
+        (geocoding_path, geocoding_query), (forecast_path, forecast_query) = (
+            weather_service.requests
+        )
+        assert geocoding_path == GEOCODING_PATH
+        assert geocoding_query == {"name": "Testville", "count": "1"}
+        assert forecast_path == FORECAST_PATH
+        assert forecast_query == {
+            "latitude": "1.5",
+            "longitude": "-2.25",
+            "current": "temperature_2m,weather_code,wind_speed_10m",
+        }
+
+    async def test_an_unknown_code_still_gives_the_temperature(self, weather_service: Any) -> None:
+        weather_service.answer(
+            GEOCODING_PATH,
+            200,
+            {"results": [{"name": "Testville", "latitude": 1.0, "longitude": 2.0}]},
+        )
+        weather_service.answer(
+            FORECAST_PATH, 200, {"current": {"temperature_2m": -3.2, "weather_code": 42}}
+        )
+
+        result = await _ask_weather("Testville")
+
+        assert result == {"available": True, "place": "Testville", "temperature_celsius": -3}
+
+    async def test_a_place_nobody_knows(self, weather_service: Any) -> None:
+        weather_service.answer(GEOCODING_PATH, 200, {"generationtime_ms": 0.1})
+
+        result = await _ask_weather("Nowhere At All")
+
+        assert result["available"] is False
+        assert len(weather_service.requests) == 1, "asked for a forecast with nowhere to ask about"
+
+    @pytest.mark.parametrize("place", ["", "   ", None, 42])
+    async def test_no_place_is_not_available(self, weather_service: Any, place: Any) -> None:
+        result = await _ask_weather(place)
+
+        assert result["available"] is False
+        assert weather_service.requests == []
+
+    async def test_a_failing_forecast_is_not_available(self, weather_service: Any) -> None:
+        weather_service.answer(
+            GEOCODING_PATH,
+            200,
+            {"results": [{"name": "Testville", "latitude": 1.0, "longitude": 2.0}]},
+        )
+        weather_service.answer(FORECAST_PATH, 502)
+
+        result = await _ask_weather("Testville")
+
+        assert result["available"] is False
+
+    async def test_a_slow_service_is_given_up_on(
+        self, weather_service: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "WEATHER_TIMEOUT_SECONDS", 0.1)
+        weather_service.answer(GEOCODING_PATH, 200, {"results": []}, delay=1.0)
+
+        started = time.monotonic()
+        result = await _ask_weather("Testville")
+
+        assert time.monotonic() - started < 0.9
+        assert result["available"] is False
+
+    async def test_nothing_listening_is_not_available(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "WEATHER_GEOCODING_URL", "http://127.0.0.1:9/v1/search")
+
+        result = await _ask_weather("Testville")
+
+        assert result["available"] is False
+
+    def test_the_model_names_only_a_place(self) -> None:
+        from agent_bot import build_tool_schemas
+
+        offered = {schema.name: schema for schema in build_tool_schemas(False, None, weather=True)}
+
+        assert set(offered) == {"weather"}
+        assert set(offered["weather"].properties) == {"place"}
+        assert offered["weather"].required == ["place"]
