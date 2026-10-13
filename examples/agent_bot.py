@@ -130,6 +130,7 @@ import asyncio
 import contextlib
 import importlib
 import os
+import re
 import sys
 import threading
 import time
@@ -151,7 +152,9 @@ from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
     LLMRunFrame,
+    STTUpdateSettingsFrame,
     TranscriptionFrame,
+    TTSUpdateSettingsFrame,
     VADUserStartedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver
@@ -164,8 +167,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.llm_service import FunctionCallParams, LLMService
+from pipecat.services.settings import STTSettings, TTSSettings
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -522,6 +527,262 @@ DEFAULT_TTS_VOICE: dict[str, str] = {
 TTS_VOICE = os.environ.get("BOT_TTS_VOICE", "").strip() or DEFAULT_TTS_VOICE.get(TTS_PROVIDER, "")
 """The voice to speak with. Empty only for Cartesia, which reads `CARTESIA_VOICE_ID` instead."""
 
+FOLLOW_CALLER_CONSISTENT_TURNS = 2
+"""How many stretches of caller speech in a row must be heard in another configured language
+before `BOT_TTS_FOLLOW_CALLER` moves the voice to it.
+
+One is not enough: a recognizer on `multi` reports a language per transcript, and a caller who says
+"okay" or a name in the middle of Dutch is reported as English for that one stretch. Answering that
+in an English voice and then flipping back is worse than the accent. Two keeps a single misheard
+stretch from flipping the voice and still follows a caller who has really changed language by
+their second sentence."""
+
+KOKORO_VOICE_PREFIXES: dict[str, str] = {
+    "en": "ab",
+    "es": "e",
+    "fr": "f",
+    "hi": "h",
+    "it": "i",
+    "ja": "j",
+    "pt": "p",
+    "zh": "z",
+    "cmn": "z",
+}
+"""The languages the local voice speaks, by base code, and the first letter of its voices in each.
+
+Kokoro v1.0 is trained on these languages only, and names every voice by its language: `af_heart` is
+American English, `ef_dora` Spanish, `zf_xiaobei` Mandarin. There is no Dutch, and nothing pipecat
+can do about that: its Kokoro service would fall back to espeak-ng's Dutch phonemes read by an
+English voice, which is the accent this setting exists to remove. So a language outside this table,
+or a voice of the wrong letter for one inside it, stops the bot at startup instead."""
+
+
+def base_language(code: str) -> str:
+    """Drop the region and the case from a language code: `nl` for `nl-BE`, `en` for `en_US`."""
+    return code.replace("_", "-").split("-")[0].lower()
+
+
+def as_pipecat_language(code: str) -> Language | str:
+    """Pipecat's enum member for a BCP-47 code, or the code itself for a provider-specific one.
+
+    Each service converts the enum to its own spelling (`nl-NL` for Google, `nl` for Cartesia), so
+    the enum is what lets one setting reach four providers. A code the enum does not know is passed
+    through as written, which pipecat sends to the provider unchanged.
+    """
+    try:
+        return Language(code)
+    except ValueError:
+        return code
+
+
+@dataclass(frozen=True)
+class SpeakingLanguages:
+    """What the bot may speak on a call, read from the environment by `resolve_speaking_languages`.
+
+    `starting` is None when nothing is configured, and then nothing below reaches a service: each
+    synthesizer keeps its own default, which is how the example behaved before this existed.
+    """
+
+    starting: str | None
+    available: tuple[str, ...]
+    voices: Mapping[str, str]
+    follow_caller: bool
+
+    @property
+    def switchable(self) -> bool:
+        """Whether there is another language to switch to, which is what the tool is for."""
+        return len(self.available) > 1
+
+    def configured_language_for(self, reported: str) -> str | None:
+        """Find the configured language a recognizer report means, by exact code, then base code.
+
+        A recognizer reports `nl-BE` for a caller the deployment configured as `nl`; that caller
+        speaks the configured language. None when the report is no configured language at all.
+        """
+        normalised = reported.replace("_", "-").lower()
+        for language in self.available:
+            if language.replace("_", "-").lower() == normalised:
+                return language
+        for language in self.available:
+            if base_language(language) == base_language(reported):
+                return language
+        return None
+
+    def voice_for(self, language: str) -> str | None:
+        """Name the voice `BOT_TTS_VOICES` gives `language`, or None when it gives none."""
+        return self.voices.get(language)
+
+
+def resolve_speaking_languages(
+    environment: Mapping[str, str], provider: str, default_voice: str
+) -> SpeakingLanguages:
+    """Read what the bot speaks: `BOT_TTS_LANGUAGE`, `BOT_TTS_LANGUAGES`, `BOT_TTS_VOICES`.
+
+    `BOT_TTS_LANGUAGES` is every language a call may switch to (`en,nl`), `BOT_TTS_LANGUAGE` the one
+    it starts in, defaulting to the first of the list. `BOT_TTS_VOICES` gives a language its own
+    voice (`nl=<voice>,en=<voice>`), because a voice speaks its own language natively and every
+    other one with its accent; a language it names nothing for keeps `default_voice`.
+    `BOT_TTS_FOLLOW_CALLER=true` lets the voice follow the language the recognizer hears.
+
+    Checked in `main`, so a combination that cannot work stops the bot at startup, naming the
+    variable, rather than at the first call, where it would be heard as an accent and not as an
+    error.
+
+    Raises:
+        ValueError: For a malformed value, a starting language or a voice for a language the list
+            does not hold, following the caller with nothing to follow, or a language the local
+            voice cannot speak natively.
+
+    """
+    starting = environment.get("BOT_TTS_LANGUAGE", "").strip()
+    listed = tuple(
+        dict.fromkeys(
+            language.strip()
+            for language in environment.get("BOT_TTS_LANGUAGES", "").split(",")
+            if language.strip()
+        )
+    )
+    if starting and listed and starting not in listed:
+        raise ValueError(
+            f"BOT_TTS_LANGUAGE {starting!r} is not one of BOT_TTS_LANGUAGES ({', '.join(listed)})"
+        )
+    available = listed or ((starting,) if starting else ())
+
+    voices: dict[str, str] = {}
+    for entry in environment.get("BOT_TTS_VOICES", "").split(","):
+        if not entry.strip():
+            continue
+        language, separator, voice = (part.strip() for part in entry.partition("="))
+        if not separator or not language or not voice or language in voices:
+            raise ValueError(
+                f"BOT_TTS_VOICES entry {entry.strip()!r} is not language=voice, once per language "
+                "(for example nl=<voice id>,en=<voice id>)"
+            )
+        if language not in available:
+            raise ValueError(
+                f"BOT_TTS_VOICES names a voice for {language!r}, which is not a configured "
+                f"language ({', '.join(available) or 'none: set BOT_TTS_LANGUAGES'})"
+            )
+        voices[language] = voice
+
+    follow_caller = environment.get("BOT_TTS_FOLLOW_CALLER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if follow_caller and len(available) < 2:
+        raise ValueError(
+            "BOT_TTS_FOLLOW_CALLER needs BOT_TTS_LANGUAGES to list more than one language to follow"
+        )
+
+    languages = SpeakingLanguages(
+        starting=starting or (available[0] if available else None),
+        available=available,
+        voices=voices,
+        follow_caller=follow_caller,
+    )
+    if provider == "local":
+        _refuse_what_the_local_voice_cannot_speak(languages, default_voice)
+    return languages
+
+
+def _refuse_what_the_local_voice_cannot_speak(
+    languages: SpeakingLanguages, default_voice: str
+) -> None:
+    """Stop a language Kokoro has no voice for, and a Kokoro voice of another language.
+
+    Raises:
+        ValueError: Naming the language, what the local voice can speak, and what to change.
+
+    """
+    for language in languages.available:
+        prefixes = KOKORO_VOICE_PREFIXES.get(base_language(language))
+        if prefixes is None:
+            raise ValueError(
+                f"the local voice (Kokoro) cannot speak {language!r}: it speaks only "
+                f"{', '.join(sorted(KOKORO_VOICE_PREFIXES))}, and would read {language!r} in an "
+                "English accent. Choose a hosted voice for it with BOT_TTS_PROVIDER "
+                "(cartesia, google or openai), or remove it from BOT_TTS_LANGUAGES."
+            )
+        voice = languages.voice_for(language) or default_voice
+        if not voice or voice[0] not in prefixes:
+            raise ValueError(
+                f"the local voice {voice!r} is not a {language!r} voice, and would speak "
+                f"{language!r} with its own accent: name one in BOT_TTS_VOICES, as "
+                f"{language}=<a Kokoro voice starting with {' or '.join(prefixes)}>"
+            )
+
+
+GOOGLE_VOICE_LOCALE = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-")
+"""The locale a Google voice name starts with, as in `en-US-Chirp3-HD-Charon`."""
+
+
+def speaking_voice(
+    provider: str, language: str, languages: SpeakingLanguages, default_voice: str
+) -> str:
+    """Choose the voice that speaks `language`: the one the map names, or the configured voice.
+
+    Google is the one provider whose voice names carry a locale, and whose API refuses a voice of
+    one locale asked to speak another. Without a voice in the map, its voice is the configured one
+    moved to the language's locale: the Chirp3 voices exist under the same name in every locale
+    they serve, so `en-US-Chirp3-HD-Charon` speaking Dutch is `nl-NL-Chirp3-HD-Charon`.
+    """
+    voice = languages.voice_for(language)
+    if voice:
+        return voice
+    if provider == "google" and GOOGLE_VOICE_LOCALE.match(default_voice):
+        from pipecat.services.google.tts import language_to_google_tts_language
+
+        pipecat_language = as_pipecat_language(language)
+        locale = (
+            language_to_google_tts_language(pipecat_language)
+            if isinstance(pipecat_language, Language)
+            else language
+        )
+        return GOOGLE_VOICE_LOCALE.sub(f"{locale}-", default_voice, count=1)
+    return default_voice
+
+
+OPENAI_ACCENT_INSTRUCTIONS = (
+    "Speak in the language whose BCP-47 code is {language}, with the accent of a native speaker."
+)
+"""What OpenAI's voice is told when a language is set. Its speech endpoint takes no language at all
+and reads every text in its voice's own accent, so the instructions, which only its `gpt-` speech
+models accept, are the one place a language can be asked for."""
+
+
+def speaking_settings(
+    provider: str, language: str | None, languages: SpeakingLanguages, default_voice: str
+) -> dict[str, Any]:
+    """Gather the settings that make `provider` speak `language`. Empty when it is None.
+
+    Used twice: as constructor settings for the starting language, and as the delta a switch sends
+    mid-call, so the two cannot disagree about what speaking a language means for a provider.
+    """
+    if language is None:
+        return {}
+    settings: dict[str, Any] = {
+        "language": as_pipecat_language(language),
+        "voice": speaking_voice(provider, language, languages, default_voice),
+    }
+    if provider == "openai" and TTS_MODEL.startswith("gpt-"):
+        settings["instructions"] = OPENAI_ACCENT_INSTRUCTIONS.format(language=language)
+    return settings
+
+
+def default_tts_voice() -> str:
+    """Name the voice the selected synthesizer speaks when the voice map names none."""
+    if TTS_PROVIDER == "cartesia":
+        return TTS_VOICE or os.environ.get("CARTESIA_VOICE_ID", "")
+    return TTS_VOICE
+
+
+def configured_speaking_languages() -> SpeakingLanguages:
+    """Read the speaking languages for the selected synthesizer, as the environment says now."""
+    return resolve_speaking_languages(os.environ, TTS_PROVIDER, default_tts_voice())
+
+
 WHISPER_DEVICE = os.environ.get("BOT_WHISPER_DEVICE", "").strip() or "auto"
 """Where faster-whisper runs: `cuda`, `cpu`, or `auto` to take a GPU when one is visible."""
 
@@ -598,6 +859,41 @@ goodbye and ended their turn: replayed from a call, 0 of 5 hangups and 0 of 5 tr
 and a 30B model alike. With the order reversed, 10 of 10 of each. The goodbye still plays before
 the line goes, because pipecat runs the model again on the tool's result and `end_call` waits for
 that second reply to finish."""
+
+
+def speaking_language_prompt(languages: SpeakingLanguages) -> str:
+    """Tell the model which language it speaks in. Empty when none is configured.
+
+    The voice and the words have to agree. A voice set to Dutch reading an English reply is the
+    accent problem the other way round, so the model is told which language the voice is in, and,
+    when it can switch, that the switch is a tool call: the voice changes with the tool, not with
+    the words, and a model that just starts answering in another language is heard in the old voice.
+
+    Everything the bot says is the model's own reply, the greeting included, so this is the only
+    text that needs to carry the language. The instructions themselves stay in English, which every
+    model here follows whatever language it is asked to answer in.
+    """
+    if languages.starting is None:
+        return ""
+    prompt = (
+        "\n\nSpeak the language whose BCP-47 code is "
+        f"{languages.starting} on this call, starting with your greeting."
+    )
+    if not languages.switchable:
+        return prompt
+    prompt += (
+        f" You can also speak {', '.join(languages.available)} (BCP-47 codes). When the caller asks"
+        " you to speak one of them, call the set_speaking_language tool with it straight away and"
+        " answer in that language from then on: your voice changes with the tool, so do not change"
+        " language without calling it. If they ask for a language that is not in that list, tell"
+        " them in the language you are speaking that you cannot."
+    )
+    if languages.follow_caller:
+        prompt += (
+            " If the caller simply starts speaking one of those languages, answer in theirs;"
+            " your voice follows them on its own."
+        )
+    return prompt
 
 
 def _required_environment_variable(name: str, purpose: str) -> str:
@@ -896,6 +1192,215 @@ async def transfer_call(params: FunctionCallParams) -> None:
         await resources.worker.queue_frame(EndWorkerFrame())
 
 
+class SpeakingLanguageController(FrameProcessor):
+    """Change the language the bot speaks mid-call: when the model is asked, or after the caller.
+
+    One per call, and only when the deployment configured more than one language. It holds the
+    call's current language, serves the `set_speaking_language` tool, and sits after the echo guard
+    to hear the language the recognizer reports for each stretch of the caller's speech, so the
+    bot's own echo never counts as the caller changing language.
+
+    A switch is a `TTSUpdateSettingsFrame`, pipecat's runtime settings change, carrying the new
+    language and that language's voice. Cartesia, which locks voice and language per context,
+    flushes and opens a fresh one, so the change takes effect at the next sentence. A recognizer
+    pinned to one language gets an `STTUpdateSettingsFrame` too, or it would go on transcribing the
+    caller in the old one; one on `multi` hears every language already and is left alone.
+    """
+
+    def __init__(
+        self,
+        languages: SpeakingLanguages,
+        *,
+        provider: str,
+        default_voice: str,
+        recognizer_language: str,
+        consistent_turns: int = FOLLOW_CALLER_CONSISTENT_TURNS,
+    ) -> None:
+        """Start the call in `languages.starting`, speaking through `provider`."""
+        super().__init__()
+        self.languages = languages
+        self._provider = provider
+        self._default_voice = default_voice
+        self._recognizer_is_pinned = recognizer_language.lower() != "multi"
+        self._consistent_turns = consistent_turns
+        self.current = languages.starting or languages.available[0]
+        # Follow-the-caller state: the language heard in the latest run of stretches that differs
+        # from the current one, how many stretches in a row it has been heard, and whether the
+        # stretch in progress has already been counted.
+        self._candidate: str | None = None
+        self._candidate_turns = 0
+        self._stretch_counted = False
+        # An explicit request is the caller saying which language they want. Following them after
+        # that would undo it: an English speaker who asks for Dutch keeps speaking English.
+        self._requested = False
+
+    def _switch_frames(
+        self, language: str
+    ) -> tuple[TTSUpdateSettingsFrame, STTUpdateSettingsFrame | None]:
+        """Build the settings change for the voice, and a pinned recognizer, to speak `language`."""
+        voice_settings = speaking_settings(
+            self._provider, language, self.languages, self._default_voice
+        )
+        if "instructions" in voice_settings:
+            # Only OpenAI's voice takes instructions, so only its own settings class carries them.
+            from pipecat.services.openai.tts import OpenAITTSService
+
+            voice_delta: TTSSettings = OpenAITTSService.Settings(**voice_settings)
+        else:
+            voice_delta = TTSSettings(**voice_settings)
+        recognizer_frame = (
+            STTUpdateSettingsFrame(delta=STTSettings(language=as_pipecat_language(language)))
+            if self._recognizer_is_pinned
+            else None
+        )
+        return TTSUpdateSettingsFrame(delta=voice_delta), recognizer_frame
+
+    async def set_speaking_language(self, params: FunctionCallParams) -> None:
+        """Serve the tool: switch to the language the model names, if it is a configured one.
+
+        The frames go out through the model's own service, ahead of the reply it gives once this
+        returns: downstream into the voice, which is next in the pipeline, so the reply is spoken in
+        the new language, and upstream to the recognizer.
+        """
+        requested = str(params.arguments.get("language", ""))
+        language = self.languages.configured_language_for(requested) if requested else None
+        if language is None:
+            await params.result_callback(
+                {
+                    "error": f"cannot speak {requested!r} on this call",
+                    "available": list(self.languages.available),
+                }
+            )
+            return
+        self._requested = True
+        if language != self.current:
+            voice_frame, recognizer_frame = self._switch_frames(language)
+            await params.llm.push_frame(voice_frame)
+            if recognizer_frame is not None:
+                await params.llm.push_frame(recognizer_frame, FrameDirection.UPSTREAM)
+            logger.info(f"speaking language {self.current} -> {language}, as the caller asked")
+            self.current = language
+        await params.result_callback({"speaking_language": language})
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Count the caller's language per stretch of speech, and pass every frame through."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._stretch_counted = False
+        elif (
+            isinstance(frame, TranscriptionFrame)
+            and self.languages.follow_caller
+            and not self._requested
+            and not self._stretch_counted
+            and frame.language
+        ):
+            heard = self.languages.configured_language_for(str(frame.language))
+            # A language nobody configured, or none reported, says nothing about which configured
+            # one the caller is speaking, so it neither counts nor breaks a run.
+            if heard is not None:
+                self._stretch_counted = True
+                await self._count(heard)
+        await self.push_frame(frame, direction)
+
+    async def _count(self, heard: str) -> None:
+        """Count one stretch heard in `heard`, and follow it once it has been heard consistently."""
+        if heard == self.current:
+            self._candidate, self._candidate_turns = None, 0
+            return
+        if heard == self._candidate:
+            self._candidate_turns += 1
+        else:
+            self._candidate, self._candidate_turns = heard, 1
+        if self._candidate_turns < self._consistent_turns:
+            return
+        voice_frame, recognizer_frame = self._switch_frames(heard)
+        # Ahead of the transcript, so the reply to it is already spoken in the new voice.
+        await self.push_frame(voice_frame)
+        if recognizer_frame is not None:
+            await self.push_frame(recognizer_frame, FrameDirection.UPSTREAM)
+        logger.info(
+            f"speaking language {self.current} -> {heard}, following the caller "
+            f"after {self._candidate_turns} turns in it"
+        )
+        self.current = heard
+        self._candidate, self._candidate_turns = None, 0
+
+
+def build_speaking_language_controller() -> SpeakingLanguageController | None:
+    """Build the call's language switch, or None when there is only one language to speak."""
+    languages = configured_speaking_languages()
+    if not languages.switchable:
+        return None
+    return SpeakingLanguageController(
+        languages,
+        provider=TTS_PROVIDER,
+        default_voice=default_tts_voice(),
+        recognizer_language=STT_LANGUAGE,
+    )
+
+
+def build_tool_schemas(
+    with_control: bool, speaking: SpeakingLanguageController | None
+) -> list[FunctionSchema]:
+    """List the model's tools: hangup and transfer with a control plane, and the language switch.
+
+    Each only when it can act. A tool the model is offered and cannot use is a promise to the caller
+    that is never kept, which is the same reason the prompts for them are appended conditionally.
+    """
+    tools: list[FunctionSchema] = []
+    if with_control:
+        tools.append(
+            FunctionSchema(
+                name="end_call",
+                description=(
+                    "Hang up the phone call. Call it as soon as the caller is done, "
+                    "before saying goodbye, and say the goodbye after it returns: the "
+                    "call ends once the goodbye has finished playing."
+                ),
+                properties={},
+                required=[],
+                handler=end_call,
+            )
+        )
+        if TRANSFER_TARGET:
+            tools.append(
+                FunctionSchema(
+                    name="transfer_call",
+                    description=(
+                        "Put the caller through to a person. Call it first, and after "
+                        "it returns tell them you are transferring them: the transfer "
+                        "happens once your words have finished playing, and the call is "
+                        "not yours afterwards."
+                    ),
+                    properties={},
+                    required=[],
+                    handler=transfer_call,
+                )
+            )
+    if speaking is not None:
+        tools.append(
+            FunctionSchema(
+                name="set_speaking_language",
+                description=(
+                    "Change the language your voice speaks, for the rest of the call. Call it as "
+                    "soon as the caller asks you to speak another language, then answer in it."
+                ),
+                properties={
+                    "language": {
+                        "type": "string",
+                        # The deployment's list, and nothing else: a language the model could name
+                        # freely is one the configured voice may not speak natively.
+                        "enum": list(speaking.languages.available),
+                        "description": "The BCP-47 code of the language to speak.",
+                    }
+                },
+                required=["language"],
+                handler=speaking.set_speaking_language,
+            )
+        )
+    return tools
+
+
 class EchoGuard(FrameProcessor):
     """Drop transcriptions that arrive while the line is the bot's own.
 
@@ -987,7 +1492,7 @@ def ends_mid_sentence(text: str) -> bool:
 
 def is_english(language: str) -> bool:
     """Whether a language code is English, in any regional variant (`en`, `en-US`, `en_AU`)."""
-    return language.replace("_", "-").split("-")[0].lower() == "en"
+    return base_language(language) == "en"
 
 
 # pipecat's BaseUserTurnStopStrategy.__init_subclass__ is untyped and runs for every subclass, so
@@ -1367,7 +1872,6 @@ def preload_local_models() -> None:
     silence its first caller.
     """
     import numpy
-    from pipecat.transcriptions.language import Language
 
     roles = local_roles()
     started = time.monotonic()
@@ -1383,9 +1887,18 @@ def preload_local_models() -> None:
     if "tts" in roles:
         build_text_to_speech()
         kokoro = importlib.import_module("pipecat.services.kokoro.tts")
-        language = kokoro.language_to_kokoro_language(Language.EN)
+        # In the language and voice the first call starts in, so the one exercised is the one used.
+        languages = configured_speaking_languages()
+        starting = languages.starting
+        pipecat_language = as_pipecat_language(starting) if starting else Language.EN
+        language = (
+            kokoro.language_to_kokoro_language(pipecat_language)
+            if isinstance(pipecat_language, Language)
+            else pipecat_language
+        )
+        voice = speaking_voice("local", starting, languages, TTS_VOICE) if starting else TTS_VOICE
         for synthesizer in kokoro.Kokoro.built():
-            synthesizer.create("Ready.", voice=TTS_VOICE, speed=1.0, lang=language)
+            synthesizer.create("Ready.", voice=voice, speed=1.0, lang=language)
 
     logger.info(
         f"local models loaded and exercised in {time.monotonic() - started:.1f}s "
@@ -1399,6 +1912,7 @@ def build_llm_service(with_hangup: bool) -> LLMService[Any]:
         resolve_system_prompt(os.environ)
         + (HANGUP_PROMPT if with_hangup else "")
         + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
+        + speaking_language_prompt(configured_speaking_languages())
     )
     builders: dict[str, Callable[[str], LLMService[Any]]] = {
         "anthropic": _build_anthropic_llm_service,
@@ -1585,6 +2099,16 @@ def build_text_to_speech() -> TTSService:
     return builders[TTS_PROVIDER]()
 
 
+def _starting_speaking_settings(provider: str, voice: str) -> dict[str, Any]:
+    """Give the language and voice a synthesizer starts the call in, or nothing when none is set.
+
+    Nothing rather than the language each service defaults to, so a deployment that sets no
+    language builds every voice exactly as it did before languages could be configured.
+    """
+    languages = resolve_speaking_languages(os.environ, provider, voice)
+    return speaking_settings(provider, languages.starting, languages, voice)
+
+
 def _build_cartesia_tts_service() -> TTSService:
     """Build Cartesia's voice."""
     from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -1594,7 +2118,11 @@ def _build_cartesia_tts_service() -> TTSService:
     voice = TTS_VOICE or _provider_key("tts", "cartesia", "CARTESIA_VOICE_ID")
     return CartesiaTTSService(
         api_key=_provider_key("tts", "cartesia", "CARTESIA_API_KEY"),
-        settings=CartesiaTTSService.Settings(voice=voice, model=TTS_MODEL),
+        # Without a language Cartesia speaks English, whatever the text: Dutch replies came out
+        # in an English accent. The language, and that language's voice, only when one is set.
+        settings=CartesiaTTSService.Settings(
+            **{"voice": voice, "model": TTS_MODEL, **_starting_speaking_settings("cartesia", voice)}
+        ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
@@ -1609,7 +2137,13 @@ def _build_google_tts_service() -> TTSService:
     from pipecat.utils.types import NOT_GIVEN
 
     return GoogleTTSService(
-        settings=GoogleTTSService.Settings(voice=TTS_VOICE, model=TTS_MODEL or NOT_GIVEN),
+        settings=GoogleTTSService.Settings(
+            **{
+                "voice": TTS_VOICE,
+                "model": TTS_MODEL or NOT_GIVEN,
+                **_starting_speaking_settings("google", TTS_VOICE),
+            }
+        ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
@@ -1628,7 +2162,13 @@ def _build_openai_tts_service() -> TTSService:
     # the wire on the way out, which is the one place in this process that converts.
     return OpenAITTSService(
         api_key=_provider_key("tts", "openai", "OPENAI_API_KEY"),
-        settings=OpenAITTSService.Settings(voice=TTS_VOICE, model=TTS_MODEL),
+        settings=OpenAITTSService.Settings(
+            **{
+                "voice": TTS_VOICE,
+                "model": TTS_MODEL,
+                **_starting_speaking_settings("openai", TTS_VOICE),
+            }
+        ),
         sample_rate=OPENAI_TTS_SAMPLE_RATE,
     )
 
@@ -1638,7 +2178,9 @@ def _build_local_tts_service() -> TTSService:
     from pipecat.services.kokoro.tts import KokoroTTSService
 
     return KokoroTTSService(
-        settings=KokoroTTSService.Settings(voice=TTS_VOICE),
+        settings=KokoroTTSService.Settings(
+            **{"voice": TTS_VOICE, **_starting_speaking_settings("local", TTS_VOICE)}
+        ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
@@ -1743,42 +2285,12 @@ def build_worker(
     # The conversation itself. The system prompt lives on the service (and is cached there), so
     # the context carries only the call.
     context = LLMContext()
-    if control is not None:
-        context.set_tools(
-            ToolsSchema(
-                standard_tools=[
-                    FunctionSchema(
-                        name="end_call",
-                        description=(
-                            "Hang up the phone call. Call it as soon as the caller is done, "
-                            "before saying goodbye, and say the goodbye after it returns: the "
-                            "call ends once the goodbye has finished playing."
-                        ),
-                        properties={},
-                        required=[],
-                        handler=end_call,
-                    )
-                ]
-                + (
-                    [
-                        FunctionSchema(
-                            name="transfer_call",
-                            description=(
-                                "Put the caller through to a person. Call it first, and after "
-                                "it returns tell them you are transferring them: the transfer "
-                                "happens once your words have finished playing, and the call is "
-                                "not yours afterwards."
-                            ),
-                            properties={},
-                            required=[],
-                            handler=transfer_call,
-                        )
-                    ]
-                    if TRANSFER_TARGET
-                    else []
-                )
-            )
-        )
+    # None unless the deployment configured a second language: with one, the voice is built
+    # speaking it and there is nothing to switch, so the pipeline stays as it was.
+    speaking_language = build_speaking_language_controller()
+    tools = build_tool_schemas(control is not None, speaking_language)
+    if tools:
+        context.set_tools(ToolsSchema(standard_tools=tools))
     # The aggregator decides the caller's turn, and nothing else in the pipeline does: see
     # `build_user_aggregator_params` for what a second decider in front of it cost. Its strategies
     # are explicit and differ by backend: the cloud path ends a turn on the engine's endpoint plus
@@ -1799,6 +2311,9 @@ def build_worker(
                 # Between the recognizer and the turn logic on purpose: the echo is dropped before
                 # anything can treat it as the caller starting a turn.
                 echo_guard,
+                # After the echo guard, so the bot's own echo never counts as the caller changing
+                # language, and ahead of the turn, so a switch reaches the voice before the reply.
+                *([speaking_language] if speaking_language is not None else []),
                 aggregators.user(),
                 llm,
                 text_to_speech,
@@ -1937,6 +2452,7 @@ async def main(
         refuse_an_unknown_backend(BACKEND)
         missing = missing_environment(providers, os.environ)
         resolve_system_prompt(os.environ)
+        speaking_languages = configured_speaking_languages()
     except ValueError as error:
         sys.exit(str(error))
     if missing:
@@ -1980,7 +2496,50 @@ async def main(
             if control is not None
             else "none (no control plane, so the bot can neither hang up nor transfer)"
         )
+        + (
+            f", set_speaking_language -> {', '.join(speaking_languages.available)}"
+            if speaking_languages.switchable
+            else ""
+        )
     )
+    # Which language the voice speaks, for the same reason: an accent is not visible in a log.
+    if speaking_languages.starting is not None:
+        logger.info(
+            f"speaking: {speaking_languages.starting}"
+            + (
+                f" of {', '.join(speaking_languages.available)}"
+                if speaking_languages.switchable
+                else ""
+            )
+            + "; voices "
+            + ", ".join(
+                f"{language}="
+                + (
+                    speaking_voice(TTS_PROVIDER, language, speaking_languages, default_tts_voice())
+                    or "account voice"
+                )
+                for language in speaking_languages.available
+            )
+            + (", following the caller" if speaking_languages.follow_caller else "")
+        )
+    if speaking_languages.follow_caller and STT_LANGUAGE.lower() != "multi":
+        logger.warning(
+            f"BOT_TTS_FOLLOW_CALLER is on, but the recognizer is pinned to {STT_LANGUAGE} and "
+            "reports nothing else, so the voice will only change when the caller asks for it. "
+            "Follow the caller with a recognizer on multi (deepgram)."
+        )
+    if (
+        speaking_languages.starting is not None
+        and STT_LANGUAGE.lower() != "multi"
+        and base_language(STT_LANGUAGE) != base_language(speaking_languages.starting)
+    ):
+        # Warned rather than changed: the recognizer's language is BOT_STT_LANGUAGE's, and the
+        # local recognizer's default model is English-only, so moving it here would stop the bot.
+        logger.warning(
+            f"the bot speaks {speaking_languages.starting} but the recognizer is pinned to "
+            f"{STT_LANGUAGE}: set BOT_STT_LANGUAGE to match, or to multi on deepgram, or callers "
+            "answering in that language are transcribed as the other one"
+        )
     # The turn-taking posture, for the same reason: "it interrupted itself" and "it would not let me
     # interrupt" are both tuning, and neither is visible from a transcript.
     logger.info(

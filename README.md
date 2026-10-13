@@ -358,6 +358,44 @@ whether the control channel ever finds its call — the engine expands `{call_id
 the **SIP** Call-ID, so the two channels join on `sip_call_id`, not on the control frame's own
 `call_id`.
 
+### Speaking another language
+
+Left alone, the agent's voice speaks its provider's default language, which is English: a model
+answering in Dutch is read out by an English voice, with an English accent. Four variables fix
+that, and with none of them set the bot is built exactly as before:
+
+| variable | format | default |
+|---|---|---|
+| `BOT_TTS_LANGUAGE` | BCP-47 (`nl`, `nl-BE`) or the provider's own code | unset: the provider's default |
+| `BOT_TTS_LANGUAGES` | comma-separated list (`nl,en`) | unset: just `BOT_TTS_LANGUAGE` |
+| `BOT_TTS_VOICES` | `language=voice` pairs (`nl=<voice id>,en=<voice id>`) | unset: the configured voice for all |
+| `BOT_TTS_FOLLOW_CALLER` | `true` / `false` | `false` |
+
+`BOT_TTS_LANGUAGE` is the language the call starts in (the greeting included), and goes to every
+synthesizer as its language setting. With more than one language in `BOT_TTS_LANGUAGES` the model
+gets a `set_speaking_language` tool, limited to that list, and calls it when the caller asks for
+another language: the voice, its language and a recognizer pinned to one language all change for
+the rest of the call. `BOT_TTS_FOLLOW_CALLER=true` also moves the voice to the language the
+recognizer hears, once two stretches of the caller's speech in a row are in it; that needs a
+recognizer that reports a language per transcript, which is Deepgram on `multi`, its default here.
+
+**The language setting alone does not remove the accent; the voice has to speak that language
+natively.** A voice reads every language in its own accent. On Cartesia, where a voice is a voice
+id on your account, give each language a native voice in `BOT_TTS_VOICES`, or use one of
+Cartesia's multilingual voices with the language set. Google's voice names carry their locale, so
+a language without a voice in the map gets the configured voice in that locale
+(`en-US-Chirp3-HD-Charon` becomes `nl-NL-Chirp3-HD-Charon`). OpenAI's speech endpoint takes no
+language, so its `gpt-` voices are instead instructed to use a native accent. The local voice,
+Kokoro, has no Dutch at all, and a language it cannot speak, or a Kokoro voice of another language,
+stops the bot at startup rather than speaking with an accent.
+
+A bot that answers in Dutch with a native voice and switches to English when asked:
+
+```sh
+BOT_TTS_LANGUAGES=nl,en
+BOT_TTS_VOICES=nl=<a Dutch voice id>,en=<an English voice id>
+```
+
 `examples/probe.py` speaks the engine's half of the media wire — connect, `start`, stream silence
 — and reports how much audio comes back and how long the first frame took. No phone, no SIP
 stack, no engine. It is the fastest way to tell "the AI is broken" from "the media path is

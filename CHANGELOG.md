@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The agent example speaks a configured language, and switches when the caller asks.** Its voice
+  was built with no language, so Cartesia spoke English and read a Dutch reply in an English
+  accent. `BOT_TTS_LANGUAGE` now reaches every synthesizer that takes one, `BOT_TTS_VOICES` gives
+  each language its own voice (the language alone does not remove an accent; a native or
+  multilingual voice does), and `BOT_TTS_LANGUAGES` with more than one entry gives the model a
+  `set_speaking_language` tool that changes the voice through pipecat's `TTSUpdateSettingsFrame`
+  for the rest of the call, a pinned recognizer included. `BOT_TTS_FOLLOW_CALLER=true` follows the
+  language the recognizer hears, after two stretches of speech in a row, so one misheard word does
+  not flip it. Kokoro has no Dutch, so a language the local voice cannot speak natively stops the
+  bot at startup. With none of these set, every service is built exactly as before.
+
 ### Fixed
 
 - **The agent example takes Google's application default credentials for speech.** With
