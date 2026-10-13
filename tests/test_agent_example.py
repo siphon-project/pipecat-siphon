@@ -10,6 +10,7 @@ import asyncio
 import importlib.util
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -990,6 +991,345 @@ class TestTransferVerdict:
             }
         )
         assert any("FAILED" in line and "486" in line for line in lines), lines
+
+
+SIP_CALL_ID = "abc@example.invalid"
+TRANSFER_DESTINATION = "sip:desk@example.invalid"
+
+
+def _verdict(kind: str, stage: str, code: int | None, reason: str | None) -> dict[str, Any]:
+    """One transfer event as `next_event()` returns it, in the payload shape siphon sends."""
+    return {"kind": kind, "payload": {"stage": stage, "code": code, "reason": reason}}
+
+
+ACCEPTED = _verdict("TransferProgress", "accepted", 202, "Accepted")
+COMPLETED = _verdict("TransferCompleted", "transferred", 200, "OK")
+REFUSED_BY_THE_PHONE = _verdict("TransferFailed", "rejected", 405, "Method Not Allowed")
+ENDED_WITH_THE_CALL = _verdict("TransferFailed", "call_ended", None, None)
+
+
+class _FakeTransferringCall(_FakeControlCall):
+    """A control call whose `transfer()` is answered on the event stream, as siphon answers one.
+
+    `transfer()` resolves once the REFER is sent and the verdict follows as events (RFC 3515
+    §2.4.4), so the fake queues `verdicts` when it is asked to transfer. `None` in the script is
+    the call ending: the stream closes, as `next_event()` does when siphon tears the call down.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[dict[str, Any] | None],
+        transfer_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(sip_call_id=SIP_CALL_ID)
+        self.transfers: list[str] = []
+        self._verdicts = verdicts
+        self._transfer_error = transfer_error
+        self._stream: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    def deliver(self, event: dict[str, Any] | None) -> None:
+        """Put one more event on the stream, later than the REFER."""
+        self._stream.put_nowait(event)
+
+    def end(self) -> None:
+        """Close the stream, as the end of the call does."""
+        self._stream.put_nowait(None)
+
+    async def next_event(self) -> dict[str, Any] | None:
+        """Deliver whatever has arrived, in order, blocking until something does."""
+        return await self._stream.get()
+
+    async def transfer(self, target: str) -> None:
+        """Record the REFER, then answer it with the scripted verdict."""
+        self.transfers.append(target)
+        if self._transfer_error is not None:
+            raise self._transfer_error
+        for event in self._verdicts:
+            self._stream.put_nowait(event)
+
+
+class _FakeWorker:
+    """Record what the tool queues into the pipeline: the end of the call, or a model note."""
+
+    def __init__(self) -> None:
+        self.frames: list[Frame] = []
+
+    async def queue_frame(self, frame: Frame) -> None:
+        self.frames.append(frame)
+
+    def ended(self) -> bool:
+        from pipecat.frames.frames import EndWorkerFrame
+
+        return any(isinstance(frame, EndWorkerFrame) for frame in self.frames)
+
+    def notes_to_the_model(self) -> list[str]:
+        from pipecat.frames.frames import LLMMessagesAppendFrame
+
+        return [
+            str(message["content"])  # type: ignore[index]
+            for frame in self.frames
+            if isinstance(frame, LLMMessagesAppendFrame) and frame.run_llm
+            for message in frame.messages
+        ]
+
+
+class _FinishedSpeech:
+    """The handover line has already played: the transfer tests are about what follows it."""
+
+    async def wait_until_finished(self) -> bool:
+        return True
+
+
+class _Transfer:
+    """One `transfer_call` tool call on a call wired to a control plane, and what it did."""
+
+    def __init__(self, call: _FakeTransferringCall) -> None:
+        import agent_bot
+
+        self.call = call
+        self.control = ControlPlane(application="agent-app", token="t", url="ws://127.0.0.1:9/x")
+        self.control._transfer_final = lambda kind: kind in {"TransferCompleted", "TransferFailed"}
+        self.control._transfer_outcome = lambda event: event.get("payload")
+        self.worker = _FakeWorker()
+        serializer: Any = SimpleNamespace(call_id=SIP_CALL_ID)
+        speech: Any = _FinishedSpeech()
+        worker: Any = self.worker
+        self.resources = agent_bot.CallResources(
+            serializer=serializer, speech=speech, control=self.control, worker=worker
+        )
+        self.results: list[dict[str, Any]] = []
+        self._holder: asyncio.Task[None] | None = None
+
+    async def attach(self) -> None:
+        """Hand the call to the control plane, as siphon's handover does."""
+        self._holder = asyncio.create_task(self.control._handle_call(self.call))
+        await asyncio.sleep(0)
+
+    async def request(self) -> None:
+        """Run the tool as pipecat would, recording every result it hands the model."""
+        import agent_bot
+
+        async def result_callback(result: dict[str, Any], **_: Any) -> None:
+            self.results.append(result)
+
+        params: Any = SimpleNamespace(app_resources=self.resources, result_callback=result_callback)
+        await agent_bot.transfer_call(params)
+
+    async def hang_up(self) -> None:
+        """End the call and let the control plane let go of it."""
+        self.call.end()
+        if self._holder is not None:
+            await self._holder
+
+
+@pytest.fixture
+def transfer_settings(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Configure a destination, and a verdict wait short enough to run in a test."""
+    import agent_bot
+
+    monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", TRANSFER_DESTINATION)
+    monkeypatch.setattr(agent_bot, "TRANSFER_VERDICT_TIMEOUT_SECONDS", TIMEOUT_SECONDS)
+    return monkeypatch
+
+
+@pytest.mark.usefixtures("transfer_settings")
+class TestTransferKeepsTheCallerUntilTheVerdict:
+    """The bot lets go of a call only once its transfer has actually happened.
+
+    `transfer()` resolves when the REFER is sent, and many phones refuse a REFER from the network
+    (`405`, `403`). Ending the bot's leg on the send left such a caller on a silent line until the
+    node gave up on the call; measured on a test rig, that is the common failure, not the rare one.
+    """
+
+    async def test_a_completed_transfer_ends_the_bot(self) -> None:
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED, COMPLETED]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert transfer.call.transfers == [TRANSFER_DESTINATION]
+        assert transfer.worker.ended(), "the transfer completed and the bot is still on the call"
+        assert transfer.worker.notes_to_the_model() == []
+        await transfer.hang_up()
+
+    async def test_a_phone_that_refuses_the_refer_keeps_the_caller_and_tells_the_model(
+        self,
+    ) -> None:
+        transfer = _Transfer(_FakeTransferringCall([REFUSED_BY_THE_PHONE]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert not transfer.worker.ended(), "the bot left a caller whose transfer never started"
+        notes = transfer.worker.notes_to_the_model()
+        assert len(notes) == 1, transfer.worker.frames
+        assert "still on the line" in notes[0]
+        assert not transfer.resources.transfer_hold.holding, "the caller is still not heard"
+        await transfer.hang_up()
+
+    async def test_no_verdict_within_the_wait_counts_as_failed(
+        self, transfer_settings: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        transfer_settings.setattr(agent_bot, "TRANSFER_VERDICT_TIMEOUT_SECONDS", QUIET_SECONDS)
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED]))
+        await transfer.attach()
+
+        started = time.monotonic()
+        await transfer.request()
+
+        assert time.monotonic() - started < TIMEOUT_SECONDS, "the wait was not bounded"
+        assert not transfer.worker.ended()
+        assert len(transfer.worker.notes_to_the_model()) == 1
+        assert not transfer.resources.transfer_hold.holding
+        await transfer.hang_up()
+
+    async def test_a_completion_after_the_wait_still_ends_the_bot(
+        self, transfer_settings: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        transfer_settings.setattr(agent_bot, "TRANSFER_VERDICT_TIMEOUT_SECONDS", QUIET_SECONDS)
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED]))
+        await transfer.attach()
+        await transfer.request()
+        assert not transfer.worker.ended()
+
+        # The destination answers late: the caller is gone, so the bot's leg is finished after all.
+        transfer.call.deliver(COMPLETED)
+        for _ in range(100):
+            if transfer.worker.ended():
+                break
+            await asyncio.sleep(0.01)
+
+        assert transfer.worker.ended(), "the caller was transferred and the bot stayed on the call"
+        await transfer.hang_up()
+
+    async def test_the_call_ending_during_the_transfer_ends_the_bot_without_recovering(
+        self,
+    ) -> None:
+        # A phone may BYE its old leg as soon as it has sent the INVITE to the destination (TS
+        # 24.629 allows it), and siphon then reports call_ended although the new call may connect.
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED, ENDED_WITH_THE_CALL, None]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert transfer.worker.ended()
+        assert transfer.worker.notes_to_the_model() == [], "the bot tried to talk to nobody"
+        await transfer.hang_up()
+
+    async def test_the_stream_closing_without_a_verdict_counts_as_the_call_ending(self) -> None:
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED, None]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert transfer.worker.ended()
+        assert transfer.worker.notes_to_the_model() == []
+
+    async def test_a_second_request_while_one_is_pending_is_refused(self) -> None:
+        transfer = _Transfer(_FakeTransferringCall([ACCEPTED]))
+        await transfer.attach()
+
+        first = asyncio.create_task(transfer.request())
+        for _ in range(100):
+            if transfer.call.transfers:
+                break
+            await asyncio.sleep(0.01)
+        assert transfer.resources.transfer_hold.holding, "the caller is heard over the transfer"
+
+        await transfer.request()
+
+        assert transfer.call.transfers == [TRANSFER_DESTINATION], "a second REFER was sent"
+        assert "error" in transfer.results[-1], transfer.results
+
+        transfer.call.deliver(REFUSED_BY_THE_PHONE)
+        await first
+        assert not transfer.worker.ended()
+        await transfer.hang_up()
+
+    async def test_a_transfer_the_control_plane_refuses_keeps_the_caller(self) -> None:
+        transfer = _Transfer(_FakeTransferringCall([], transfer_error=RuntimeError("not_found")))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert not transfer.worker.ended()
+        assert len(transfer.worker.notes_to_the_model()) == 1
+        assert not transfer.resources.transfer_hold.holding
+        await transfer.hang_up()
+
+    async def test_without_a_control_plane_the_tool_refuses_and_nothing_is_held(self) -> None:
+        import agent_bot
+
+        results: list[dict[str, Any]] = []
+
+        async def result_callback(result: dict[str, Any], **_: Any) -> None:
+            results.append(result)
+
+        params: Any = SimpleNamespace(app_resources=None, result_callback=result_callback)
+        await agent_bot.transfer_call(params)
+
+        assert results == [{"error": "this call cannot be transferred from here"}]
+
+
+class TestTransferHold:
+    """While a transfer is being decided the caller's words do not reach the model.
+
+    The phone is busy with the REFER and the destination, so a reply from the bot would talk over
+    the transfer; the cleanest way to have none is to start no turn at all.
+    """
+
+    async def test_holding_drops_the_caller_and_releasing_lets_them_through(self) -> None:
+        import agent_bot
+
+        hold = agent_bot.TransferHold()
+        hold.engage()
+        await run_test(
+            hold,
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                VADUserStartedSpeakingFrame(),
+                TranscriptionFrame("hello?", "caller", time_now_iso8601()),
+                VADUserStoppedSpeakingFrame(),
+                TextFrame("not the caller"),
+            ],
+            expected_down_frames=[TextFrame],
+        )
+        hold.release()
+        await run_test(
+            hold,
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[TranscriptionFrame("hello?", "caller", time_now_iso8601())],
+            expected_down_frames=[TranscriptionFrame],
+        )
+
+    def test_the_hold_is_in_the_pipeline_only_with_a_control_plane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        TestObserverHook._stub_the_call(monkeypatch)
+        built: list[list[FrameProcessor]] = []
+
+        def recording_pipeline(processors: list[FrameProcessor]) -> Pipeline:
+            built.append(processors)
+            return Pipeline(processors)
+
+        monkeypatch.setattr(agent_bot, "Pipeline", recording_pipeline)
+        websocket: Any = object()
+        agent_bot.build_worker(websocket, None)
+        agent_bot.build_worker(
+            websocket, ControlPlane(application="agent-app", token="t", url="ws://127.0.0.1:9/x")
+        )
+
+        holds = [
+            [processor for processor in processors if isinstance(processor, agent_bot.TransferHold)]
+            for processors in built
+        ]
+        assert [len(found) for found in holds] == [0, 1]
 
 
 class TestPinnedSampling:

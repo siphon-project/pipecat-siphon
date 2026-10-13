@@ -135,9 +135,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -151,11 +151,13 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
+    LLMMessagesAppendFrame,
     LLMRunFrame,
     STTUpdateSettingsFrame,
     TranscriptionFrame,
     TTSUpdateSettingsFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -834,6 +836,20 @@ From the environment and never from the model. The tool therefore takes no argum
 destination the model could name is a destination the *caller* can talk it into naming, and the
 verb on the other end will dial whatever it is given."""
 
+TRANSFER_VERDICT_TIMEOUT_SECONDS = float(os.environ.get("BOT_TRANSFER_VERDICT_TIMEOUT", "") or 60)
+"""How long the bot keeps a caller it has asked to transfer before it takes the transfer as failed.
+
+`transfer()` resolves when siphon has sent the REFER. Whether it happened arrives later, on the
+REFER's implicit subscription (RFC 3515 §2.4.4), and RFC 3515 gives that subscription no duration of
+its own: the phone picks it. siphon's docs name no deadline for it either, so a phone that answers
+`202` and never sends the terminating NOTIFY would keep the bot waiting for the rest of the call.
+
+Sixty seconds is siphon's own default for a transfer to report (`accept_refer` in `controller` mode,
+after which siphon tells the referrer `503`), and it is well past 64*T1 = 32 s, the most a REFER can
+go unanswered (RFC 3261 Timer F), so a phone that refuses or never answers the REFER is always
+heard from first. A refusal itself takes a round trip: a `405` from a phone arrives in milliseconds,
+and only a phone that accepted and is ringing the destination uses this much of it."""
+
 TRANSFER_PROMPT = """
 
 You can also put the caller through to a person with the transfer_call tool. Call it first, and
@@ -997,6 +1013,49 @@ class BotSpeechMonitor(FrameProcessor):
                 return True
 
 
+@dataclass(frozen=True)
+class TransferVerdict:
+    """What became of a transfer the bot asked for, read the way the bot has to act on it.
+
+    `ending` is the decision, and there are three because there are three things to do. A
+    `completed` transfer and an `ended` call both leave the bot with nobody on its leg, so it ends.
+    A `failed` one leaves the caller with the bot, which has to carry on with them.
+
+    `ended` is the one to read twice. `TransferFailed` with stage `call_ended` means siphon tore the
+    call down while the transfer was outstanding, and a phone does that on purpose when it BYEs its
+    old leg as soon as it has sent the INVITE to the destination, which TS 24.629 allows. That new
+    call may well connect. Either way the caller has left *this* call, so there is nobody to tell
+    that the transfer did not work, and nothing to recover. The refusals (`rejected`, `refused`,
+    `unauthorized`, `no_outcome`) arrive on a call that is still up, which is what tells them apart.
+    """
+
+    ending: Literal["completed", "failed", "ended"]
+    stage: str | None = None
+    status: int | None = None
+    reason: str | None = None
+
+    @classmethod
+    def from_event(cls, kind: str, outcome: Mapping[str, Any]) -> TransferVerdict:
+        """Read a final transfer event's kind and payload into the decision it calls for."""
+        stage = outcome.get("stage")
+        # The wire calls it `code`; the SDK's docstring calls it `status`. Either is the SIP status
+        # the verdict rests on, and neither decides the verdict: the kind does.
+        status = outcome.get("code", outcome.get("status"))
+        ending: Literal["completed", "failed", "ended"]
+        if kind == "TransferCompleted":
+            ending = "completed"
+        elif stage == "call_ended":
+            ending = "ended"
+        else:
+            ending = "failed"
+        return cls(ending=ending, stage=stage, status=status, reason=outcome.get("reason"))
+
+    @property
+    def leaves_the_call(self) -> bool:
+        """Whether the caller is gone from the bot's leg, so the bot should end it."""
+        return self.ending != "failed"
+
+
 class ControlPlane:
     """The bot's half of the siphon control channel: the calls it is allowed to act on.
 
@@ -1021,6 +1080,27 @@ class ControlPlane:
         # reach them.
         self._transfer_final: Any = lambda _kind: False
         self._transfer_outcome: Any = lambda _event: None
+        self._transfer_verdicts: dict[str, asyncio.Future[TransferVerdict]] = {}
+
+    def expect_transfer_verdict(self, sip_call_id: str) -> asyncio.Future[TransferVerdict]:
+        """Return what will hold the verdict on the next transfer of this call.
+
+        Asked for *before* the REFER goes out. A phone that refuses one answers within a round trip,
+        and a verdict that lands before anyone listens for it would be lost. An earlier transfer's
+        waiter is cancelled: only the latest REFER on a call is still somebody's question.
+        """
+        previous = self._transfer_verdicts.pop(sip_call_id, None)
+        if previous is not None:
+            previous.cancel()
+        verdict: asyncio.Future[TransferVerdict] = asyncio.get_running_loop().create_future()
+        self._transfer_verdicts[sip_call_id] = verdict
+        return verdict
+
+    def _deliver_transfer_verdict(self, sip_call_id: str, verdict: TransferVerdict) -> None:
+        """Hand a verdict to whoever is waiting for one on this call, if anyone is."""
+        waiting = self._transfer_verdicts.pop(sip_call_id, None)
+        if waiting is not None and not waiting.done():
+            waiting.set_result(verdict)
 
     def call_for(self, sip_call_id: str | None) -> Any | None:
         """Return the control handle for a media session, or None if the two never joined."""
@@ -1043,29 +1123,37 @@ class ControlPlane:
                 # Draining events is what keeps the handle alive for the call's life; it is also
                 # where a transfer's verdict lands. `transfer()` resolves as soon as siphon has
                 # *sent* the REFER — RFC 3515 §2.4.4 delivers the outcome afterwards, on the
-                # implicit subscription. Without reading these the bot says it transferred the
-                # caller and never learns whether it did, and by then the caller is gone either
-                # way, so the log is the only place it can show.
+                # implicit subscription. The tool waits on this verdict before it lets go of the
+                # caller, because a phone that refuses the REFER is still on the line with the bot.
                 kind = event.get("kind")
                 if not self._transfer_final(kind):
                     continue
-                outcome = self._transfer_outcome(event) or {}
-                detail = (
-                    f"stage={outcome.get('stage')} status={outcome.get('status')} "
-                    f"reason={outcome.get('reason')}"
-                )
+                verdict = TransferVerdict.from_event(kind, self._transfer_outcome(event) or {})
+                detail = f"stage={verdict.stage} status={verdict.status} reason={verdict.reason}"
                 # The kind is the verdict. The status is the NOTIFY's code when siphon has one,
                 # and a completed transfer has arrived without it: read as the verdict, the missing
                 # code logged a caller who was already hearing the destination as a failed transfer.
-                if kind == "TransferCompleted":
+                # The two failed lines share their wording up to the `--`, which the conversation
+                # harness parses: `call_ended` is still not a completion it can count.
+                if verdict.ending == "completed":
                     logger.info(f"transfer completed on call {sip_call_id}: {detail}")
                 else:
                     logger.warning(
                         f"transfer FAILED on call {sip_call_id}: {detail} "
-                        f"-- the caller was told they were being put through"
+                        + (
+                            "-- the call ended with it, the caller may be on their way there"
+                            if verdict.ending == "ended"
+                            else "-- keeping the caller"
+                        )
                     )
+                self._deliver_transfer_verdict(sip_call_id, verdict)
         finally:
             self._calls.pop(sip_call_id, None)
+            # siphon flushes `call_ended` before the stream closes, so this is the fallback for a
+            # stream that closed without one: the call is gone all the same.
+            self._deliver_transfer_verdict(
+                sip_call_id, TransferVerdict(ending="ended", stage="call_ended")
+            )
             logger.info(f"control channel detached from call {sip_call_id}")
 
     async def run_forever(self) -> None:
@@ -1105,6 +1193,55 @@ def _import_control_sdk() -> tuple[Any, type[BaseException], Any, Any]:
     return ControlClient, ControlError, is_transfer_final, transfer_outcome
 
 
+class TransferHold(FrameProcessor):
+    """Keep the caller's words from the model while a transfer is being decided.
+
+    Between the REFER and its verdict the bot has nothing to say: it has told the caller they are
+    being put through, and their phone is busy with the REFER and the destination. A reply in that
+    time talks over the transfer, and anything can start one -- a "hello?" while the destination
+    rings, a cough, or pipecat's own recovery prompt for a turn with nothing recognised in it.
+
+    So no turn starts. Muting the voice instead was the other choice and the worse one: the model
+    would still answer, and its unheard reply would sit in the context as something the caller was
+    told. The recognizer still gets the audio, since a streaming one can drop a connection fed
+    nothing for a minute; only what it makes of the audio stops here. What the caller says during
+    the hold is lost rather than queued, which is right for words said into a transfer.
+    """
+
+    HELD_FRAMES = (
+        TranscriptionFrame,
+        InterimTranscriptionFrame,
+        VADUserStartedSpeakingFrame,
+        VADUserStoppedSpeakingFrame,
+    )
+    """What opens or feeds a caller turn: the engine's speech edges and the recognizer's words."""
+
+    def __init__(self) -> None:
+        """Start open: a call is not on hold until a transfer puts it there."""
+        super().__init__()
+        self._holding = False
+
+    @property
+    def holding(self) -> bool:
+        """Whether the caller is being kept from the model right now."""
+        return self._holding
+
+    def engage(self) -> None:
+        """Stop the caller's turns, from the REFER until its verdict."""
+        self._holding = True
+
+    def release(self) -> None:
+        """Let the caller be heard again."""
+        self._holding = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Pass everything except a caller's speech while the hold is on."""
+        await super().process_frame(frame, direction)
+        if self._holding and isinstance(frame, self.HELD_FRAMES):
+            return
+        await self.push_frame(frame, direction)
+
+
 @dataclass
 class CallResources:
     """What a tool handler needs to act on the call it is running inside."""
@@ -1116,6 +1253,14 @@ class CallResources:
     # ending for this bot even though it is not an ending for the caller, and ending the pipeline is
     # how the media socket gets closed.
     worker: PipelineWorker | None = None
+    # In the pipeline whenever this object is, so the tool can stop the caller's words reaching the
+    # model while a transfer is being decided.
+    transfer_hold: TransferHold = field(default_factory=TransferHold)
+    # From the tool call until its verdict, or until the wait for one runs out. A second request in
+    # that time is refused rather than sent, because a second REFER would only race the first.
+    transfer_pending: bool = False
+    # Watches a verdict that arrives after the wait gave up on it, in case it is a completion.
+    late_transfer_verdict: asyncio.Task[None] | None = None
 
 
 async def end_call(params: FunctionCallParams) -> None:
@@ -1151,12 +1296,111 @@ async def end_call(params: FunctionCallParams) -> None:
         logger.info(f"hangup rejected ({error}); the caller most likely hung up first")
 
 
+TRANSFER_FAILED_NOTE = (
+    "[The transfer did not go through: {why}. The caller is still on the line with you. Tell them,"
+    " in the language you have been speaking with them, and carry on helping them.]"
+)
+"""What the model is told when a transfer fails, so that it, not this file, says so to the caller.
+
+Bracketed and third person for the reason KICKOFF is: it lands in the context as a user turn, which
+every provider here takes mid-call, and a first-person line would be answered literally. The words
+the caller hears are the model's own, in whatever language the call is in."""
+
+TRANSFER_FAILURE_EXPLANATIONS: dict[str, str] = {
+    "rejected": "the caller's phone refused to be transferred",
+    "unauthorized": "the caller's phone refused to be transferred",
+    "refused": "the person it was meant to reach could not be reached",
+    "timeout": "no answer came back in time",
+    "not_sent": "it could not be started",
+}
+"""Why, per verdict stage, in the words the note gives the model. Unlisted stages, `no_outcome`
+among them, read as an outcome nobody confirmed."""
+
+
+async def _inform_the_model_the_transfer_failed(resources: CallResources, why: str) -> None:
+    """Put the failure in front of the model and have it answer, since nothing else will."""
+    if resources.worker is None:
+        return
+    note = TRANSFER_FAILED_NOTE.format(why=why)
+    await resources.worker.queue_frame(
+        LLMMessagesAppendFrame(messages=[{"role": "user", "content": note}], run_llm=True)
+    )
+
+
+async def _end_on_a_late_completion(
+    resources: CallResources, verdict: asyncio.Future[TransferVerdict]
+) -> None:
+    """End the bot's leg if a transfer it stopped waiting for turns out to have worked after all."""
+    try:
+        outcome = await verdict
+    except asyncio.CancelledError:
+        # A later transfer took over the question. Anything else cancelling this task is not ours
+        # to swallow.
+        if verdict.cancelled():
+            return
+        raise
+    if outcome.leaves_the_call and resources.worker is not None:
+        await resources.worker.queue_frame(EndWorkerFrame())
+
+
+async def _transfer_and_wait_for_the_verdict(resources: CallResources, control_call: Any) -> bool:
+    """REFER the caller, and return whether they have left the bot's leg by the verdict.
+
+    The caller's words are held from the REFER until the verdict (see `TransferHold`), and a failed
+    transfer is put to the model, because the caller who was told they were being put through is
+    still there and nothing else on the line will speak to them.
+    """
+    sip_call_id = resources.serializer.call_id or ""
+    verdict = resources.control.expect_transfer_verdict(sip_call_id)
+    resources.transfer_hold.engage()
+    try:
+        await control_call.transfer(TRANSFER_TARGET)
+    except resources.control.error_class as error:
+        # The caller hanging up first is the ordinary case, not a fault. If they have, the note
+        # below is answered to nobody and the call's own teardown ends the pipeline.
+        logger.info(f"transfer rejected ({error}); the caller most likely hung up first")
+        verdict.cancel()
+        await _inform_the_model_the_transfer_failed(
+            resources, TRANSFER_FAILURE_EXPLANATIONS["not_sent"]
+        )
+        return False
+    logger.info(f"asked the caller's phone to transfer to {TRANSFER_TARGET}")
+
+    try:
+        # Shielded so the wait running out does not cancel the verdict itself: a late one can still
+        # say the caller has gone.
+        outcome = await asyncio.wait_for(asyncio.shield(verdict), TRANSFER_VERDICT_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning(
+            f"no transfer verdict within {TRANSFER_VERDICT_TIMEOUT_SECONDS:g}s, keeping the caller"
+        )
+        resources.late_transfer_verdict = asyncio.create_task(
+            _end_on_a_late_completion(resources, verdict)
+        )
+        await _inform_the_model_the_transfer_failed(
+            resources, TRANSFER_FAILURE_EXPLANATIONS["timeout"]
+        )
+        return False
+
+    if outcome.leaves_the_call:
+        return True
+    await _inform_the_model_the_transfer_failed(
+        resources,
+        TRANSFER_FAILURE_EXPLANATIONS.get(outcome.stage or "", "it was never confirmed"),
+    )
+    return False
+
+
 async def transfer_call(params: FunctionCallParams) -> None:
-    """Say the handover line, wait for it to play, then REFER the caller away.
+    """Say the handover line, wait for it to play, REFER the caller away, and wait for the verdict.
 
     Takes no arguments, exactly like `end_call` and for the same reason: it acts on the call the
     bot is already on and sends it to the one configured destination. A model-chosen destination
     would be a caller-chosen destination.
+
+    The bot lets go of the caller only once the transfer has happened, or the call has gone. Many
+    phones refuse a REFER from the network (`405`, `403`), and ending the bot's leg as soon as the
+    REFER was sent left exactly those callers on a silent line until the node gave up on the call.
     """
     resources = params.app_resources
     if not isinstance(resources, CallResources) or not TRANSFER_TARGET:
@@ -1168,26 +1412,31 @@ async def transfer_call(params: FunctionCallParams) -> None:
         await params.result_callback({"error": "this call cannot be transferred from here"})
         return
 
-    # Answer before the caller leaves: once they are transferred there is nobody to hear a result.
-    # As in `end_call`, the result is what gets the handover line said, and the wait below listens
-    # for that reply.
-    await params.result_callback({"transferring": True})
-
-    if not await resources.speech.wait_until_finished():
-        logger.warning("handover line did not finish within the cap, transferring anyway")
-
-    try:
-        await control_call.transfer(TRANSFER_TARGET)
-        logger.info(f"transferred the call to {TRANSFER_TARGET}")
-    except resources.control.error_class as error:
-        # The caller hanging up first is the ordinary case, not a fault.
-        logger.info(f"transfer rejected ({error}); the caller most likely hung up first")
+    if resources.transfer_pending:
+        await params.result_callback(
+            {"error": "a transfer is already in progress; wait for it to go through or fail"}
+        )
         return
 
-    # The REFER hands the caller to someone else, so this bot's leg is finished even though the
-    # call is not. Leaving the pipeline running holds the media socket open, and the leg then sits
-    # there until the engine's media timeout reaps it -- half a minute of a call nobody is on,
-    # during which the referee's NOTIFYs arrive on a dialog this side has stopped caring about.
+    resources.transfer_pending = True
+    try:
+        # Answer before the caller leaves: once they are transferred there is nobody to hear a
+        # result. As in `end_call`, the result is what gets the handover line said, and the wait
+        # below listens for that reply.
+        await params.result_callback({"transferring": True})
+
+        if not await resources.speech.wait_until_finished():
+            logger.warning("handover line did not finish within the cap, transferring anyway")
+
+        if not await _transfer_and_wait_for_the_verdict(resources, control_call):
+            return
+    finally:
+        resources.transfer_pending = False
+        resources.transfer_hold.release()
+
+    # The transfer happened or the call went with it, so this bot's leg is finished even though the
+    # call may not be. Leaving the pipeline running holds the media socket open, and the leg then
+    # sits there until the engine's media timeout reaps it -- half a minute of a call nobody is on.
     if resources.worker is not None:
         await resources.worker.queue_frame(EndWorkerFrame())
 
@@ -2308,6 +2557,9 @@ def build_worker(
             [
                 transport.input(),
                 speech_to_text,
+                # After the recognizer, which keeps getting audio, and ahead of the turn logic: see
+                # `TransferHold`. Only with a control plane, since only then is there a transfer.
+                *([resources.transfer_hold] if resources is not None else []),
                 # Between the recognizer and the turn logic on purpose: the echo is dropped before
                 # anything can treat it as the caller starting a turn.
                 echo_guard,

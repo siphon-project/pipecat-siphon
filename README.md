@@ -352,7 +352,12 @@ turn taking is the engine's, not the pipeline's — there is no VAD analyzer in 
 
 Given `--control-url`, it also connects to the SIPhon SIP engine's control plane and gets an `end_call` tool, so
 the model can hang up when the conversation is done rather than emitting a magic phrase for
-something else to notice. The example's docstring covers the platform side: the media profile the
+something else to notice. With `BOT_TRANSFER_TARGET` set it gets a `transfer_call` tool as well,
+which REFERs the caller to that destination and keeps the call until the transfer's verdict: many
+phones refuse a REFER from the network, and then the bot stays on the line, is told the transfer
+did not work and tells the caller, rather than leaving them in silence (a phone that never answers
+counts as refusing after `BOT_TRANSFER_VERDICT_TIMEOUT`, 60 s by default).
+The example's docstring covers the platform side: the media profile the
 engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
 whether the control channel ever finds its call — the engine expands `{call_id}` in a `ws_uri` to
 the **SIP** Call-ID, so the two channels join on `sip_call_id`, not on the control frame's own
