@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A bot can place a call.** `pipecat_siphon.PlacedCalls` places one through siphon-sip's control
+  plane (`originate` with `media=True`), so the engine dials the bot when the callee answers, and
+  adds `placed=<channel>` to the `ws_uri` so that dial-in names its call before `start` arrives: a
+  bot that speaks first has to know whom it rang. The call's control events resolve to a
+  `CallOutcome` (answered, rejected with its SIP status, timed out, failed, ended), and every path
+  resolves: a call siphon never reports on is hung up after its ring timeout, and one answered
+  without the engine reaching the bot is hung up rather than left silent. The agent example's
+  `--call <sip-uri>` uses it to ring one number, greet as the caller (`--call-context` says what
+  about), and exit 0 or 1 by how the call went; `end_call` and `transfer_call` work on it as on a
+  call coming in. Needs a `siphon-control` whose `originate` returns the placed `Call`.
+
 - **The agent example speaks a configured language, and switches when the caller asks.** Its voice
   was built with no language, so Cartesia spoke English and read a Dutch reply in an English
   accent. `BOT_TTS_LANGUAGE` now reaches every synthesizer that takes one, `BOT_TTS_VOICES` gives

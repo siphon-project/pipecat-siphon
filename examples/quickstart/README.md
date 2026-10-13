@@ -97,6 +97,21 @@ echo 'BOT_TTS_VOICES=nl=<a Dutch voice id>,en=<an English voice id>' >> .env
 docker compose up -d bot
 ```
 
+To have the bot ring a number instead of waiting for one, give it the address the engine reaches
+it on and run it once with the number (and, optionally, what the call is about). It greets first
+when the call is answered and exits when the call ends:
+
+```sh
+echo 'BOT_CALL_WS_URI=ws://127.0.0.1:9001/stream?call={call_id}' >> .env
+docker compose run --rm bot --host 127.0.0.1 --port 9002 \
+    --control-url ws://127.0.0.1:9092/control/ws \
+    --call 'sip:+15550100@trunk.example' --call-context 'the parcel delivery they asked about'
+```
+
+`--port` differs from the running bot's because both are on the host network; point
+`BOT_CALL_WS_URI` at the port the calling one listens on. A rejected or unanswered call is logged
+with its SIP status and the run exits 1.
+
 `agent_bot.py` is copied into the image rather than bind-mounted, so an edit to the Python itself
 needs `docker compose up --build bot`.
 
