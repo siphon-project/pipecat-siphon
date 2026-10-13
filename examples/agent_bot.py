@@ -31,8 +31,9 @@ Each provider asks for its own credential, read from the environment. The defaul
 
 Install one extra per provider you point a role at (`google`, `openai`, `whisper`, `kokoro`), and
 note that Gemini and Google's speech APIs are different products: `GOOGLE_API_KEY` for the model,
-`GOOGLE_APPLICATION_CREDENTIALS` for the recognizer and the voice. Whatever is missing is named at
-startup, not at the first call.
+application default credentials for the recognizer and the voice -- `GOOGLE_APPLICATION_CREDENTIALS`
+pointing at a service-account JSON file, or on Google Cloud the instance's own service account with
+nothing set. Whatever is missing is named at startup, not at the first call.
 
 To let the bot end the call itself, add the control channel (see "The control plane" below)::
 
@@ -1137,16 +1138,6 @@ def build_transport(
     )
 
 
-_GOOGLE_CLOUD_CREDENTIALS = (
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "path to a Google Cloud service-account JSON file",
-)
-"""Google's speech APIs are Cloud services and authenticate as a service account, not with an API
-key. pipecat passes no credentials of its own, so the client falls back to application default
-credentials, which is this variable. The same account needs the Speech-to-Text and Text-to-Speech
-APIs enabled; Gemini is a different product with a different credential, and one does not imply the
-other."""
-
 REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ("llm", "anthropic"): (("ANTHROPIC_API_KEY", "Claude API key"),),
     ("llm", "google"): (("GOOGLE_API_KEY", "Gemini API key"),),
@@ -1154,7 +1145,9 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     # Nothing: the model server's address has a default and takes no key.
     ("llm", "local"): (),
     ("stt", "deepgram"): (("DEEPGRAM_API_KEY", "speech-to-text key"),),
-    ("stt", "google"): (_GOOGLE_CLOUD_CREDENTIALS,),
+    # Nothing here: Google's speech APIs take application default credentials, which need not be
+    # a variable at all. `refuse_missing_google_cloud_credentials` checks them instead.
+    ("stt", "google"): (),
     ("stt", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
     # Nothing: the model downloads itself.
     ("stt", "local"): (),
@@ -1162,7 +1155,7 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
         ("CARTESIA_API_KEY", "text-to-speech key"),
         ("CARTESIA_VOICE_ID", "voice to speak with"),
     ),
-    ("tts", "google"): (_GOOGLE_CLOUD_CREDENTIALS,),
+    ("tts", "google"): (),
     ("tts", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
     ("tts", "local"): (),
 }
@@ -1171,7 +1164,8 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
 Keyed per role *and* provider because the same provider asks for different things depending on the
 job -- Gemini takes an API key while Google's speech APIs take a service account -- and because the
 one table is then the only place a key is named. The builders read their purpose text out of it
-rather than repeating the pair, so the two cannot drift apart."""
+rather than repeating the pair, so the two cannot drift apart. Google's speech APIs list nothing:
+their credential is an identity, not a value, and need not be a variable at all."""
 
 _ROLE_PROVIDER_CHOICES: dict[str, tuple[str, ...]] = {
     "llm": LLM_PROVIDERS,
@@ -1225,6 +1219,50 @@ def missing_environment(providers: Mapping[str, str], environment: Mapping[str, 
 
     """
     return [name for name, _purpose in required_environment(providers) if not environment.get(name)]
+
+
+GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+"""The scope pipecat's Google recognizer and voice ask application default credentials for."""
+
+
+def refuse_missing_google_cloud_credentials(providers: Mapping[str, str]) -> None:
+    """Stop a selection using Google's speech APIs when no Google identity can be found.
+
+    Those APIs are Cloud services and authenticate as a service account, not with an API key, and
+    pipecat passes no credentials of its own, so the client falls back to application default
+    credentials. That is `GOOGLE_APPLICATION_CREDENTIALS` when it is set, and otherwise, on Google
+    Cloud, the metadata server, with no file at all. Demanding the variable would force a long-lived
+    key onto a machine that already has an identity, so this asks the library instead. Gemini is a
+    different product with a different credential and is not checked here.
+
+    Raises:
+        ValueError: If no credentials resolve, or the recognizer is selected and they name no
+            project, which pipecat's recognizer needs and its voice does not.
+
+    """
+    roles = [role for role in ("stt", "tts") if providers.get(role) == "google"]
+    if not roles:
+        return
+    import google.auth
+    from google.auth.exceptions import GoogleAuthError
+
+    try:
+        _credentials, project = google.auth.default(scopes=[GOOGLE_CLOUD_SCOPE])
+    # The base class, as pipecat catches: a metadata server that answers badly raises a transport
+    # error rather than `DefaultCredentialsError`, and must stop the bot the same way.
+    except GoogleAuthError as error:
+        raise ValueError(
+            f"{_provider_summary(providers)} found no Google Cloud credentials for "
+            f"{' and '.join(f'{role}=google' for role in roles)}: set "
+            "GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON file, or run on Google Cloud "
+            "where the metadata server provides the instance's service account. The account needs "
+            f"the Speech-to-Text and Text-to-Speech APIs. ({error})"
+        ) from error
+    if "stt" in roles and not project:
+        raise ValueError(
+            f"{_provider_summary(providers)} found Google Cloud credentials naming no project, and "
+            "stt=google needs one: set GOOGLE_CLOUD_PROJECT and run again."
+        )
 
 
 def _provider_summary(providers: Mapping[str, str]) -> str:
@@ -1502,10 +1540,9 @@ def _build_google_stt_service() -> STTService:
     """Build Google's recognizer, on the model meant for telephone audio."""
     from pipecat.services.google.stt import GoogleSTTService
 
-    # No credentials passed: pipecat falls back to Google's application default credentials, which
-    # is `GOOGLE_APPLICATION_CREDENTIALS`. Read here only to fail with that name rather than with
-    # the library's own `No valid credentials provided.`
-    _provider_key("stt", "google", "GOOGLE_APPLICATION_CREDENTIALS")
+    # No credentials passed: pipecat falls back to application default credentials, which startup
+    # has already checked resolve, to a project as well, so this cannot fail with the library's own
+    # `No valid credentials provided.`
     return GoogleSTTService(
         settings=GoogleSTTService.Settings(model=STT_MODEL, language=STT_LANGUAGE),
         sample_rate=PIPELINE_SAMPLE_RATE,
@@ -1566,8 +1603,7 @@ def _build_google_tts_service() -> TTSService:
     """Build Google's voice."""
     from pipecat.services.google.tts import GoogleTTSService
 
-    # As with the recognizer: application default credentials, named here so the failure does.
-    _provider_key("tts", "google", "GOOGLE_APPLICATION_CREDENTIALS")
+    # As with the recognizer: application default credentials, checked at startup.
     # The Chirp3 voices carry their own model, so `model` stays unset unless a deployment names
     # one. `NOT_GIVEN` rather than `None`: pipecat reads None as a value to send.
     from pipecat.utils.types import NOT_GIVEN
@@ -1910,6 +1946,10 @@ async def main(
             + ", ".join(f"{name} (the {purposes[name]})" for name in missing)
             + "; set them and run again."
         )
+    try:
+        refuse_missing_google_cloud_credentials(providers)
+    except ValueError as error:
+        sys.exit(str(error))
     if local_roles():
         preload_local_models()
 
