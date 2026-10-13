@@ -39,19 +39,26 @@ from pipecat.utils.time import time_now_iso8601
 from agent_bot import (
     DEFAULT_SYSTEM_PROMPT,
     EMPTY_TURN_RECOVERY,
+    KICKOFF,
     BotSpeechMonitor,
+    CallRequest,
     ControlPlane,
     SharedConstructor,
     TransferVerdict,
     build_user_aggregator_params,
+    call_request_from_arguments,
     ends_mid_sentence,
     is_english,
+    kickoff_for,
     missing_environment,
+    parse_arguments,
+    place_one_call,
     refuse_an_unknown_backend,
     refuse_an_unknown_transfer_mode,
     refuse_missing_google_cloud_credentials,
     resolve_system_prompt,
 )
+from control_event_fixtures import ANSWERED, BUSY, FAR_END_HUNG_UP, RINGING
 
 # Short enough that the suite stays fast, long enough not to race the event loop.
 START_SECONDS = 0.3
@@ -290,6 +297,178 @@ class TestControlPlaneCorrelation:
         call = _FakeControlCall(sip_call_id=None)
         await control._handle_call(call)
         assert control.call_for(None) is None
+
+
+class _PlacingClient:
+    """Stands in for a `siphon_control.ControlClient` that places calls.
+
+    Each originate hands back a `_FakeControlCall` scripted with `events`, then holding the call
+    open until the test ends it -- or raises `error`, as a refused originate does.
+    """
+
+    def __init__(
+        self, events: list[dict[str, Any]] | None = None, error: BaseException | None = None
+    ) -> None:
+        self.events = events or []
+        self.error = error
+        self.calls: list[_FakeControlCall] = []
+        self.originated: list[dict[str, Any]] = []
+
+    async def originate(
+        self, channel: str, to: str | None = None, **options: Any
+    ) -> _FakeControlCall:
+        self.originated.append({"channel": channel, "to": to, **options})
+        if self.error is not None:
+            raise self.error
+        call = _FakeControlCall(
+            sip_call_id=f"placed-{len(self.calls)}@example.invalid",
+            channel_id=channel,
+            events=list(self.events),
+        )
+        self.calls.append(call)
+        return call
+
+
+def _placing_control(client: _PlacingClient) -> ControlPlane:
+    control = ControlPlane(application="agent-app", token="t", url="ws://127.0.0.1:9092/x")
+    control.attach_client(client)
+    return control
+
+
+def _call_request(**overrides: Any) -> CallRequest:
+    fields: dict[str, Any] = {
+        "to": "sip:+15550100@trunk.example",
+        "ws_uri": "ws://198.51.100.10:9001/stream?call={call_id}",
+        "from_uri": None,
+        "profile": "agent",
+        "ring_timeout": 30,
+        "context": {},
+    }
+    return CallRequest(**{**fields, **overrides})
+
+
+class TestPlacingACall:
+    """`--call`: the bot rings a number, greets first on answer, and says how the call went."""
+
+    def test_no_call_asked_for_is_no_request(self) -> None:
+        assert call_request_from_arguments(parse_arguments([])) is None
+
+    def test_a_call_needs_the_control_plane(self) -> None:
+        with pytest.raises(ValueError, match="--control-url"):
+            call_request_from_arguments(
+                parse_arguments(
+                    ["--call", "sip:+15550100@trunk.example", "--call-ws-uri", "ws://192.0.2.1/"]
+                )
+            )
+
+    def test_a_call_needs_the_address_the_engine_reaches_the_bot_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("BOT_CALL_WS_URI", raising=False)
+        with pytest.raises(ValueError, match="BOT_CALL_WS_URI"):
+            call_request_from_arguments(
+                parse_arguments(
+                    ["--call", "sip:+15550100@trunk.example", "--control-url", "ws://192.0.2.1/"]
+                )
+            )
+
+    def test_a_ring_timeout_under_a_second_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="--call-timeout"):
+            call_request_from_arguments(
+                parse_arguments(
+                    [
+                        "--call",
+                        "sip:+15550100@trunk.example",
+                        "--control-url",
+                        "ws://192.0.2.1/",
+                        "--call-ws-uri",
+                        "ws://192.0.2.1/",
+                        "--call-timeout",
+                        "0",
+                    ]
+                )
+            )
+
+    def test_the_request_carries_what_was_asked_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BOT_CALL_WS_URI", "ws://198.51.100.10:9001/stream?call={call_id}")
+        request = call_request_from_arguments(
+            parse_arguments(
+                [
+                    "--call",
+                    "sip:+15550100@trunk.example",
+                    "--control-url",
+                    "ws://192.0.2.1/",
+                    "--call-from",
+                    "sip:bot@pbx.example",
+                    "--call-context",
+                    "the parcel delivery they asked about",
+                    "--call-timeout",
+                    "20",
+                ]
+            )
+        )
+        assert request == _call_request(
+            from_uri="sip:bot@pbx.example",
+            ring_timeout=20,
+            context={"reason": "the parcel delivery they asked about"},
+        )
+
+    def test_an_inbound_call_opens_on_the_caller_kickoff(self) -> None:
+        assert kickoff_for(None) == KICKOFF
+
+    def test_a_placed_call_opens_knowing_the_bot_rang_them_and_why(self) -> None:
+        kickoff = kickoff_for({"reason": "the parcel delivery they asked about"})
+        assert kickoff != KICKOFF
+        assert "placed this call" in kickoff
+        assert "the parcel delivery they asked about" in kickoff
+        # Without a reason it still says who called whom.
+        assert "placed this call" in kickoff_for({})
+
+    async def test_a_placed_call_is_joined_like_a_handed_over_one(self) -> None:
+        """`end_call` and `transfer_call` find a placed call by its SIP Call-ID, as any other."""
+        client = _PlacingClient()
+        control = _placing_control(client)
+
+        placed = await control.place(_call_request())
+        call = client.calls[0]
+        assert control.call_for(call.sip_call_id) is call
+        assert client.originated[0]["ws_uri"].endswith(f"&placed={placed.channel}")
+
+        call.end()
+        await placed.ended()
+        await asyncio.sleep(0)
+        assert control.call_for(call.sip_call_id) is None
+
+    async def test_a_placed_call_s_transfer_verdict_still_reaches_the_tool(self) -> None:
+        client = _PlacingClient(
+            events=[
+                {
+                    "kind": "TransferCompleted",
+                    "payload": {"stage": "transferred", "status": None, "reason": "OK"},
+                }
+            ]
+        )
+        control = _placing_control(client)
+        control._transfer_final = lambda kind: kind == "TransferCompleted"
+        control._transfer_outcome = lambda raw: raw.get("payload")
+
+        verdict = control.expect_transfer_verdict("placed-0@example.invalid")
+        await control.place(_call_request())
+
+        assert (await asyncio.wait_for(verdict, TIMEOUT_SECONDS)).ending == "completed"
+        client.calls[0].end()
+
+    async def test_a_busy_callee_is_reported_and_fails_the_run(self) -> None:
+        control = _placing_control(_PlacingClient(events=[RINGING, BUSY]))
+        assert await place_one_call(control, _call_request()) == 1
+
+    async def test_an_answered_call_that_ends_normally_is_a_clean_run(self) -> None:
+        control = _placing_control(_PlacingClient(events=[RINGING, ANSWERED, FAR_END_HUNG_UP]))
+        assert await place_one_call(control, _call_request()) == 0
+
+    async def test_a_refused_originate_fails_the_run(self) -> None:
+        control = _placing_control(_PlacingClient(error=RuntimeError("not_found: no route")))
+        assert await place_one_call(control, _call_request()) == 1
 
 
 class TestSharedConstructor:
@@ -2551,6 +2730,7 @@ class TestCallerNumberFromTheStreamUrl:
             _control: object,
             _observer_factory: object = None,
             caller: str | None = None,
+            _placed: object = None,
         ) -> None:
             served.append(caller)
 

@@ -363,6 +363,16 @@ two are joined when it answers, which drops the bot's stream. A refusal or no an
 `BOT_TRANSFER_RING_TIMEOUT` (30 s) keeps the caller with the bot, as above. The routing script
 that hands the call over says where that leg goes and whom it presents, as the call's vars
 `transfer_next_hop`, `transfer_from`, `transfer_p_asserted_identity` and `transfer_privacy`.
+
+With `--call <sip-uri>` (and `--call-ws-uri`, the bot's own address as the engine reaches it) the
+bot places one call through the control plane's `originate` instead of waiting for one, opens it as
+the caller once it is answered (`--call-context` says what the call is about), and exits when it is
+over: 0 for an answered call that ended normally, 1 with the outcome logged for a refused, rejected
+(`rejected 486 Busy Here`), unanswered or failed one. The pieces are in the package for a bot of
+your own: `pipecat_siphon.PlacedCalls` places a call, adds `placed=<channel>` to the `ws_uri` so the
+engine's dial-in names its call before `start` arrives, and reports how the call went from the
+control events, hanging up a call siphon never reports on or one answered into a bot that was never
+reached. It needs a `siphon-control` whose `originate` returns the placed `Call`.
 The example's docstring covers the platform side: the media profile the
 engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
 whether the control channel ever finds its call — the engine expands `{call_id}` in a `ws_uri` to

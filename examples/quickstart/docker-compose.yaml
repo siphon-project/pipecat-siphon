@@ -120,6 +120,9 @@ services:
       # refer (the default) or bridge; see the example's TRANSFER_MODE.
       BOT_TRANSFER_MODE: "${BOT_TRANSFER_MODE:-}"
       BOT_TRANSFER_RING_TIMEOUT: "${BOT_TRANSFER_RING_TIMEOUT:-}"
+      # Only for `--call`, a run that places a call rather than waiting for one.
+      BOT_CALL_WS_URI: "${BOT_CALL_WS_URI:-}"
+      BOT_CALL_CONTEXT: "${BOT_CALL_CONTEXT:-}"
       # Model choices. Empty leaves the example's own defaults for the selected backend.
       BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
       BOT_STT_MODEL: "${BOT_STT_MODEL:-}"

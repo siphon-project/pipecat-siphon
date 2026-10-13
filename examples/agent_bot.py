@@ -136,7 +136,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
@@ -196,6 +196,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import SiphonFrameSerializer
+from pipecat_siphon.outbound import PlacedCall, PlacedCalls
 
 PIPELINE_SAMPLE_RATE = int(os.environ.get("BOT_SAMPLE_RATE", "") or 16000)
 """What the pipeline runs at. Match it to `ws_sample_rate` on the profile and nothing in this
@@ -256,6 +257,20 @@ context and the call works normally from then on. It reads as a dead line.
 Bracketed and third person on purpose. It lands in the transcript as a user turn, and a
 first-person line ("hello?") gets answered literally."""
 
+
+def kickoff_for(placed_context: Mapping[str, str] | None) -> str:
+    """Return the greeting turn's one message: `KICKOFF` coming in, its twin for a placed call.
+
+    On a placed call the bot is the caller, and the model has to know it to open the call the right
+    way round: say who it is and why it rang, rather than asking how it can help.
+    """
+    if placed_context is None:
+        return KICKOFF
+    reason = placed_context.get("reason", "").strip()
+    about = f", about {reason}" if reason else ""
+    return f"[You placed this call{about}. They have just answered and have not spoken yet.]"
+
+
 TURN_INCOMPLETE_HOLD_SECONDS = 1.5
 """How long a turn whose English transcript stops mid-sentence is held open, on either path.
 
@@ -275,6 +290,12 @@ FAREWELL_QUIET_SECONDS = 0.5
 
 FAREWELL_TIMEOUT_SECONDS = 20.0
 """Hard cap on waiting for the farewell. A model that will not stop talking still gets hung up."""
+
+CONTROL_CONNECT_TIMEOUT_SECONDS = 30.0
+"""How long `--call` waits for the control plane before giving up on placing its call.
+
+The media path waits forever, since siphon restarting is routine; a one-shot call is not worth
+waiting forever for, and a process that never exits would be the worst way to say so."""
 
 CONTROL_RETRY_MINIMUM_SECONDS = 1.0
 CONTROL_RETRY_MAXIMUM_SECONDS = 30.0
@@ -1269,6 +1290,22 @@ class ControlPlane:
         self._transfer_final: Any = lambda _kind: False
         self._transfer_outcome: Any = lambda _event: None
         self._transfer_verdicts: dict[str, asyncio.Future[TransferVerdict]] = {}
+        # The calls this bot places, until the engine dials in for each. One registry per bot,
+        # because the dial-in arrives on the media server, not on the control connection.
+        self.placed_calls = PlacedCalls()
+        self._client: Any | None = None
+        self._connected = asyncio.Event()
+        self._forgetting: set[asyncio.Task[None]] = set()
+
+    def attach_client(self, client: Any) -> None:
+        """Make `client` the connection calls are placed on: the live one, once it is up."""
+        self._client = client
+        self._connected.set()
+
+    def detach_client(self) -> None:
+        """Forget the connection: it has dropped, and the next one is not up yet."""
+        self._client = None
+        self._connected.clear()
 
     def expect_transfer_verdict(self, sip_call_id: str) -> asyncio.Future[TransferVerdict]:
         """Return what will hold the verdict on the next transfer of this call.
@@ -1307,47 +1344,107 @@ class ControlPlane:
         self._calls[sip_call_id] = call
         logger.info(f"control channel attached to call {sip_call_id}")
         try:
+            # Draining events is what keeps the handle alive for the call's life; it is also where
+            # a transfer's verdict lands (see `_watch_event`).
             while (event := await call.next_event()) is not None:
-                # Draining events is what keeps the handle alive for the call's life; it is also
-                # where a transfer's verdict lands. `transfer()` resolves as soon as siphon has
-                # *sent* the REFER — RFC 3515 §2.4.4 delivers the outcome afterwards, on the
-                # implicit subscription. The tool waits on this verdict before it lets go of the
-                # caller, because a phone that refuses the REFER is still on the line with the bot.
-                kind = event.get("kind")
-                if kind in BRIDGE_FINAL_EVENTS:
-                    # A `bridge` transfer's dial reports on the caller's own channel; the bot
-                    # dials for nothing else, so these are always the transfer's.
-                    verdict = TransferVerdict.from_bridge_event(kind, event.get("payload") or {})
-                elif self._transfer_final(kind):
-                    verdict = TransferVerdict.from_event(kind, self._transfer_outcome(event) or {})
-                else:
-                    continue
-                detail = f"stage={verdict.stage} status={verdict.status} reason={verdict.reason}"
-                # The kind is the verdict. The status is the NOTIFY's code when siphon has one,
-                # and a completed transfer has arrived without it: read as the verdict, the missing
-                # code logged a caller who was already hearing the destination as a failed transfer.
-                # The two failed lines share their wording up to the `--`, which the conversation
-                # harness parses: `call_ended` is still not a completion it can count.
-                if verdict.ending == "completed":
-                    logger.info(f"transfer completed on call {sip_call_id}: {detail}")
-                else:
-                    logger.warning(
-                        f"transfer FAILED on call {sip_call_id}: {detail} "
-                        + (
-                            "-- the call ended with it, the caller may be on their way there"
-                            if verdict.ending == "ended"
-                            else "-- keeping the caller"
-                        )
-                    )
-                self._deliver_transfer_verdict(sip_call_id, verdict)
+                self._watch_event(sip_call_id, event)
         finally:
-            self._calls.pop(sip_call_id, None)
-            # siphon flushes `call_ended` before the stream closes, so this is the fallback for a
-            # stream that closed without one: the call is gone all the same.
-            self._deliver_transfer_verdict(
-                sip_call_id, TransferVerdict(ending="ended", stage="call_ended")
+            self._forget(sip_call_id)
+
+    def _watch_event(self, sip_call_id: str | None, event: Mapping[str, Any]) -> None:
+        """Read one control event on a call for a transfer's verdict.
+
+        `transfer()` resolves as soon as siphon has *sent* the REFER -- RFC 3515 §2.4.4 delivers
+        the outcome afterwards, on the implicit subscription. The tool waits on this verdict before
+        it lets go of the caller, because a phone that refuses the REFER is still on the line with
+        the bot.
+        """
+        kind: Any = event.get("kind")
+        if sip_call_id is None:
+            return
+        if kind in BRIDGE_FINAL_EVENTS:
+            # A `bridge` transfer's dial reports on the caller's own channel; the bot dials for
+            # nothing else there (a call it places has a channel of its own), so these are always
+            # the transfer's.
+            verdict = TransferVerdict.from_bridge_event(kind, event.get("payload") or {})
+        elif self._transfer_final(kind):
+            verdict = TransferVerdict.from_event(kind, self._transfer_outcome(event) or {})
+        else:
+            return
+        detail = f"stage={verdict.stage} status={verdict.status} reason={verdict.reason}"
+        # The kind is the verdict. The status is the NOTIFY's code when siphon has one, and a
+        # completed transfer has arrived without it: read as the verdict, the missing code logged a
+        # caller who was already hearing the destination as a failed transfer. The two failed lines
+        # share their wording up to the `--`, which the conversation harness parses: `call_ended`
+        # is still not a completion it can count.
+        if verdict.ending == "completed":
+            logger.info(f"transfer completed on call {sip_call_id}: {detail}")
+        else:
+            logger.warning(
+                f"transfer FAILED on call {sip_call_id}: {detail} "
+                + (
+                    "-- the call ended with it, the caller may be on their way there"
+                    if verdict.ending == "ended"
+                    else "-- keeping the caller"
+                )
             )
-            logger.info(f"control channel detached from call {sip_call_id}")
+        self._deliver_transfer_verdict(sip_call_id, verdict)
+
+    def _forget(self, sip_call_id: str) -> None:
+        """Drop a call that has ended, and answer whoever still waits on its transfer."""
+        self._calls.pop(sip_call_id, None)
+        # siphon flushes `call_ended` before the stream closes, so this is the fallback for a
+        # stream that closed without one: the call is gone all the same.
+        self._deliver_transfer_verdict(
+            sip_call_id, TransferVerdict(ending="ended", stage="call_ended")
+        )
+        logger.info(f"control channel detached from call {sip_call_id}")
+
+    async def place(self, request: CallRequest) -> PlacedCall:
+        """Place `request`'s call, joined like a handed-over one so the tools can act on it.
+
+        siphon sends a placed call no `StasisStart`, so it never reaches `_handle_call`; it is
+        registered here instead, on the same SIP Call-ID, which the engine's `start` carries too.
+
+        Raises:
+            TimeoutError: If the control plane is not up within `CONTROL_CONNECT_TIMEOUT_SECONDS`.
+            Exception: Whatever the control client raises when siphon refuses the originate.
+
+        """
+        await asyncio.wait_for(self._connected.wait(), CONTROL_CONNECT_TIMEOUT_SECONDS)
+        client = self._client
+        if client is None:
+            raise ConnectionError("the control connection dropped before the call was placed")
+        joined: dict[str, str] = {}
+        placed = await self.placed_calls.place(
+            client,
+            to=request.to,
+            ws_uri=request.ws_uri,
+            from_uri=request.from_uri,
+            profile=request.profile,
+            ring_timeout=request.ring_timeout,
+            context=request.context,
+            # The placed call's events are read by `PlacedCall`, the stream's only reader; the
+            # transfer verdicts among them still have to land here.
+            on_event=lambda event: self._watch_event(joined.get("sip_call_id"), event),
+        )
+        sip_call_id = placed.sip_call_id
+        if sip_call_id is None:
+            logger.warning(
+                f"placed call {placed.channel} has no SIP Call-ID, so the tools cannot reach it"
+            )
+            return placed
+        joined["sip_call_id"] = sip_call_id
+        self._calls[sip_call_id] = placed.call
+        logger.info(f"control channel attached to placed call {sip_call_id}")
+        forgetting = asyncio.create_task(self._forget_when_over(placed, sip_call_id))
+        self._forgetting.add(forgetting)
+        forgetting.add_done_callback(self._forgetting.discard)
+        return placed
+
+    async def _forget_when_over(self, placed: PlacedCall, sip_call_id: str) -> None:
+        await placed.ended()
+        self._forget(sip_call_id)
 
     async def run_forever(self) -> None:
         """Keep a control connection up, retrying the first connect until the engine is there."""
@@ -1362,13 +1459,19 @@ class ControlPlane:
             client = control_client_class(app=self._application, token=self._token, url=self._url)
             client.on_call(self._handle_call)
             try:
+                # Connected before it is offered for placing calls, so `--call` waits for a live
+                # connection rather than racing the first one.
+                await client.connect()
+                self.attach_client(client)
                 await client.run()
             except Exception as error:  # any connect failure here is worth retrying
+                self.detach_client()
                 logger.warning(f"control plane unreachable ({error}); retrying in {delay:.0f}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, CONTROL_RETRY_MAXIMUM_SECONDS)
             else:
                 # `run()` returned rather than raised: the client was shut down deliberately.
+                self.detach_client()
                 return
 
 
@@ -1433,6 +1536,75 @@ class TransferHold(FrameProcessor):
         if self._holding and isinstance(frame, self.HELD_FRAMES):
             return
         await self.push_frame(frame, direction)
+
+
+@dataclass(frozen=True)
+class CallRequest:
+    """The one call `--call` places: where, from whom, about what, and how long it may ring."""
+
+    to: str
+    ws_uri: str
+    from_uri: str | None
+    profile: str
+    ring_timeout: int
+    context: Mapping[str, str]
+
+
+def call_request_from_arguments(arguments: argparse.Namespace) -> CallRequest | None:
+    """Read `--call` and its options, or None when no call was asked for.
+
+    Raises:
+        ValueError: If a call was asked for without what placing it needs.
+
+    """
+    if not arguments.call:
+        return None
+    if not arguments.control_url:
+        raise ValueError("--call places its call through the control plane: set --control-url")
+    if not arguments.call_ws_uri:
+        raise ValueError(
+            "--call needs the address the engine reaches this bot on, with its {call_id}: set "
+            "--call-ws-uri or BOT_CALL_WS_URI (ws://<this host>:<port>/stream?call={call_id})"
+        )
+    if arguments.call_timeout < 1:
+        raise ValueError(
+            f"--call-timeout must be at least 1 second, not {arguments.call_timeout}: siphon reads "
+            "0 as a call that rings forever"
+        )
+    context = {"reason": arguments.call_context} if arguments.call_context else {}
+    return CallRequest(
+        to=arguments.call,
+        ws_uri=arguments.call_ws_uri,
+        from_uri=arguments.call_from,
+        profile=arguments.call_profile,
+        ring_timeout=arguments.call_timeout,
+        context=context,
+    )
+
+
+async def place_one_call(control: ControlPlane, request: CallRequest) -> int:
+    """Place `request`'s call, see it through, and return the exit status that says how it went.
+
+    0 for a call that was answered and then ended normally, 1 for everything else: refused,
+    rejected, unanswered, or answered without the bot ever getting it.
+    """
+    logger.info(f"placing a call to {request.to}")
+    try:
+        placed = await control.place(request)
+    except Exception as error:
+        logger.error(f"placing the call to {request.to} failed: {error}")
+        return 1
+    answered = await placed.answered()
+    if answered.kind != "answered":
+        logger.error(f"the call to {request.to} was not answered: {answered}")
+        return 1
+    logger.info(f"the call to {request.to} was answered")
+    ended = await placed.ended()
+    if ended.kind != "ended":
+        logger.error(f"the call to {request.to} ended badly: {ended}")
+        return 1
+    logger.info(f"the call to {request.to} is over: {ended}")
+    return 0
 
 
 @dataclass
@@ -3018,6 +3190,7 @@ def build_worker(
     control: ControlPlane | None,
     observer_factory: ObserverFactory | None = None,
     caller: str | None = None,
+    placed: PlacedCall | None = None,
 ) -> PipelineWorker:
     """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
 
@@ -3030,7 +3203,8 @@ def build_worker(
     being part of it -- how a test harness reads what the bot heard and decided.
 
     `caller` is the caller's number from the media socket's URL, already checked by `parse_caller`,
-    or None. Only the caller_lookup tool reads it.
+    or None. Only the caller_lookup tool reads it. `placed` is the call this bot placed, when the
+    engine is dialling in for one; the bot opens it as the caller.
     """
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
@@ -3145,11 +3319,16 @@ def build_worker(
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport: object, _client: object) -> None:
-        logger.info("engine connected, greeting the caller")
+        logger.info(
+            "engine connected, greeting the caller"
+            if placed is None
+            else f"engine connected for placed call {placed.channel}, greeting the callee"
+        )
         speech_monitor.reset()
         # Seeding also *clears* the previous call's transcript, which matters now that the
         # server outlives a call: `set_messages` replaces, so call two does not inherit call one.
-        context.set_messages([{"role": "user", "content": KICKOFF}])
+        kickoff = kickoff_for(placed.context if placed is not None else None)
+        context.set_messages([{"role": "user", "content": kickoff}])
         await worker.queue_frame(LLMRunFrame())
 
     @transport.event_handler("on_client_disconnected")
@@ -3164,10 +3343,11 @@ async def serve_call(
     control: ControlPlane | None,
     observer_factory: ObserverFactory | None = None,
     caller: str | None = None,
+    placed: PlacedCall | None = None,
 ) -> None:
     """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
     await websocket.accept()
-    worker = build_worker(websocket, control, observer_factory, caller)
+    worker = build_worker(websocket, control, observer_factory, caller, placed)
     runner = WorkerRunner()
     await runner.add_workers(worker)
     # Returns when the pipeline ends, which is when the engine closes the socket. Everything the
@@ -3187,20 +3367,22 @@ def build_app(
         # Any path. The engine's `ws_uri` carries a `{call_id}` query and whatever path the
         # deployment chose, and refusing an unexpected one would be a confusing way to fail a call
         # that is otherwise perfectly formed. The call is identified by the `start` envelope, not
-        # by the URL.
+        # by the URL -- except a call this bot placed, whose URL names it (`placed=`), because the
+        # bot speaks first and has to know whom it rang before `start` arrives.
         #
-        # The one thing read from the URL is the caller's number, a `caller` parameter that whoever
-        # dials this socket may add. This example does not verify the URL, so whoever can reach
-        # this port can claim any number: keep it on a network only the dialling side reaches, as
-        # the docstring's addresses already assume.
+        # The other thing read from the URL is the caller's number, a `caller` parameter that
+        # whoever dials this socket may add. This example does not verify the URL, so whoever can
+        # reach this port can claim any number: keep it on a network only the dialling side
+        # reaches, as the docstring's addresses already assume.
         raw_caller = websocket.query_params.get("caller")
         caller = parse_caller(raw_caller)
         if caller is not None:
             logger.info(f"call from {mask_number(caller)}")
         elif raw_caller is not None:
             logger.warning("ignoring a caller parameter that is not 6 to 15 digits")
+        placed = control.placed_calls.claim(websocket.query_params) if control is not None else None
         try:
-            await serve_call(websocket, control, observer_factory, caller)
+            await serve_call(websocket, control, observer_factory, caller, placed)
         except WebSocketDisconnect:
             # The ordinary end of a call: the engine closed first.
             logger.info("engine closed the media socket")
@@ -3221,8 +3403,13 @@ async def main(
     port: int,
     control: ControlPlane | None,
     observer_factory: ObserverFactory | None = None,
-) -> None:
-    """Answer calls until the process is stopped, each watched by `observer_factory`'s observer."""
+    call: CallRequest | None = None,
+) -> int:
+    """Answer calls until the process is stopped, each watched by `observer_factory`'s observer.
+
+    With `call`, place that one call as well and stop once it is over, returning the exit status
+    that says how it went. Without, return 0 when the server is stopped.
+    """
     # Before anything listens. A selection that cannot run should stop the bot here, naming what is
     # missing, rather than at the first call, where the caller hears it as a dead line.
     providers = selected_providers()
@@ -3348,21 +3535,31 @@ async def main(
 
     if control is None:
         await server.serve()
-        return
+        return 0
 
     # The media path must survive an absent control plane: the engine and this bot restart
     # independently, so "not listening yet" is a routine race and not a reason to exit.
     control_task = asyncio.create_task(control.run_forever())
+    # Placed while the server listens, since the engine dials the bot when the callee answers; and
+    # once the call is over, so is the run.
+    call_task = asyncio.create_task(place_one_call(control, call)) if call is not None else None
+    if call_task is not None:
+        call_task.add_done_callback(lambda _task: setattr(server, "should_exit", True))
     try:
         await server.serve()
     finally:
-        control_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await control_task
+        for task in (call_task, control_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    if call_task is None or call_task.cancelled():
+        return 0
+    return call_task.result()
 
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse the bind address and the control-plane options."""
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse the bind address, the control-plane options, and the call to place, if any."""
     parser = argparse.ArgumentParser(description="Conversational siphon-rtp media bot")
     parser.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=9001, help="port to bind (default 9001)")
@@ -3375,7 +3572,34 @@ def parse_arguments() -> argparse.Namespace:
         default="agent-app",
         help="control application name, matching the handover target (default agent-app)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--call",
+        metavar="SIP_URI",
+        help="place one call to this URI, greet first when it is answered, and exit when it ends",
+    )
+    parser.add_argument(
+        "--call-ws-uri",
+        default=os.environ.get("BOT_CALL_WS_URI") or None,
+        help="this bot's address as the engine reaches it, with {call_id} (env BOT_CALL_WS_URI)",
+    )
+    parser.add_argument("--call-from", help="the From URI the call is placed with")
+    parser.add_argument(
+        "--call-context",
+        help="what the call is about, for the bot to open with (env BOT_CALL_CONTEXT)",
+        default=os.environ.get("BOT_CALL_CONTEXT") or None,
+    )
+    parser.add_argument(
+        "--call-profile",
+        default=os.environ.get("BOT_CALL_PROFILE") or "agent",
+        help="the siphon media profile the placed leg is anchored on (default agent)",
+    )
+    parser.add_argument(
+        "--call-timeout",
+        type=int,
+        default=30,
+        help="seconds the call may ring before siphon gives up on it (default 30)",
+    )
+    return parser.parse_args(argv)
 
 
 def run(arguments: argparse.Namespace, observer_factory: ObserverFactory | None = None) -> None:
@@ -3384,6 +3608,10 @@ def run(arguments: argparse.Namespace, observer_factory: ObserverFactory | None 
     `observer_factory` watches each call without this file being edited: the conversation harness
     passes one that writes what every call's pipeline heard, decided and said.
     """
+    try:
+        call = call_request_from_arguments(arguments)
+    except ValueError as error:
+        sys.exit(str(error))
     control_plane = (
         ControlPlane(
             application=arguments.control_app,
@@ -3396,9 +3624,12 @@ def run(arguments: argparse.Namespace, observer_factory: ObserverFactory | None 
         else None
     )
     try:
-        asyncio.run(main(arguments.host, arguments.port, control_plane, observer_factory))
+        status = asyncio.run(
+            main(arguments.host, arguments.port, control_plane, observer_factory, call)
+        )
     except KeyboardInterrupt:
         sys.exit(0)
+    sys.exit(status)
 
 
 if __name__ == "__main__":
