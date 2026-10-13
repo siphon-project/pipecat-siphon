@@ -88,6 +88,15 @@ echo 'BOT_TRANSFER_TARGET=sip:manager@example.com' >> .env
 docker compose up -d bot
 ```
 
+To have it answer in Dutch with a native voice and switch to English when the caller asks, give
+it both languages and a voice of each (see "Speaking another language" in the top-level README):
+
+```sh
+echo 'BOT_TTS_LANGUAGES=nl,en' >> .env
+echo 'BOT_TTS_VOICES=nl=<a Dutch voice id>,en=<an English voice id>' >> .env
+docker compose up -d bot
+```
+
 `agent_bot.py` is copied into the image rather than bind-mounted, so an edit to the Python itself
 needs `docker compose up --build bot`.
 

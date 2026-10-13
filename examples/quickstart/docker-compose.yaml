@@ -128,6 +128,12 @@ services:
       # no error anywhere. Set it only for a compatible server that is not on the default port.
       BOT_LLM_BASE_URL: "${BOT_LLM_BASE_URL:-}"
       BOT_TTS_VOICE: "${BOT_TTS_VOICE:-}"
+      # The language the voice speaks, and which it may switch to. Empty keeps the provider's own
+      # default; see "Speaking another language" in the top-level README.
+      BOT_TTS_LANGUAGE: "${BOT_TTS_LANGUAGE:-}"
+      BOT_TTS_LANGUAGES: "${BOT_TTS_LANGUAGES:-}"
+      BOT_TTS_VOICES: "${BOT_TTS_VOICES:-}"
+      BOT_TTS_FOLLOW_CALLER: "${BOT_TTS_FOLLOW_CALLER:-}"
       BOT_WHISPER_DEVICE: "${BOT_WHISPER_DEVICE:-}"
       BOT_WHISPER_COMPUTE_TYPE: "${BOT_WHISPER_COMPUTE_TYPE:-}"
       # Read by the NVIDIA runtime to decide what to inject. Inert under runc.

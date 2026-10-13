@@ -1320,3 +1320,608 @@ class TestObserverHook:
         agent_bot.build_worker(websocket, None)
 
         assert workers[0]["observers"] == []
+
+
+SPEAKING_VARIABLES = (
+    "BOT_TTS_LANGUAGE",
+    "BOT_TTS_LANGUAGES",
+    "BOT_TTS_VOICES",
+    "BOT_TTS_FOLLOW_CALLER",
+)
+
+
+@pytest.fixture
+def _no_speaking_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every speaking-language test from a deployment that sets none of it."""
+    for name in SPEAKING_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestSpeakingLanguageConfiguration:
+    """What the deployment says the bot may speak, read and checked before any call."""
+
+    def test_nothing_set_is_no_language_at_all(self) -> None:
+        """Unset has to mean today's behaviour: the synthesizer's own default, no tool."""
+        from agent_bot import resolve_speaking_languages
+
+        languages = resolve_speaking_languages({}, "cartesia", "voice")
+
+        assert languages.starting is None
+        assert languages.available == ()
+        assert not languages.switchable
+
+    def test_one_language_is_spoken_from_the_start_with_no_switch(self) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        languages = resolve_speaking_languages({"BOT_TTS_LANGUAGE": "nl"}, "cartesia", "voice")
+
+        assert languages.starting == "nl"
+        assert languages.available == ("nl",)
+        assert not languages.switchable
+
+    def test_a_list_starts_in_its_first_language_unless_told_otherwise(self) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        listed = resolve_speaking_languages({"BOT_TTS_LANGUAGES": "nl, en"}, "cartesia", "voice")
+        chosen = resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGES": "nl,en", "BOT_TTS_LANGUAGE": "en"}, "cartesia", "voice"
+        )
+
+        assert listed.starting == "nl" and listed.available == ("nl", "en")
+        assert listed.switchable
+        assert chosen.starting == "en"
+
+    def test_a_starting_language_outside_the_list_is_refused(self) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError, match="BOT_TTS_LANGUAGE 'de'"):
+            resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGES": "nl,en", "BOT_TTS_LANGUAGE": "de"}, "cartesia", "voice"
+            )
+
+    def test_the_voice_map_gives_each_language_its_own_voice(self) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        languages = resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_VOICES": "nl=dutch-voice, en=english-voice"},
+            "cartesia",
+            "account-voice",
+        )
+
+        assert languages.voices == {"nl": "dutch-voice", "en": "english-voice"}
+
+    @pytest.mark.parametrize("voices", ["nl", "nl=", "=voice", "nl=a,nl=b"])
+    def test_a_malformed_voice_map_is_refused(self, voices: str) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError, match="BOT_TTS_VOICES"):
+            resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_VOICES": voices}, "cartesia", "voice"
+            )
+
+    def test_a_voice_for_a_language_nobody_configured_is_refused(self) -> None:
+        """A typo in the map would otherwise leave the language it meant on the wrong voice."""
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError, match="'de'"):
+            resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_VOICES": "de=voice"}, "cartesia", "voice"
+            )
+
+    def test_following_the_caller_needs_a_second_language(self) -> None:
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError, match="BOT_TTS_FOLLOW_CALLER"):
+            resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGE": "nl", "BOT_TTS_FOLLOW_CALLER": "true"}, "cartesia", "voice"
+            )
+        following = resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_FOLLOW_CALLER": "true"}, "cartesia", "voice"
+        )
+        assert following.follow_caller
+
+    def test_the_local_voice_refuses_a_language_it_cannot_speak(self) -> None:
+        """Kokoro has no Dutch: refusing at start beats an English voice reading Dutch."""
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError) as raised:
+            resolve_speaking_languages({"BOT_TTS_LANGUAGES": "en,nl"}, "local", "af_heart")
+
+        message = str(raised.value)
+        assert "'nl'" in message
+        assert "BOT_TTS_PROVIDER" in message
+
+    def test_the_local_voice_refuses_a_voice_of_another_language(self) -> None:
+        """Kokoro can speak Spanish, but not with its American English voice."""
+        from agent_bot import resolve_speaking_languages
+
+        with pytest.raises(ValueError, match="BOT_TTS_VOICES"):
+            resolve_speaking_languages({"BOT_TTS_LANGUAGES": "en,es"}, "local", "af_heart")
+        languages = resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGES": "en,es", "BOT_TTS_VOICES": "es=ef_dora"}, "local", "af_heart"
+        )
+        assert languages.available == ("en", "es")
+
+    def test_the_languages_the_local_voice_accepts_are_ones_pipecat_maps(self) -> None:
+        """Read from pipecat's installed source: its Kokoro module cannot be imported here."""
+        import ast
+
+        from agent_bot import KOKORO_VOICE_PREFIXES
+
+        spec = importlib.util.find_spec("pipecat")
+        assert spec is not None and spec.submodule_search_locations
+        source = (
+            Path(next(iter(spec.submodule_search_locations))) / "services" / "kokoro" / "tts.py"
+        ).read_text()
+        mapped: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef) and node.name == "language_to_kokoro_language":
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Dict):
+                        for key in inner.keys:
+                            if isinstance(key, ast.Attribute):
+                                mapped.add(getattr(Language, key.attr).value.split("-")[0])
+        assert mapped, "language_to_kokoro_language no longer holds a map"
+        assert set(KOKORO_VOICE_PREFIXES) <= mapped
+        assert "nl" not in mapped, "pipecat's Kokoro maps Dutch now; KOKORO_VOICE_PREFIXES can too"
+
+
+def _record_settings(monkeypatch: pytest.MonkeyPatch, service_class: Any) -> list[dict[str, Any]]:
+    """Record the keyword arguments every `service_class.Settings(...)` is built with.
+
+    The builder's own call is the first: the service's constructor builds its defaults through the
+    same name afterwards.
+    """
+    real_settings = service_class.Settings
+    recorded: list[dict[str, Any]] = []
+
+    def recording(**keyword_arguments: Any) -> Any:
+        recorded.append(keyword_arguments)
+        return real_settings(**keyword_arguments)
+
+    monkeypatch.setattr(service_class, "Settings", staticmethod(recording))
+    return recorded
+
+
+class _FakeVoiceService:
+    """Stands in for a voice whose constructor needs credentials or a model on disk."""
+
+    Settings: Any = None
+    built: list[dict[str, Any]]
+
+    def __init__(self, **keyword_arguments: Any) -> None:
+        type(self).built.append(keyword_arguments)
+        self.settings = keyword_arguments["settings"]
+
+
+@pytest.mark.usefixtures("_vendor_credentials", "_no_speaking_language")
+class TestSpeakingLanguageReachesEveryVoice:
+    """The configured language reaches each synthesizer that takes one, and only when set."""
+
+    def test_cartesia_is_built_exactly_as_before_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.cartesia.tts import CartesiaTTSService
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "cartesia")
+        recorded = _record_settings(monkeypatch, CartesiaTTSService)
+
+        service = agent_bot.build_text_to_speech()
+
+        assert recorded[0] == {
+            "voice": "test-value",
+            "model": agent_bot.DEFAULT_TTS_MODEL["cartesia"],
+        }
+        # Cartesia's own default, which is the accent this change exists to remove.
+        settings: Any = service.settings
+        assert settings.language == "en"
+
+    def test_cartesia_speaks_the_configured_language_with_its_voice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "tts", "cartesia")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        monkeypatch.setenv("BOT_TTS_VOICES", "nl=a-dutch-voice")
+
+        service = agent_bot.build_text_to_speech()
+
+        settings: Any = service.settings
+        assert settings.language == "nl"
+        assert settings.voice == "a-dutch-voice"
+
+    def test_cartesia_keeps_the_account_voice_when_the_map_names_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A multilingual voice with the language set is the other way to lose the accent."""
+        import agent_bot
+
+        _select(monkeypatch, "tts", "cartesia")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        monkeypatch.setenv("CARTESIA_VOICE_ID", "a-multilingual-voice")
+
+        settings: Any = agent_bot.build_text_to_speech().settings
+
+        assert settings.language == "nl"
+        assert settings.voice == "a-multilingual-voice"
+
+    def test_openai_is_built_exactly_as_before_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.openai.tts import OpenAITTSService
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "openai")
+        recorded = _record_settings(monkeypatch, OpenAITTSService)
+
+        agent_bot.build_text_to_speech()
+
+        assert recorded[0] == {"voice": "alloy", "model": agent_bot.DEFAULT_TTS_MODEL["openai"]}
+
+    def test_openai_is_told_the_language_and_asked_for_a_native_accent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenAI's endpoint takes no language: its instructions are the only accent control."""
+        import agent_bot
+
+        _select(monkeypatch, "tts", "openai")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+
+        settings: Any = agent_bot.build_text_to_speech().settings
+
+        assert settings.language == Language.NL
+        assert "nl" in settings.instructions and "native" in settings.instructions
+
+    @staticmethod
+    def _fake_google(monkeypatch: pytest.MonkeyPatch) -> type[_FakeVoiceService]:
+        import pipecat.services.google.tts as google_tts
+
+        fake = type(
+            "FakeGoogleTTSService",
+            (_FakeVoiceService,),
+            {"Settings": google_tts.GoogleTTSService.Settings, "built": []},
+        )
+        monkeypatch.setattr(google_tts, "GoogleTTSService", fake)
+        return fake
+
+    def test_google_is_built_exactly_as_before_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "tts", "google")
+        fake = self._fake_google(monkeypatch)
+
+        agent_bot.build_text_to_speech()
+
+        settings: Any = fake.built[0]["settings"]
+        assert settings.voice == "en-US-Chirp3-HD-Charon"
+        assert not isinstance(settings.language, (str, Language))
+
+    def test_google_gets_the_language_and_the_same_voice_in_that_locale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Google's voice names carry their locale, and a voice of another one is refused."""
+        import agent_bot
+
+        _select(monkeypatch, "tts", "google")
+        fake = self._fake_google(monkeypatch)
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+
+        agent_bot.build_text_to_speech()
+
+        settings: Any = fake.built[0]["settings"]
+        assert settings.language == Language.NL
+        assert settings.voice == "nl-NL-Chirp3-HD-Charon"
+
+    @staticmethod
+    def _fake_kokoro(monkeypatch: pytest.MonkeyPatch) -> type[_FakeVoiceService]:
+        import sys
+        import types
+
+        from pipecat.services.settings import TTSSettings
+
+        module = types.ModuleType("pipecat.services.kokoro.tts")
+        fake = type(
+            "FakeKokoroTTSService", (_FakeVoiceService,), {"Settings": TTSSettings, "built": []}
+        )
+        module.KokoroTTSService = fake  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pipecat.services.kokoro.tts", module)
+        return fake
+
+    def test_kokoro_is_built_exactly_as_before_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "tts", "local")
+        fake = self._fake_kokoro(monkeypatch)
+
+        agent_bot.build_text_to_speech()
+
+        settings: Any = fake.built[0]["settings"]
+        assert settings.voice == "af_heart"
+        assert not isinstance(settings.language, (str, Language))
+
+    def test_kokoro_gets_the_language_and_its_voice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "tts", "local")
+        fake = self._fake_kokoro(monkeypatch)
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "es")
+        monkeypatch.setenv("BOT_TTS_VOICES", "es=ef_dora")
+
+        agent_bot.build_text_to_speech()
+
+        settings: Any = fake.built[0]["settings"]
+        assert settings.language == Language.ES
+        assert settings.voice == "ef_dora"
+
+
+class _FakeLanguageModel:
+    """Stands in for the LLM service a tool handler pushes its frames through."""
+
+    def __init__(self) -> None:
+        self.pushed: list[tuple[Frame, FrameDirection]] = []
+
+    async def push_frame(
+        self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
+    ) -> None:
+        self.pushed.append((frame, direction))
+
+
+class _ToolCall:
+    """The parts of `FunctionCallParams` the language tool reads."""
+
+    def __init__(self, arguments: dict[str, Any]) -> None:
+        self.arguments = arguments
+        self.llm = _FakeLanguageModel()
+        self.results: list[Any] = []
+
+    async def result_callback(self, result: Any, **_keyword_arguments: Any) -> None:
+        self.results.append(result)
+
+
+def _controller(
+    environment: dict[str, str], *, provider: str = "cartesia", recognizer_language: str = "multi"
+) -> Any:
+    from agent_bot import SpeakingLanguageController, resolve_speaking_languages
+
+    languages = resolve_speaking_languages(environment, provider, "account-voice")
+    return SpeakingLanguageController(
+        languages,
+        provider=provider,
+        default_voice="account-voice",
+        recognizer_language=recognizer_language,
+    )
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestSpeakingLanguageTool:
+    """The model switches the bot's language when the caller asks, and only to a configured one."""
+
+    def test_the_tool_exists_only_with_a_language_to_switch_to(self) -> None:
+        from agent_bot import build_tool_schemas
+
+        two = _controller({"BOT_TTS_LANGUAGES": "en,nl"})
+        offered = {schema.name: schema for schema in build_tool_schemas(False, two)}
+        assert set(offered) == {"set_speaking_language"}
+        assert offered["set_speaking_language"].properties["language"]["enum"] == ["en", "nl"]
+
+        assert build_tool_schemas(False, None) == []
+        with_control = [schema.name for schema in build_tool_schemas(True, None)]
+        assert "set_speaking_language" not in with_control
+        assert "end_call" in with_control
+
+    def test_one_configured_language_builds_no_switch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        assert agent_bot.build_speaking_language_controller() is None
+        monkeypatch.setenv("BOT_TTS_LANGUAGES", "nl,en")
+        assert agent_bot.build_speaking_language_controller() is not None
+
+    async def test_the_tool_changes_the_voice_for_the_rest_of_the_call(self) -> None:
+        from pipecat.frames.frames import STTUpdateSettingsFrame, TTSUpdateSettingsFrame
+
+        controller = _controller(
+            {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_VOICES": "nl=a-dutch-voice"}
+        )
+        call = _ToolCall({"language": "nl"})
+
+        await controller.set_speaking_language(call)
+
+        assert controller.current == "nl"
+        assert len(call.llm.pushed) == 1
+        frame, direction = call.llm.pushed[0]
+        assert isinstance(frame, TTSUpdateSettingsFrame)
+        assert direction == FrameDirection.DOWNSTREAM
+        assert frame.delta is not None
+        assert frame.delta.language == Language.NL
+        assert frame.delta.voice == "a-dutch-voice"
+        assert not any(isinstance(pushed, STTUpdateSettingsFrame) for pushed, _ in call.llm.pushed)
+        assert call.results == [{"speaking_language": "nl"}]
+
+    async def test_a_pinned_recognizer_is_switched_too(self) -> None:
+        """A recognizer on `multi` hears every language already; one pinned to English does not."""
+        from pipecat.frames.frames import STTUpdateSettingsFrame
+
+        controller = _controller({"BOT_TTS_LANGUAGES": "en,nl"}, recognizer_language="en-US")
+        call = _ToolCall({"language": "nl"})
+
+        await controller.set_speaking_language(call)
+
+        upstream = [
+            frame for frame, direction in call.llm.pushed if direction == FrameDirection.UPSTREAM
+        ]
+        assert len(upstream) == 1
+        assert isinstance(upstream[0], STTUpdateSettingsFrame)
+        assert upstream[0].delta is not None and upstream[0].delta.language == Language.NL
+
+    async def test_a_language_nobody_configured_is_refused(self) -> None:
+        controller = _controller({"BOT_TTS_LANGUAGES": "en,nl"})
+        call = _ToolCall({"language": "de"})
+
+        await controller.set_speaking_language(call)
+
+        assert controller.current == "en"
+        assert call.llm.pushed == []
+        assert "error" in call.results[0]
+
+    async def test_the_real_voice_service_takes_the_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Applied to a built Cartesia service, not only shaped like a frame it would take."""
+        import agent_bot
+
+        monkeypatch.setenv("CARTESIA_API_KEY", "test-value")
+        monkeypatch.setenv("CARTESIA_VOICE_ID", "account-voice")
+        _select(monkeypatch, "tts", "cartesia")
+        service = agent_bot.build_text_to_speech()
+        controller = _controller(
+            {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_VOICES": "nl=a-dutch-voice"}
+        )
+        call = _ToolCall({"language": "nl"})
+
+        await controller.set_speaking_language(call)
+        frame: Any = call.llm.pushed[0][0]
+        await service._update_settings(frame.delta)
+
+        settings: Any = service.settings
+        assert settings.language == "nl"
+        assert settings.voice == "a-dutch-voice"
+
+    def test_the_prompt_says_how_to_switch_only_when_it_can(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        unset: Any = agent_bot.build_llm_service(with_hangup=False).settings
+        assert unset.system_instruction == agent_bot.resolve_system_prompt({})
+
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        single: Any = agent_bot.build_llm_service(with_hangup=False).settings
+        assert "nl" in single.system_instruction
+        assert "set_speaking_language" not in single.system_instruction
+
+        monkeypatch.setenv("BOT_TTS_LANGUAGES", "nl,en")
+        switchable: Any = agent_bot.build_llm_service(with_hangup=False).settings
+        assert "set_speaking_language" in switchable.system_instruction
+
+
+async def _hear(controller: Any, stretches: list[Language | None]) -> list[Frame]:
+    """Feed one transcript per stretch of caller speech, in `stretches`' languages."""
+    pushed: list[Frame] = []
+
+    async def capture(frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM) -> None:
+        pushed.append(frame)
+
+    controller.push_frame = capture
+    for language in stretches:
+        await controller.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await controller.process_frame(
+            TranscriptionFrame("words", "caller", time_now_iso8601(), language),
+            FrameDirection.DOWNSTREAM,
+        )
+    return pushed
+
+
+def _switches(pushed: list[Frame]) -> list[Any]:
+    from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+    return [
+        frame.delta.language
+        for frame in pushed
+        if isinstance(frame, TTSUpdateSettingsFrame) and frame.delta is not None
+    ]
+
+
+FOLLOWING = {"BOT_TTS_LANGUAGES": "en,nl", "BOT_TTS_FOLLOW_CALLER": "true"}
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestFollowTheCaller:
+    """The voice follows the language the recognizer hears, once it has heard it consistently."""
+
+    async def test_consistent_turns_switch_the_voice(self) -> None:
+        from agent_bot import FOLLOW_CALLER_CONSISTENT_TURNS
+
+        controller = _controller(FOLLOWING)
+
+        pushed = await _hear(controller, [Language.NL] * FOLLOW_CALLER_CONSISTENT_TURNS)
+
+        assert _switches(pushed) == [Language.NL]
+        assert controller.current == "nl"
+        # The switch goes ahead of the transcript, so the reply to it is already in the new voice.
+        from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+        first_switch = next(
+            index for index, frame in enumerate(pushed) if isinstance(frame, TTSUpdateSettingsFrame)
+        )
+        assert isinstance(pushed[first_switch + 1], TranscriptionFrame)
+
+    async def test_one_misheard_turn_does_not_flip_the_voice(self) -> None:
+        controller = _controller(FOLLOWING)
+
+        pushed = await _hear(controller, [Language.NL, Language.EN, Language.NL, Language.EN])
+
+        assert _switches(pushed) == []
+        assert controller.current == "en"
+
+    async def test_several_transcripts_in_one_stretch_count_once(self) -> None:
+        controller = _controller(FOLLOWING)
+        pushed: list[Frame] = []
+
+        async def capture(
+            frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
+        ) -> None:
+            pushed.append(frame)
+
+        controller.push_frame = capture
+        await controller.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        for _ in range(3):
+            await controller.process_frame(
+                TranscriptionFrame("woord", "caller", time_now_iso8601(), Language.NL),
+                FrameDirection.DOWNSTREAM,
+            )
+
+        assert _switches(pushed) == []
+
+    async def test_a_regional_report_matches_its_configured_language(self) -> None:
+        controller = _controller(FOLLOWING)
+
+        pushed = await _hear(controller, [Language.NL_BE, Language.NL_NL])
+
+        assert _switches(pushed) == [Language.NL]
+
+    async def test_unconfigured_and_unreported_languages_are_ignored(self) -> None:
+        controller = _controller(FOLLOWING)
+
+        pushed = await _hear(controller, [Language.DE, None, Language.DE])
+
+        assert _switches(pushed) == []
+
+    async def test_without_the_option_the_voice_never_follows(self) -> None:
+        controller = _controller({"BOT_TTS_LANGUAGES": "en,nl"})
+
+        pushed = await _hear(controller, [Language.NL] * 5)
+
+        assert _switches(pushed) == []
+
+    async def test_an_explicit_request_wins_over_following(self) -> None:
+        """Told to speak Dutch by an English speaker, the bot must not drift back to English."""
+        controller = _controller(FOLLOWING)
+        await controller.set_speaking_language(_ToolCall({"language": "nl"}))
+
+        pushed = await _hear(controller, [Language.EN] * 5)
+
+        assert _switches(pushed) == []
+        assert controller.current == "nl"
