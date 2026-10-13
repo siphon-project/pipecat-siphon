@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The agent example can look up the caller's account details, and the weather.** With
+  `BOT_CALLER_LOOKUP_URL` set, a URL with `{caller}` in it, the model gets a `caller_lookup` tool
+  that fetches it for the number in the media socket's `caller` query parameter and passes the JSON
+  object back, scalars and one level of lists and objects, at most 2 KB. The number is checked to
+  be 6 to 15 digits and the tool takes no arguments, so the model cannot be talked into looking up
+  somebody else. `BOT_CALLER_LOOKUP_DESCRIPTION` says what the lookup is for. A missing number, a
+  failure status, an unreadable or oversized answer, or no answer within 1.5 s reach the model as
+  "not available", and the number is only ever logged masked. `BOT_WEATHER=on` adds a `weather`
+  tool on open-meteo, which needs no key. Both are off unless configured, and the prompt mentions
+  only what is on.
 - **The agent example speaks a configured language, and switches when the caller asks.** Its voice
   was built with no language, so Cartesia spoke English and read a Dutch reply in an English
   accent. `BOT_TTS_LANGUAGE` now reaches every synthesizer that takes one, `BOT_TTS_VOICES` gives

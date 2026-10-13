@@ -401,6 +401,31 @@ BOT_TTS_LANGUAGES=nl,en
 BOT_TTS_VOICES=nl=<a Dutch voice id>,en=<an English voice id>
 ```
 
+### Looking things up for the caller
+
+Two more tools, each off until it is configured, and the prompt mentions only the ones that are on:
+
+| variable | format | default |
+|---|---|---|
+| `BOT_CALLER_LOOKUP_URL` | URL with `{caller}` in it (`https://accounts.example.invalid/customers/{caller}`) | unset: no `caller_lookup` tool |
+| `BOT_CALLER_LOOKUP_DESCRIPTION` | one sentence, the tool description the model sees | a generic account lookup |
+| `BOT_WEATHER` | `on` / `off` | `off`: no `weather` tool |
+
+`caller_lookup` takes no arguments. It fetches `BOT_CALLER_LOOKUP_URL` with `{caller}` replaced by
+the number in the media socket's `caller` query parameter (6 to 15 digits, no plus; anything else
+counts as no number), and hands the model the JSON object it gets back: strings, numbers and
+booleans, and lists or objects of those, one level deep. Nothing else is interpreted, so the
+description is how the model learns what the record is for. A model that could name the number
+could be talked into looking up anyone, so it cannot. No `caller` on the URL, a `404` or any other
+failure status, an answer that is not a JSON object or is over 2 KB, or no answer within 1.5 s all
+reach the model as "not available", and the bot says it cannot see that right now. A URL without
+`{caller}` stops the bot at startup. The number is logged masked. The example does not verify the
+URL, so the bot's port must be reachable only by whatever dials it.
+
+`weather` takes a place the model chooses, a capital when the caller names a country and no town,
+and reads the current temperature, conditions and wind from [open-meteo](https://open-meteo.com/),
+which needs no key. It gives up after 3 s.
+
 `examples/probe.py` speaks the engine's half of the media wire — connect, `start`, stream silence
 — and reports how much audio comes back and how long the first frame took. No phone, no SIP
 stack, no engine. It is the fastest way to tell "the AI is broken" from "the media path is

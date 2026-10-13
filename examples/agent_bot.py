@@ -129,6 +129,8 @@ import argparse
 import asyncio
 import contextlib
 import importlib
+import json
+import math
 import os
 import re
 import sys
@@ -139,6 +141,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
 
+import aiohttp
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from loguru import logger
@@ -877,6 +880,126 @@ the line goes, because pipecat runs the model again on the tool's result and `en
 that second reply to finish."""
 
 
+def is_switched_on(value: str) -> bool:
+    """Read an on/off variable the way `BOT_TTS_FOLLOW_CALLER` is read: on only when it says so."""
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+CALLER_LOOKUP_URL = os.environ.get("BOT_CALLER_LOOKUP_URL", "").strip()
+"""The URL the caller_lookup tool fetches, with `{caller}` where the caller's number goes. Empty
+disables the tool.
+
+A template rather than a base URL, because the service it points at is the deployment's own and so
+is its path: `https://accounts.example.invalid/customers/{caller}`. No default, not even a port: a
+guessed address is a tool that answers "not available" on every call while looking configured."""
+
+CALLER_LOOKUP_PLACEHOLDER = "{caller}"
+"""Where the number goes in `BOT_CALLER_LOOKUP_URL`. A URL without it is refused at startup: it
+would look up the same thing for every caller, which is somebody else's details for all but one."""
+
+DEFAULT_CALLER_LOOKUP_DESCRIPTION = (
+    "Look up details about the caller's account, for questions about their own account."
+)
+"""What the model is told the tool does, when the deployment does not say."""
+
+CALLER_LOOKUP_DESCRIPTION = (
+    os.environ.get("BOT_CALLER_LOOKUP_DESCRIPTION", "").strip() or DEFAULT_CALLER_LOOKUP_DESCRIPTION
+)
+"""The tool's description, which is what tells the model when to call it. Worth setting: the model
+only knows what the lookup is good for from this sentence."""
+
+CALLER_LOOKUP_TIMEOUT_SECONDS = 1.5
+"""How long the caller_lookup request may take. The caller hears silence for all of it, and a
+lookup slower than this is better answered with "I cannot see that right now"."""
+
+CALLER_LOOKUP_MAXIMUM_BYTES = 2048
+"""The most of the lookup's answer, serialized, that is handed to the model. A larger answer counts
+as not available rather than being cut: half a record read aloud is worse than none, and the whole
+of it is resent with every turn for the rest of the call."""
+
+CALLER_NUMBER = re.compile(r"[0-9]{6,15}")
+"""What a `caller` on the media socket's URL must be: the number's digits, without a plus. ASCII
+digits on purpose, since `str.isdigit` also passes other scripts' digits, and the number goes into
+a URL."""
+
+
+def refuse_a_caller_lookup_url_without_the_caller(url: str) -> None:
+    """Stop a `BOT_CALLER_LOOKUP_URL` that has nowhere to put the caller's number.
+
+    Raises:
+        ValueError: If the URL is set and does not contain `{caller}`.
+
+    """
+    if url and CALLER_LOOKUP_PLACEHOLDER not in url:
+        raise ValueError(
+            f"BOT_CALLER_LOOKUP_URL must contain {CALLER_LOOKUP_PLACEHOLDER} where the caller's "
+            "number goes, for example https://accounts.example.invalid/customers/{caller}"
+        )
+
+
+WEATHER_ENABLED = is_switched_on(os.environ.get("BOT_WEATHER", ""))
+"""Whether the model gets the weather tool. Off unless `BOT_WEATHER=on`, like every other capability
+here: with nothing set the bot is built as before and makes no request to anyone it was not told
+about."""
+
+WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+"""open-meteo's place search and forecast. Neither takes a key. The forecast's default units are
+degrees Celsius and km/h, which is what the tool reports."""
+
+WEATHER_TIMEOUT_SECONDS = 3.0
+"""The whole weather lookup, both requests together, is capped at this."""
+
+WEATHER_PLACE_MAXIMUM_LENGTH = 100
+"""A place name longer than this is cut, since the model, and through it the caller, chooses it."""
+
+WEATHER_CONDITIONS: dict[int, str] = {
+    0: "clear sky",
+    1: "mainly clear",
+    2: "partly cloudy",
+    3: "overcast",
+    45: "fog",
+    48: "freezing fog",
+    51: "light drizzle",
+    53: "drizzle",
+    55: "heavy drizzle",
+    56: "light freezing drizzle",
+    57: "freezing drizzle",
+    61: "light rain",
+    63: "rain",
+    65: "heavy rain",
+    66: "light freezing rain",
+    67: "freezing rain",
+    71: "light snow",
+    73: "snow",
+    75: "heavy snow",
+    77: "snow grains",
+    80: "light rain showers",
+    81: "rain showers",
+    82: "violent rain showers",
+    85: "light snow showers",
+    86: "heavy snow showers",
+    95: "thunderstorms",
+    96: "thunderstorms with light hail",
+    99: "thunderstorms with heavy hail",
+}
+"""The WMO weather interpretation codes open-meteo reports, as a phrase that can be said aloud. A
+code missing here is left out of the result rather than guessed at."""
+
+CALLER_LOOKUP_PROMPT = """
+
+When the caller asks about their own account, call the caller_lookup tool, which looks up the
+number they are calling from. If it says the details are not available, tell them you cannot see
+that right now."""
+"""Appended only when the tool is configured, for the reason HANGUP_PROMPT gives."""
+
+WEATHER_PROMPT = """
+
+When the caller asks about the weather, call the weather tool with the place they mean. If they do
+not name one and you know which country they are in, use its capital."""
+"""Appended only when the tool is enabled."""
+
+
 def speaking_language_prompt(languages: SpeakingLanguages) -> str:
     """Tell the model which language it speaks in. Empty when none is configured.
 
@@ -1575,6 +1698,205 @@ class SpeakingLanguageController(FrameProcessor):
         self._candidate, self._candidate_turns = None, 0
 
 
+def parse_caller(value: str | None) -> str | None:
+    """Read the caller's number from the media socket's `caller` parameter, or None for no number.
+
+    Anything but 6 to 15 ASCII digits counts as no number at all rather than as a number to clean
+    up: the tool puts it in a URL, and a value that needed cleaning is not one to trust.
+    """
+    if value is None or CALLER_NUMBER.fullmatch(value) is None:
+        return None
+    return value
+
+
+def mask_number(number: str) -> str:
+    """Hide all but the last two digits of a phone number, for a log line."""
+    return "*" * (len(number) - 2) + number[-2:]
+
+
+def _not_available(reason: str) -> dict[str, Any]:
+    """Build the result a lookup tool gives when it has nothing to say, with why, for the model."""
+    return {"available": False, "reason": reason}
+
+
+def _text(value: object) -> str | None:
+    """Read a non-empty string field, or None for anything else."""
+    return value if isinstance(value, str) and value else None
+
+
+def _number(value: object) -> float | None:
+    """Read a numeric field, or None for anything else, a bool included (to Python, an int)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _is_scalar(value: object) -> bool:
+    """Whether a JSON value is a string, a finite number or a boolean."""
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, (str, int, bool))
+
+
+def _scalars_only(value: object) -> object | None:
+    """Keep a scalar, or a list or object of scalars with everything else in it dropped."""
+    if _is_scalar(value):
+        return value
+    if isinstance(value, list):
+        return [item for item in value if _is_scalar(item)]
+    if isinstance(value, dict):
+        return {
+            key: item for key, item in value.items() if isinstance(key, str) and _is_scalar(item)
+        }
+    return None
+
+
+def pass_through_caller_lookup(body: object) -> dict[str, Any]:
+    """Hand the model the lookup's answer as it came, minus anything deeper than one level.
+
+    No field is interpreted: what the record holds is the deployment's business, and the description
+    is where the model learns what it means. Nulls and anything nested further are dropped, and an
+    answer that is still over `CALLER_LOOKUP_MAXIMUM_BYTES` is not available at all.
+    """
+    if not isinstance(body, dict):
+        return _not_available("the answer could not be read")
+    details = {
+        key: kept
+        for key, value in body.items()
+        if isinstance(key, str) and (kept := _scalars_only(value)) is not None
+    }
+    if len(json.dumps(details, ensure_ascii=False).encode()) > CALLER_LOOKUP_MAXIMUM_BYTES:
+        return _not_available("the answer was too long to use")
+    return {"available": True, "details": details}
+
+
+class CallerLookup:
+    """Serve the caller_lookup tool for one call: the details the deployment keeps on the caller.
+
+    One per call, holding the number the media socket was opened with. The tool takes no arguments
+    for the reason `end_call` takes none: a number the model could name is a number the caller can
+    talk it into naming, and then anyone's details are one question away.
+    """
+
+    def __init__(self, url_template: str, caller: str | None) -> None:
+        """Look `caller` up at `url_template`, with `{caller}` replaced. No number, no lookup."""
+        self._url_template = url_template
+        self._caller = caller
+
+    async def caller_lookup(self, params: FunctionCallParams) -> None:
+        """Serve the tool: hand the model what the lookup found, or that nothing could be seen."""
+        await params.result_callback(await self.look_up())
+
+    async def look_up(self) -> dict[str, Any]:
+        """Fetch the caller's details, within the timeout."""
+        if self._caller is None:
+            return _not_available("the caller's number is not known on this call")
+        masked = mask_number(self._caller)
+        url = self._url_template.replace(CALLER_LOOKUP_PLACEHOLDER, self._caller)
+        timeout = aiohttp.ClientTimeout(total=CALLER_LOOKUP_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as reply:
+                if reply.status == 404:
+                    logger.info(f"caller lookup: {masked} is not known")
+                    return _not_available("the caller is not known")
+                if not 200 <= reply.status < 300:
+                    logger.warning(f"caller lookup: HTTP {reply.status} for {masked}")
+                    return _not_available("the lookup failed")
+                body = await reply.json(content_type=None)
+        except TimeoutError:
+            logger.warning(
+                f"caller lookup: no answer for {masked} within {CALLER_LOOKUP_TIMEOUT_SECONDS:g}s"
+            )
+            return _not_available("the lookup took too long")
+        except (aiohttp.ClientError, ValueError) as error:
+            # The type and not the message: aiohttp puts the URL in its messages, and the URL has
+            # the whole number in it.
+            logger.warning(f"caller lookup: lookup for {masked} failed ({type(error).__name__})")
+            return _not_available("the lookup failed")
+        result = pass_through_caller_lookup(body)
+        logger.info(f"caller lookup for {masked}: {'found' if result['available'] else 'unusable'}")
+        return result
+
+
+def _first_place(found: object) -> tuple[str, float, float] | None:
+    """Read the name, latitude and longitude of the first place found, or None for no usable one."""
+    results = found.get("results") if isinstance(found, dict) else None
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return None
+    first = results[0]
+    name = _text(first.get("name"))
+    latitude, longitude = _number(first.get("latitude")), _number(first.get("longitude"))
+    if name is None or latitude is None or longitude is None:
+        return None
+    country = _text(first.get("country"))
+    return (f"{name}, {country}" if country else name), latitude, longitude
+
+
+def interpret_forecast(place: str, forecast: object) -> dict[str, Any]:
+    """Turn open-meteo's current conditions into what the model says about them."""
+    current = forecast.get("current") if isinstance(forecast, dict) else None
+    if not isinstance(current, dict):
+        return _not_available("the forecast could not be read")
+    temperature = _number(current.get("temperature_2m"))
+    if temperature is None:
+        return _not_available("the forecast has no temperature")
+    code = current.get("weather_code")
+    wind = _number(current.get("wind_speed_10m"))
+    result: dict[str, Any] = {
+        "available": True,
+        "place": place,
+        "temperature_celsius": round(temperature),
+        "conditions": WEATHER_CONDITIONS.get(code) if isinstance(code, int) else None,
+        "wind_kilometres_per_hour": None if wind is None else round(wind),
+        "observed_at": _text(current.get("time")),
+    }
+    return {key: value for key, value in result.items() if value is not None}
+
+
+async def look_up_weather(place: str) -> dict[str, Any]:
+    """Find `place` and its current weather on open-meteo, both within one timeout."""
+    place = place.strip()[:WEATHER_PLACE_MAXIMUM_LENGTH]
+    if not place:
+        return _not_available("no place was named")
+    try:
+        async with asyncio.timeout(WEATHER_TIMEOUT_SECONDS), aiohttp.ClientSession() as session:
+            async with session.get(
+                WEATHER_GEOCODING_URL, params={"name": place, "count": "1"}
+            ) as reply:
+                if reply.status != 200:
+                    logger.warning(f"weather: place search answered HTTP {reply.status}")
+                    return _not_available("the weather service is not answering")
+                found = _first_place(await reply.json(content_type=None))
+            if found is None:
+                return _not_available(f"no place called {place} was found")
+            name, latitude, longitude = found
+            async with session.get(
+                WEATHER_FORECAST_URL,
+                params={
+                    "latitude": str(latitude),
+                    "longitude": str(longitude),
+                    "current": "temperature_2m,weather_code,wind_speed_10m",
+                },
+            ) as reply:
+                if reply.status != 200:
+                    logger.warning(f"weather: forecast answered HTTP {reply.status}")
+                    return _not_available("the weather service is not answering")
+                forecast = await reply.json(content_type=None)
+    except TimeoutError:
+        logger.warning(f"weather: no answer within {WEATHER_TIMEOUT_SECONDS:g}s")
+        return _not_available("the weather service took too long")
+    except (aiohttp.ClientError, ValueError) as error:
+        logger.warning(f"weather: lookup failed ({type(error).__name__}: {error})")
+        return _not_available("the weather service is not answering")
+    return interpret_forecast(name, forecast)
+
+
+async def report_weather(params: FunctionCallParams) -> None:
+    """Serve the weather tool: the current weather in the place the model names."""
+    place = params.arguments.get("place")
+    await params.result_callback(await look_up_weather(place if isinstance(place, str) else ""))
+
+
 def build_speaking_language_controller() -> SpeakingLanguageController | None:
     """Build the call's language switch, or None when there is only one language to speak."""
     languages = configured_speaking_languages()
@@ -1589,9 +1911,13 @@ def build_speaking_language_controller() -> SpeakingLanguageController | None:
 
 
 def build_tool_schemas(
-    with_control: bool, speaking: SpeakingLanguageController | None
+    with_control: bool,
+    speaking: SpeakingLanguageController | None,
+    *,
+    caller_lookup: CallerLookup | None = None,
+    weather: bool = False,
 ) -> list[FunctionSchema]:
-    """List the model's tools: hangup and transfer with a control plane, and the language switch.
+    """List the model's tools: hangup and transfer, the language switch, and the two lookups.
 
     Each only when it can act. A tool the model is offered and cannot use is a promise to the caller
     that is never kept, which is the same reason the prompts for them are appended conditionally.
@@ -1645,6 +1971,32 @@ def build_tool_schemas(
                 },
                 required=["language"],
                 handler=speaking.set_speaking_language,
+            )
+        )
+    if caller_lookup is not None:
+        tools.append(
+            FunctionSchema(
+                name="caller_lookup",
+                description=CALLER_LOOKUP_DESCRIPTION,
+                # None, on purpose: see `CallerLookup`.
+                properties={},
+                required=[],
+                handler=caller_lookup.caller_lookup,
+            )
+        )
+    if weather:
+        tools.append(
+            FunctionSchema(
+                name="weather",
+                description="Get the current weather in a place: temperature, conditions, wind.",
+                properties={
+                    "place": {
+                        "type": "string",
+                        "description": "A town or city, optionally with its country.",
+                    }
+                },
+                required=["place"],
+                handler=report_weather,
             )
         )
     return tools
@@ -2162,6 +2514,8 @@ def build_llm_service(with_hangup: bool) -> LLMService[Any]:
         + (HANGUP_PROMPT if with_hangup else "")
         + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
         + speaking_language_prompt(configured_speaking_languages())
+        + (CALLER_LOOKUP_PROMPT if CALLER_LOOKUP_URL else "")
+        + (WEATHER_PROMPT if WEATHER_ENABLED else "")
     )
     builders: dict[str, Callable[[str], LLMService[Any]]] = {
         "anthropic": _build_anthropic_llm_service,
@@ -2512,6 +2866,7 @@ def build_worker(
     websocket: WebSocket,
     control: ControlPlane | None,
     observer_factory: ObserverFactory | None = None,
+    caller: str | None = None,
 ) -> PipelineWorker:
     """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
 
@@ -2522,6 +2877,9 @@ def build_worker(
 
     `observer_factory`, when given, builds an observer that watches this call's pipeline without
     being part of it -- how a test harness reads what the bot heard and decided.
+
+    `caller` is the caller's number from the media socket's URL, already checked by `parse_caller`,
+    or None. Only the caller_lookup tool reads it.
     """
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
@@ -2537,7 +2895,12 @@ def build_worker(
     # None unless the deployment configured a second language: with one, the voice is built
     # speaking it and there is nothing to switch, so the pipeline stays as it was.
     speaking_language = build_speaking_language_controller()
-    tools = build_tool_schemas(control is not None, speaking_language)
+    tools = build_tool_schemas(
+        control is not None,
+        speaking_language,
+        caller_lookup=CallerLookup(CALLER_LOOKUP_URL, caller) if CALLER_LOOKUP_URL else None,
+        weather=WEATHER_ENABLED,
+    )
     if tools:
         context.set_tools(ToolsSchema(standard_tools=tools))
     # The aggregator decides the caller's turn, and nothing else in the pipeline does: see
@@ -2649,10 +3012,11 @@ async def serve_call(
     websocket: WebSocket,
     control: ControlPlane | None,
     observer_factory: ObserverFactory | None = None,
+    caller: str | None = None,
 ) -> None:
     """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
     await websocket.accept()
-    worker = build_worker(websocket, control, observer_factory)
+    worker = build_worker(websocket, control, observer_factory, caller)
     runner = WorkerRunner()
     await runner.add_workers(worker)
     # Returns when the pipeline ends, which is when the engine closes the socket. Everything the
@@ -2673,8 +3037,19 @@ def build_app(
         # deployment chose, and refusing an unexpected one would be a confusing way to fail a call
         # that is otherwise perfectly formed. The call is identified by the `start` envelope, not
         # by the URL.
+        #
+        # The one thing read from the URL is the caller's number, a `caller` parameter that whoever
+        # dials this socket may add. This example does not verify the URL, so whoever can reach
+        # this port can claim any number: keep it on a network only the dialling side reaches, as
+        # the docstring's addresses already assume.
+        raw_caller = websocket.query_params.get("caller")
+        caller = parse_caller(raw_caller)
+        if caller is not None:
+            logger.info(f"call from {mask_number(caller)}")
+        elif raw_caller is not None:
+            logger.warning("ignoring a caller parameter that is not 6 to 15 digits")
         try:
-            await serve_call(websocket, control, observer_factory)
+            await serve_call(websocket, control, observer_factory, caller)
         except WebSocketDisconnect:
             # The ordinary end of a call: the engine closed first.
             logger.info("engine closed the media socket")
@@ -2704,6 +3079,7 @@ async def main(
         refuse_an_unknown_backend(BACKEND)
         missing = missing_environment(providers, os.environ)
         resolve_system_prompt(os.environ)
+        refuse_a_caller_lookup_url_without_the_caller(CALLER_LOOKUP_URL)
         speaking_languages = configured_speaking_languages()
     except ValueError as error:
         sys.exit(str(error))
@@ -2753,6 +3129,8 @@ async def main(
             if speaking_languages.switchable
             else ""
         )
+        + (f", caller_lookup -> {CALLER_LOOKUP_URL}" if CALLER_LOOKUP_URL else "")
+        + (", weather" if WEATHER_ENABLED else "")
     )
     # Which language the voice speaks, for the same reason: an accent is not visible in a log.
     if speaking_languages.starting is not None:
