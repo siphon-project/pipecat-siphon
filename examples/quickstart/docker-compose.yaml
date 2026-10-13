@@ -117,6 +117,9 @@ services:
       BOT_CALLER_LOOKUP_URL: "${BOT_CALLER_LOOKUP_URL:-}"
       BOT_CALLER_LOOKUP_DESCRIPTION: "${BOT_CALLER_LOOKUP_DESCRIPTION:-}"
       BOT_WEATHER: "${BOT_WEATHER:-}"
+      # refer (the default) or bridge; see the example's TRANSFER_MODE.
+      BOT_TRANSFER_MODE: "${BOT_TRANSFER_MODE:-}"
+      BOT_TRANSFER_RING_TIMEOUT: "${BOT_TRANSFER_RING_TIMEOUT:-}"
       # Model choices. Empty leaves the example's own defaults for the selected backend.
       BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
       BOT_STT_MODEL: "${BOT_STT_MODEL:-}"

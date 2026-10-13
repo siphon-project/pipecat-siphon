@@ -357,6 +357,12 @@ which REFERs the caller to that destination and keeps the call until the transfe
 phones refuse a REFER from the network, and then the bot stays on the line, is told the transfer
 did not work and tells the caller, rather than leaving them in silence (a phone that never answers
 counts as refusing after `BOT_TRANSFER_VERDICT_TIMEOUT`, 60 s by default).
+With `BOT_TRANSFER_MODE=bridge` the caller's phone is left out of it: SIPhon rings the destination
+itself (`dial` with `on_answer: "bridge"`), the caller stays with the bot while it rings, and the
+two are joined when it answers, which drops the bot's stream. A refusal or no answer within
+`BOT_TRANSFER_RING_TIMEOUT` (30 s) keeps the caller with the bot, as above. The routing script
+that hands the call over says where that leg goes and whom it presents, as the call's vars
+`transfer_next_hop`, `transfer_from`, `transfer_p_asserted_identity` and `transfer_privacy`.
 The example's docstring covers the platform side: the media profile the
 engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
 whether the control channel ever finds its call — the engine expands `{call_id}` in a `ws_uri` to

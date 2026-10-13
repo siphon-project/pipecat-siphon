@@ -853,6 +853,37 @@ go unanswered (RFC 3261 Timer F), so a phone that refuses or never answers the R
 heard from first. A refusal itself takes a round trip: a `405` from a phone arrives in milliseconds,
 and only a phone that accepted and is ringing the destination uses this much of it."""
 
+TRANSFER_MODES = ("refer", "bridge")
+TRANSFER_MODE = os.environ.get("BOT_TRANSFER_MODE", "").strip().lower() or "refer"
+"""How the transfer_call tool moves the caller: `refer` or `bridge`.
+
+`refer` asks the caller's own phone to place the new call (an in-dialog REFER, RFC 3515), which
+works only where the caller's phone carries a REFER out. Many accept one with a `202` and then do
+nothing, so the transfer never happens.
+
+`bridge` leaves the caller's phone out of it. siphon rings the destination itself (the control
+plane's `dial` with `on_answer: "bridge"`) while the caller stays on this call, and when the
+destination answers it joins the two and drops this bot's media stream. A destination that refuses
+or does not answer within BOT_TRANSFER_RING_TIMEOUT leaves the caller with the bot, as a refused
+REFER does. Where the new leg goes and whom it presents are the call's own vars, set by the
+routing script that handed the call over: `transfer_next_hop` (the proxy the leg is sent to, the
+request URI staying the destination), `transfer_from`, `transfer_p_asserted_identity` and
+`transfer_privacy`. Without them the leg goes to the destination's own host and presents the
+caller's From."""
+
+TRANSFER_RING_TIMEOUT_SECONDS = int(os.environ.get("BOT_TRANSFER_RING_TIMEOUT", "") or 30)
+"""How long the destination rings in `bridge` mode before the transfer counts as not answered.
+
+Keep it below BOT_TRANSFER_VERDICT_TIMEOUT, so the dial's own verdict arrives before the bot gives
+up waiting for one."""
+
+BRIDGED_STREAM_GRACE_SECONDS = 10.0
+"""How long the bot waits, after a `bridge` transfer, for siphon to close its media stream.
+
+siphon closes it when it joins the caller to the destination. Closing it from this side first
+would read, to the routing script, as the bot leaving a caller it still has; so the bot waits, and
+ends its pipeline itself only if the stream is somehow still open after this long."""
+
 TRANSFER_PROMPT = """
 
 You can also put the caller through to a person with the transfer_call tool. Call it first, and
@@ -1136,6 +1167,20 @@ class BotSpeechMonitor(FrameProcessor):
                 return True
 
 
+BRIDGE_FINAL_EVENTS = frozenset({"ChannelBridged", "DialFailed"})
+"""The events that end a `bridge` transfer: the caller joined to the destination, or nobody was."""
+
+BRIDGE_FAILURE_STAGES: dict[str, str] = {
+    "rejected": "refused",
+    "timeout": "timeout",
+    "ring timeout": "timeout",
+    "unsent": "not_sent",
+    "bridge_failed": "refused",
+    "caller_hangup": "call_ended",
+}
+"""A `DialFailed` cause, as the stage of a REFER's verdict that means the same to the caller."""
+
+
 @dataclass(frozen=True)
 class TransferVerdict:
     """What became of a transfer the bot asked for, read the way the bot has to act on it.
@@ -1172,6 +1217,26 @@ class TransferVerdict:
         else:
             ending = "failed"
         return cls(ending=ending, stage=stage, status=status, reason=outcome.get("reason"))
+
+    @classmethod
+    def from_bridge_event(cls, kind: str, outcome: Mapping[str, Any]) -> TransferVerdict:
+        """Read the end of a `bridge` transfer's dial into the same decision.
+
+        `ChannelBridged` is the caller joined to the destination. `DialFailed` names its `cause`;
+        the ones that mean the same as a refused REFER are given that verdict's stage, so the model
+        is told the same thing for the same outcome. A caller who hung up while the destination
+        rang has left the call, as `call_ended` has.
+        """
+        if kind == "ChannelBridged":
+            return cls(ending="completed", stage="bridged")
+        cause = str(outcome.get("cause") or "")
+        stage = BRIDGE_FAILURE_STAGES.get(cause, cause or None)
+        return cls(
+            ending="ended" if stage == "call_ended" else "failed",
+            stage=stage,
+            status=outcome.get("code"),
+            reason=outcome.get("reason"),
+        )
 
     @property
     def leaves_the_call(self) -> bool:
@@ -1249,9 +1314,14 @@ class ControlPlane:
                 # implicit subscription. The tool waits on this verdict before it lets go of the
                 # caller, because a phone that refuses the REFER is still on the line with the bot.
                 kind = event.get("kind")
-                if not self._transfer_final(kind):
+                if kind in BRIDGE_FINAL_EVENTS:
+                    # A `bridge` transfer's dial reports on the caller's own channel; the bot
+                    # dials for nothing else, so these are always the transfer's.
+                    verdict = TransferVerdict.from_bridge_event(kind, event.get("payload") or {})
+                elif self._transfer_final(kind):
+                    verdict = TransferVerdict.from_event(kind, self._transfer_outcome(event) or {})
+                else:
                     continue
-                verdict = TransferVerdict.from_event(kind, self._transfer_outcome(event) or {})
                 detail = f"stage={verdict.stage} status={verdict.status} reason={verdict.reason}"
                 # The kind is the verdict. The status is the NOTIFY's code when siphon has one,
                 # and a completed transfer has arrived without it: read as the verdict, the missing
@@ -1384,6 +1454,8 @@ class CallResources:
     transfer_pending: bool = False
     # Watches a verdict that arrives after the wait gave up on it, in case it is a completion.
     late_transfer_verdict: asyncio.Task[None] | None = None
+    # After a `bridge` transfer: ends the pipeline if siphon has not closed the stream in time.
+    bridged_stream_watch: asyncio.Task[None] | None = None
 
 
 async def end_call(params: FunctionCallParams) -> None:
@@ -1462,22 +1534,89 @@ async def _end_on_a_late_completion(
         if verdict.cancelled():
             return
         raise
-    if outcome.leaves_the_call and resources.worker is not None:
+    if outcome.leaves_the_call:
+        await _let_go_of_the_call(resources, outcome)
+
+
+async def _let_go_of_the_call(resources: CallResources, verdict: TransferVerdict) -> None:
+    """End the bot's leg once the caller has left it, by transfer or by hanging up.
+
+    After a `bridge` transfer siphon closes the media stream itself, which ends the pipeline. The
+    bot waits for that rather than closing first: a stream the bot closes reads, to the routing
+    script on the other side, as the bot walking away from a caller it still has (see
+    BRIDGED_STREAM_GRACE_SECONDS). Every other way out ends the pipeline now.
+    """
+    if resources.worker is None:
+        return
+    if verdict.stage != "bridged":
         await resources.worker.queue_frame(EndWorkerFrame())
+        return
+    worker = resources.worker
+
+    async def end_if_still_open() -> None:
+        await asyncio.sleep(BRIDGED_STREAM_GRACE_SECONDS)
+        logger.warning(
+            f"media stream still open {BRIDGED_STREAM_GRACE_SECONDS:g}s after the caller was "
+            f"bridged to {TRANSFER_TARGET}, ending the pipeline"
+        )
+        await worker.queue_frame(EndWorkerFrame())
+
+    resources.bridged_stream_watch = asyncio.create_task(end_if_still_open())
 
 
-async def _transfer_and_wait_for_the_verdict(resources: CallResources, control_call: Any) -> bool:
-    """REFER the caller, and return whether they have left the bot's leg by the verdict.
+def _bridge_dial_arguments(control_call: Any) -> dict[str, Any]:
+    """Build the `dial` that rings the destination for the caller and bridges the two.
 
-    The caller's words are held from the REFER until the verdict (see `TransferHold`), and a failed
-    transfer is put to the model, because the caller who was told they were being put through is
-    still there and nothing else on the line will speak to them.
+    The next hop and the identity come from the call's vars, which the routing script that handed
+    the call over sets; the bot names none of its own. Read from the handover's payload rather than
+    with `get_var`, so the transfer costs no round trip before the dial.
+    """
+    payload = getattr(control_call, "payload", None)
+    handed = payload.get("vars") if isinstance(payload, Mapping) else None
+    handed = handed if isinstance(handed, Mapping) else {}
+    target: dict[str, Any] = {"uri": TRANSFER_TARGET}
+    if handed.get("transfer_next_hop"):
+        target["next_hop"] = str(handed["transfer_next_hop"])
+    arguments: dict[str, Any] = {
+        "on_answer": "bridge",
+        "targets": [target],
+        "timeout": TRANSFER_RING_TIMEOUT_SECONDS,
+    }
+    for variable, argument in (
+        ("transfer_from", "from"),
+        ("transfer_p_asserted_identity", "p_asserted_identity"),
+        ("transfer_privacy", "privacy"),
+    ):
+        if handed.get(variable):
+            arguments[argument] = str(handed[variable])
+    return arguments
+
+
+async def _start_the_transfer(control_call: Any) -> None:
+    """Send the transfer the configured mode asks for. Raises the SDK's error when it is refused."""
+    if TRANSFER_MODE == "bridge":
+        await control_call.command("dial", _bridge_dial_arguments(control_call))
+        logger.info(f"ringing {TRANSFER_TARGET} to bridge the caller to it")
+        return
+    await control_call.transfer(TRANSFER_TARGET)
+    logger.info(f"asked the caller's phone to transfer to {TRANSFER_TARGET}")
+
+
+async def _transfer_and_wait_for_the_verdict(
+    resources: CallResources, control_call: Any
+) -> TransferVerdict | None:
+    """Transfer the caller, and return the verdict if they have left the bot's leg by it.
+
+    `None` is a caller who is still here. The caller's words are held from the transfer until the
+    verdict (see `TransferHold`), and a failed transfer is put to the model, because the caller who
+    was told they were being put through is still there and nothing else on the line will speak to
+    them.
     """
     sip_call_id = resources.serializer.call_id or ""
     verdict = resources.control.expect_transfer_verdict(sip_call_id)
     resources.transfer_hold.engage()
     try:
-        await control_call.transfer(TRANSFER_TARGET)
+        await _start_the_transfer(control_call)
     except resources.control.error_class as error:
         # The caller hanging up first is the ordinary case, not a fault. If they have, the note
         # below is answered to nobody and the call's own teardown ends the pipeline.
@@ -1486,8 +1625,7 @@ async def _transfer_and_wait_for_the_verdict(resources: CallResources, control_c
         await _inform_the_model_the_transfer_failed(
             resources, TRANSFER_FAILURE_EXPLANATIONS["not_sent"]
         )
-        return False
-    logger.info(f"asked the caller's phone to transfer to {TRANSFER_TARGET}")
+        return None
 
     try:
         # Shielded so the wait running out does not cancel the verdict itself: a late one can still
@@ -1503,19 +1641,19 @@ async def _transfer_and_wait_for_the_verdict(resources: CallResources, control_c
         await _inform_the_model_the_transfer_failed(
             resources, TRANSFER_FAILURE_EXPLANATIONS["timeout"]
         )
-        return False
+        return None
 
     if outcome.leaves_the_call:
-        return True
+        return outcome
     await _inform_the_model_the_transfer_failed(
         resources,
         TRANSFER_FAILURE_EXPLANATIONS.get(outcome.stage or "", "it was never confirmed"),
     )
-    return False
+    return None
 
 
 async def transfer_call(params: FunctionCallParams) -> None:
-    """Say the handover line, wait for it to play, REFER the caller away, and wait for the verdict.
+    """Say the handover line, wait for it to play, transfer the caller, and wait for the verdict.
 
     Takes no arguments, exactly like `end_call` and for the same reason: it acts on the call the
     bot is already on and sends it to the one configured destination. A model-chosen destination
@@ -1551,7 +1689,8 @@ async def transfer_call(params: FunctionCallParams) -> None:
         if not await resources.speech.wait_until_finished():
             logger.warning("handover line did not finish within the cap, transferring anyway")
 
-        if not await _transfer_and_wait_for_the_verdict(resources, control_call):
+        left = await _transfer_and_wait_for_the_verdict(resources, control_call)
+        if left is None:
             return
     finally:
         resources.transfer_pending = False
@@ -1560,8 +1699,7 @@ async def transfer_call(params: FunctionCallParams) -> None:
     # The transfer happened or the call went with it, so this bot's leg is finished even though the
     # call may not be. Leaving the pipeline running holds the media socket open, and the leg then
     # sits there until the engine's media timeout reaps it -- half a minute of a call nobody is on.
-    if resources.worker is not None:
-        await resources.worker.queue_frame(EndWorkerFrame())
+    await _let_go_of_the_call(resources, left)
 
 
 class SpeakingLanguageController(FrameProcessor):
@@ -2391,6 +2529,19 @@ def refuse_an_unknown_backend(backend: str) -> None:
         raise ValueError(f"unknown BOT_BACKEND {backend!r}: expected one of {', '.join(BACKENDS)}")
 
 
+def refuse_an_unknown_transfer_mode(mode: str) -> None:
+    """Stop a transfer mode nobody defined, naming the variable and what it accepts.
+
+    Raises:
+        ValueError: If `mode` is not one of `TRANSFER_MODES`.
+
+    """
+    if mode not in TRANSFER_MODES:
+        raise ValueError(
+            f"unknown BOT_TRANSFER_MODE {mode!r}: expected one of {', '.join(TRANSFER_MODES)}"
+        )
+
+
 _Model = TypeVar("_Model")
 
 
@@ -3077,6 +3228,7 @@ async def main(
     providers = selected_providers()
     try:
         refuse_an_unknown_backend(BACKEND)
+        refuse_an_unknown_transfer_mode(TRANSFER_MODE)
         missing = missing_environment(providers, os.environ)
         resolve_system_prompt(os.environ)
         refuse_a_caller_lookup_url_without_the_caller(CALLER_LOOKUP_URL)

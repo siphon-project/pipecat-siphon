@@ -42,11 +42,13 @@ from agent_bot import (
     BotSpeechMonitor,
     ControlPlane,
     SharedConstructor,
+    TransferVerdict,
     build_user_aggregator_params,
     ends_mid_sentence,
     is_english,
     missing_environment,
     refuse_an_unknown_backend,
+    refuse_an_unknown_transfer_mode,
     refuse_missing_google_cloud_credentials,
     resolve_system_prompt,
 )
@@ -1273,6 +1275,225 @@ class TestTransferKeepsTheCallerUntilTheVerdict:
         await agent_bot.transfer_call(params)
 
         assert results == [{"error": "this call cannot be transferred from here"}]
+
+
+HANDED_OVER_VARS = {
+    "transfer_next_hop": "sip:proxy.example.invalid:5060;transport=tcp",
+    "transfer_from": "sip:+15550100001@example.invalid;user=phone",
+    "transfer_p_asserted_identity": "tel:+15550100001",
+    "transfer_privacy": "restricted",
+}
+BRIDGED: dict[str, Any] = {
+    "kind": "ChannelBridged",
+    "payload": {"role": "anchor", "anchored": True},
+}
+DIAL_BUSY: dict[str, Any] = {
+    "kind": "DialFailed",
+    "payload": {"cause": "rejected", "code": 486, "reason": "Busy Here", "timed_out": False},
+}
+DIAL_NOT_ANSWERED: dict[str, Any] = {
+    "kind": "DialFailed",
+    "payload": {"cause": "timeout", "code": 408, "reason": "Request Timeout", "timed_out": True},
+}
+DIAL_CALLER_GONE: dict[str, Any] = {
+    "kind": "DialFailed",
+    "payload": {"cause": "caller_hangup", "code": 487, "reason": "Request Terminated"},
+}
+
+
+class _FakeBridgingCall(_FakeTransferringCall):
+    """A control call that answers a `dial` on the event stream, as siphon answers a bridge dial.
+
+    The reply only says the destination is ringing; whether it answered arrives afterwards as
+    `ChannelBridged` or `DialFailed`, so the fake queues `verdicts` when the dial is sent.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[dict[str, Any] | None],
+        handed_over: dict[str, str] | None = None,
+        dial_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(verdicts)
+        self.payload: dict[str, Any] = {"vars": dict(handed_over or {})}
+        self.commands: list[tuple[str, dict[str, Any]]] = []
+        self._dial_error = dial_error
+
+    async def command(self, verb: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Record the command, then answer it with the scripted verdict."""
+        self.commands.append((verb, dict(args or {})))
+        if self._dial_error is not None:
+            raise self._dial_error
+        for event in self._verdicts:
+            self._stream.put_nowait(event)
+        return {"state": "dialing", "on_answer": "bridge"}
+
+
+@pytest.fixture
+def bridge_settings(transfer_settings: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Transfer by bridging, with a stream grace short enough to run in a test."""
+    import agent_bot
+
+    transfer_settings.setattr(agent_bot, "TRANSFER_MODE", "bridge")
+    transfer_settings.setattr(agent_bot, "TRANSFER_RING_TIMEOUT_SECONDS", 20)
+    transfer_settings.setattr(agent_bot, "BRIDGED_STREAM_GRACE_SECONDS", QUIET_SECONDS)
+    return transfer_settings
+
+
+@pytest.mark.usefixtures("bridge_settings")
+class TestTransferByBridging:
+    """`BOT_TRANSFER_MODE=bridge`: siphon rings the destination and joins the caller to it.
+
+    The caller's phone is never asked to do anything, so a phone that accepts a REFER and then does
+    nothing with it cannot strand the transfer. The verdict the tool waits for is the dial's.
+    """
+
+    async def test_the_destination_is_dialled_with_what_the_call_was_handed(self) -> None:
+        call = _FakeBridgingCall([BRIDGED], handed_over=HANDED_OVER_VARS)
+        transfer = _Transfer(call)
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert call.transfers == [], "a REFER went to the caller's phone"
+        assert call.commands == [
+            (
+                "dial",
+                {
+                    "on_answer": "bridge",
+                    "targets": [
+                        {
+                            "uri": TRANSFER_DESTINATION,
+                            "next_hop": "sip:proxy.example.invalid:5060;transport=tcp",
+                        }
+                    ],
+                    "timeout": 20,
+                    "from": "sip:+15550100001@example.invalid;user=phone",
+                    "p_asserted_identity": "tel:+15550100001",
+                    "privacy": "restricted",
+                },
+            )
+        ]
+        await transfer.hang_up()
+
+    async def test_with_nothing_handed_over_the_dial_names_only_the_destination(self) -> None:
+        call = _FakeBridgingCall([BRIDGED])
+        transfer = _Transfer(call)
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert call.commands == [
+            (
+                "dial",
+                {"on_answer": "bridge", "targets": [{"uri": TRANSFER_DESTINATION}], "timeout": 20},
+            )
+        ]
+        await transfer.hang_up()
+
+    async def test_a_bridged_caller_is_let_go_once_siphon_has_had_time_to_close_the_stream(
+        self,
+    ) -> None:
+        """The stream is siphon's to close when it bridges; closing it first reads as leaving."""
+        transfer = _Transfer(_FakeBridgingCall([BRIDGED]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert not transfer.worker.ended(), "the bot closed its stream ahead of siphon"
+        assert transfer.worker.notes_to_the_model() == []
+        assert not transfer.resources.transfer_hold.holding
+        watch = transfer.resources.bridged_stream_watch
+        assert watch is not None
+        await asyncio.wait_for(watch, TIMEOUT_SECONDS)
+        assert transfer.worker.ended(), "a stream siphon never closed was left open"
+        await transfer.hang_up()
+
+    @pytest.mark.parametrize(
+        ("failure", "explanation"),
+        [
+            (DIAL_BUSY, "could not be reached"),
+            (DIAL_NOT_ANSWERED, "no answer came back in time"),
+        ],
+    )
+    async def test_a_destination_that_refuses_or_does_not_answer_keeps_the_caller(
+        self, failure: dict[str, Any], explanation: str
+    ) -> None:
+        transfer = _Transfer(_FakeBridgingCall([failure]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert not transfer.worker.ended(), "the bot left a caller nobody was bridged to"
+        notes = transfer.worker.notes_to_the_model()
+        assert len(notes) == 1 and explanation in notes[0], notes
+        assert not transfer.resources.transfer_hold.holding, "the caller is still not heard"
+        assert transfer.resources.bridged_stream_watch is None
+        await transfer.hang_up()
+
+    async def test_a_caller_who_hangs_up_while_it_rings_ends_the_bot_without_recovering(
+        self,
+    ) -> None:
+        transfer = _Transfer(_FakeBridgingCall([DIAL_CALLER_GONE]))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert transfer.worker.ended()
+        assert transfer.worker.notes_to_the_model() == [], "the bot tried to talk to nobody"
+        await transfer.hang_up()
+
+    async def test_a_dial_the_control_plane_refuses_keeps_the_caller(self) -> None:
+        transfer = _Transfer(_FakeBridgingCall([], dial_error=RuntimeError("invalid_state")))
+        await transfer.attach()
+
+        await transfer.request()
+
+        assert not transfer.worker.ended()
+        notes = transfer.worker.notes_to_the_model()
+        assert len(notes) == 1 and "could not be started" in notes[0], notes
+        assert not transfer.resources.transfer_hold.holding
+        await transfer.hang_up()
+
+
+class TestBridgeVerdict:
+    """A bridge dial's end, read into the verdict a REFER's end would give."""
+
+    def test_bridged_is_completed(self) -> None:
+        verdict = TransferVerdict.from_bridge_event("ChannelBridged", BRIDGED["payload"])
+        assert verdict.ending == "completed" and verdict.leaves_the_call
+
+    @pytest.mark.parametrize(
+        ("cause", "stage"),
+        [
+            ("rejected", "refused"),
+            ("timeout", "timeout"),
+            ("ring timeout", "timeout"),
+            ("unsent", "not_sent"),
+            ("bridge_failed", "refused"),
+            ("gave_up", "gave_up"),
+        ],
+    )
+    def test_a_failed_dial_keeps_the_caller(self, cause: str, stage: str) -> None:
+        verdict = TransferVerdict.from_bridge_event(
+            "DialFailed", {"cause": cause, "code": 486, "reason": "Busy Here"}
+        )
+        assert (verdict.ending, verdict.stage, verdict.status) == ("failed", stage, 486)
+        assert not verdict.leaves_the_call
+
+    def test_the_caller_hanging_up_while_it_rings_has_left_the_call(self) -> None:
+        verdict = TransferVerdict.from_bridge_event("DialFailed", DIAL_CALLER_GONE["payload"])
+        assert verdict.ending == "ended" and verdict.leaves_the_call
+
+
+class TestTransferModeConfiguration:
+    @pytest.mark.parametrize("mode", ["refer", "bridge"])
+    def test_the_two_modes_are_accepted(self, mode: str) -> None:
+        refuse_an_unknown_transfer_mode(mode)
+
+    def test_anything_else_stops_the_bot_naming_the_variable(self) -> None:
+        with pytest.raises(ValueError, match="BOT_TRANSFER_MODE"):
+            refuse_an_unknown_transfer_mode("replace")
 
 
 class TestTransferHold:
