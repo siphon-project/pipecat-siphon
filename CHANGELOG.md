@@ -18,6 +18,16 @@ All notable changes to this project are documented here. The format follows
   "not available", and the number is only ever logged masked. `BOT_WEATHER=on` adds a `weather`
   tool on open-meteo, which needs no key. Both are off unless configured, and the prompt mentions
   only what is on.
+- **The agent example can transfer a caller without asking the caller's phone.**
+  `BOT_TRANSFER_MODE=bridge` (the default stays `refer`) has `transfer_call` ring the destination
+  through the control plane's `dial` with `on_answer: "bridge"` instead of REFERing the caller,
+  for phones that accept a REFER with a `202` and then never place the call. The caller stays with
+  the bot while the destination rings, `BOT_TRANSFER_RING_TIMEOUT` (30 s) long, and is joined to it
+  when it answers. `ChannelBridged` is the completed verdict and `DialFailed` the failed one, so a
+  busy or unanswered destination keeps the caller and is put to the model exactly like a refused
+  REFER. The next hop and the identity the leg presents come from the call's handover vars. After
+  the bridge the bot leaves its media stream for SIPhon to close, ending its pipeline itself only
+  if the stream is still open 10 s later.
 - **The agent example speaks a configured language, and switches when the caller asks.** Its voice
   was built with no language, so Cartesia spoke English and read a Dutch reply in an English
   accent. `BOT_TTS_LANGUAGE` now reaches every synthesizer that takes one, `BOT_TTS_VOICES` gives
