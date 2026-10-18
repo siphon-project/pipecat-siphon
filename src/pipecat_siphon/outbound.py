@@ -15,8 +15,9 @@ are left to the bot, and this module is them:
   was answered but never reached the bot -- a callee answering into dead air.
 
 Nothing here imports the control SDK. The client and call handle are protocols, satisfied by a
-`siphon_control.ControlClient` whose `originate` returns the placed `Call` (older releases return a
-dict of ids and drop the call's events, so cannot follow it) and by anything else shaped like it.
+`siphon_control.ControlClient` from 0.9.0 on, whose `originate` returns the placed `Call` (older
+releases return a dict of ids and drop the call's events, so cannot follow it), and by anything else
+shaped like it.
 """
 
 from __future__ import annotations
@@ -383,7 +384,7 @@ class PlacedCalls:
             message = (
                 f"originate returned a {type(call).__name__}, not the placed call: this control "
                 f"client cannot follow a call it places. The call to {to} rings on until siphon's "
-                "ring timeout; upgrade siphon-control to a release whose originate returns a Call"
+                "ring timeout; upgrade siphon-control to 0.9.0 or newer"
             )
             logger.error(message)
             raise TypeError(message)

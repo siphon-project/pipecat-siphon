@@ -37,7 +37,8 @@ All notable changes to this project are documented here. The format follows
   without the engine reaching the bot is hung up rather than left silent. The agent example's
   `--call <sip-uri>` uses it to ring one number, greet as the caller (`--call-context` says what
   about), and exit 0 or 1 by how the call went; `end_call` and `transfer_call` work on it as on a
-  call coming in. Needs a `siphon-control` whose `originate` returns the placed `Call`.
+  call coming in. Needs `siphon-control` 0.9.0 or newer, the first whose `originate` returns the
+  placed `Call`; the quickstart pins 0.9.0.
 
 - **The agent example speaks a configured language, and switches when the caller asks.** Its voice
   was built with no language, so Cartesia spoke English and read a Dutch reply in an English

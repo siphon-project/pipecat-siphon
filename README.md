@@ -372,7 +372,8 @@ over: 0 for an answered call that ended normally, 1 with the outcome logged for 
 your own: `pipecat_siphon.PlacedCalls` places a call, adds `placed=<channel>` to the `ws_uri` so the
 engine's dial-in names its call before `start` arrives, and reports how the call went from the
 control events, hanging up a call siphon never reports on or one answered into a bot that was never
-reached. It needs a `siphon-control` whose `originate` returns the placed `Call`.
+reached. It needs `siphon-control` 0.9.0 or newer, the first whose `originate` returns the placed
+`Call`.
 The example's docstring covers the platform side: the media profile the
 engine's built-in `voice_ai` does not fully supply, and the correlation detail that decides
 whether the control channel ever finds its call — the engine expands `{call_id}` in a `ws_uri` to
