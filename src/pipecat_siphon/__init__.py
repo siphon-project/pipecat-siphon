@@ -7,6 +7,14 @@ pipeline speak it, in the same shape as the serializers pipecat ships in tree.
 The engine dials out as the WebSocket client, so a bot built on this is a WebSocket *server*.
 """
 
+from pipecat_siphon.outbound import (
+    CallOutcome,
+    ControlCall,
+    PlacedCall,
+    PlacedCalls,
+    PlacingClient,
+    outcome_from_event,
+)
 from pipecat_siphon.protocol import (
     ClearData,
     ControlMessage,
@@ -40,7 +48,9 @@ from pipecat_siphon.serializer import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "CallOutcome",
     "ClearData",
+    "ControlCall",
     "ControlMessage",
     "Direction",
     "DtmfData",
@@ -50,6 +60,9 @@ __all__ = [
     "EventData",
     "MarkData",
     "MediaFormat",
+    "PlacedCall",
+    "PlacedCalls",
+    "PlacingClient",
     "PlaySource",
     "PlayStartData",
     "PlayStopData",
@@ -65,5 +78,6 @@ __all__ = [
     "StopData",
     "__version__",
     "encode_control",
+    "outcome_from_event",
     "parse_control",
 ]

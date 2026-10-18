@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cargo \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels siphon-control==0.5.0
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels siphon-control==0.9.0
 
 # ── The bot ──────────────────────────────────────────────────────────────────────────────────────
 FROM python:3.13-slim
