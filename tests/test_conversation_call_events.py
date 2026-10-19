@@ -197,7 +197,8 @@ class TestWhatTheBotDid:
                 function_name="transfer_call", tool_call_id="call-1", arguments={}
             )
         )
-        await pipeline.push(TTSTextFrame(text="Putting you through now.", aggregated_by="sentence"))
+        # Positional: pipecat 1.13 renamed `aggregated_by` to `text_type`, and the range takes both.
+        await pipeline.push(TTSTextFrame("Putting you through now.", "sentence"))
         await pipeline.push(ErrorFrame(error="the recognizer refused the connection"))
 
         assert pipeline.events() == [
