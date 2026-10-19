@@ -9,7 +9,11 @@ example's logic need it there, the same way pytest already puts `tests/` itself 
 from __future__ import annotations
 
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
+
+import pytest
+from aiohttp.test_utils import TestServer
 
 _EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 if str(_EXAMPLES) not in sys.path:
@@ -21,3 +25,18 @@ if str(_EXAMPLES) not in sys.path:
 _INTEGRATION = Path(__file__).resolve().parent.parent / "integration"
 if str(_INTEGRATION) not in sys.path:
     sys.path.insert(0, str(_INTEGRATION))
+
+from fake_pbx import FakePbx  # noqa: E402  (tests/ is on the path once pytest has collected this)
+
+
+@pytest.fixture
+async def pbx() -> AsyncIterator[FakePbx]:
+    """Serve a fake siphon-pbx on loopback: `BRIEF_MENU`, and every report taken."""
+    fake = FakePbx()
+    server = TestServer(fake.app(), host="127.0.0.1")
+    await server.start_server()
+    fake.server = server
+    try:
+        yield fake
+    finally:
+        await server.close()

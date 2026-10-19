@@ -195,8 +195,19 @@ from pipecat.turns.user_stop.base_user_turn_stop_strategy import (
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from pipecat_siphon import SiphonFrameSerializer
+from pipecat_siphon import (
+    Chose,
+    Failed,
+    Finished,
+    Report,
+    SessionBrief,
+    SiphonFrameSerializer,
+    VoiceSession,
+    VoiceSessionClient,
+    session_token_from,
+)
 from pipecat_siphon.outbound import PlacedCall, PlacedCalls
+from pipecat_siphon.voice_session import QUERY_PARAMETER as SESSION_QUERY_PARAMETER
 
 PIPELINE_SAMPLE_RATE = int(os.environ.get("BOT_SAMPLE_RATE", "") or 16000)
 """What the pipeline runs at. Match it to `ws_sample_rate` on the profile and nothing in this
@@ -1051,6 +1062,94 @@ When the caller asks about the weather, call the weather tool with the place the
 not name one and you know which country they are in, use its capital."""
 """Appended only when the tool is enabled."""
 
+PBX_URL = os.environ.get("BOT_PBX_URL", "").strip()
+"""siphon-pbx's address, when this bot answers calls a siphon-pbx flow hands it. Empty: no brief.
+
+A flow's voice block has the engine dial the bot with `&session=<token>`; the bot then fetches the
+block's brief from here before it speaks, and reports how the conversation went back here, so the
+flow leaves the block on the report instead of waiting out its deadline. Set with
+`SIPHON_PBX_BOT_SECRET`, the secret the bot was given in siphon-pbx, or not at all."""
+
+PBX_SECRET_VARIABLE = "SIPHON_PBX_BOT_SECRET"
+"""The environment variable holding the bot's siphon-pbx secret. Read once, at startup."""
+
+PBX_STREAM_GRACE_SECONDS = 10.0
+"""How long after a report the bot waits for the PBX to take the call on before it ends its leg.
+
+A report the PBX took moves the call out of the block, and the engine closes the bot's stream as it
+does. The bot leaves that to the PBX rather than closing first, for the reason
+BRIDGED_STREAM_GRACE_SECONDS gives, and ends its pipeline only if the stream outlives this."""
+
+SESSION_PROMPT = """
+
+This call was handed to you with the following instructions. Where they differ from what you were
+told above, follow these:
+{instructions}"""
+"""The block's instructions, appended per call: what this conversation is for."""
+
+CHOOSE_OPTION_PROMPT = """
+
+Once the caller has made clear which of these they want, call the choose_option tool with it, then
+tell them in a few words that you are passing them on: the call moves on once your words have
+finished playing. Only choose an option the caller asked for."""
+"""Appended only when the brief has options. Tool first, words after, as HANGUP_PROMPT explains."""
+
+
+def build_voice_session_client(url: str, secret: str) -> VoiceSessionClient | None:
+    """Build the client for siphon-pbx's voice sessions, or None when neither half is configured.
+
+    Raises:
+        ValueError: If only one of the address and the secret is set, or the address is not http(s).
+
+    """
+    if not url and not secret:
+        return None
+    if not url or not secret:
+        raise ValueError(f"BOT_PBX_URL and {PBX_SECRET_VARIABLE} go together: set both, or neither")
+    try:
+        return VoiceSessionClient(url, secret)
+    except ValueError as error:
+        raise ValueError(f"BOT_PBX_URL: {error}") from error
+
+
+async def open_voice_session(
+    client: VoiceSessionClient | None, query: Mapping[str, str]
+) -> VoiceSession | None:
+    """Fetch the brief for the PBX session the dial-in URL names, or None if there is none to use.
+
+    A call that comes without a session, or whose brief cannot be had, is still answered, with the
+    bot's own configuration: a caller on a line the bot will not speak on hears nothing at all.
+    """
+    if SESSION_QUERY_PARAMETER not in query:
+        return None
+    if client is None:
+        logger.warning(
+            "the engine dialled in for a siphon-pbx session but BOT_PBX_URL is not set: answering "
+            "without the brief, and the flow will wait out its deadline for a report"
+        )
+        return None
+    token = session_token_from(query)
+    if token is None:
+        logger.warning("ignoring a session parameter that is not a plain token")
+        return None
+    brief = await client.fetch_brief(token)
+    if brief is None:
+        logger.error(
+            "no brief for this siphon-pbx session: answering with the bot's own configuration, "
+            "and nothing can be reported"
+        )
+        return None
+    logger.info(
+        f"briefed for call {brief.call_id}: "
+        + (
+            f"options {', '.join(option.option for option in brief.options)}"
+            if brief.options
+            else "an open conversation"
+        )
+        + f", the flow waits {brief.deadline_secs}s for a report"
+    )
+    return VoiceSession(client, token, brief)
+
 
 def speaking_language_prompt(languages: SpeakingLanguages) -> str:
     """Tell the model which language it speaks in. Empty when none is configured.
@@ -1663,6 +1762,85 @@ async def end_call(params: FunctionCallParams) -> None:
         logger.info(f"hangup rejected ({error}); the caller most likely hung up first")
 
 
+@dataclass
+class BriefedCall:
+    """A call siphon-pbx handed over with a brief, and the tools that tell it how the call went.
+
+    Each way the bot finishes reports once: `choose_option` the caller's choice, `end_call` that the
+    conversation is over, `fail` that the bot could not serve it. A report the PBX took moves the
+    call on, so the bot then only waits for its stream to close; one it did not take has nobody
+    waiting on it, so the bot ends its leg straight away.
+    """
+
+    session: VoiceSession
+    speech: BotSpeechMonitor
+    # Set after the worker exists, as on `CallResources`.
+    worker: PipelineWorker | None = None
+    # After a report the PBX took: ends the pipeline if the stream outlives the grace.
+    stream_watch: asyncio.Task[None] | None = None
+
+    async def choose_option(self, params: FunctionCallParams) -> None:
+        """Say the line passing the caller on, wait for it to play, then report the option."""
+        names = [option.option for option in self.session.brief.options]
+        option = params.arguments.get("option")
+        if self.session.reported is not None:
+            await params.result_callback({"error": "how this call goes has already been decided"})
+            return
+        if option not in names:
+            # The schema's enum says the same, but a model is not bound by it.
+            await params.result_callback(
+                {"error": f"not one of the options; choose one of: {', '.join(names)}"}
+            )
+            return
+        await params.result_callback({"chosen": option})
+        if not await self.speech.wait_until_finished():
+            logger.warning("the line passing the caller on did not finish within the cap")
+        await self._report_and_let_go(Chose(str(option)))
+
+    async def end_call(self, params: FunctionCallParams) -> None:
+        """Say goodbye, wait for it to play, then report the conversation finished.
+
+        Not a hangup: what happens to the call next is the flow's to decide, and it may well have
+        more for the caller than this bot did.
+        """
+        if self.session.reported is not None:
+            await params.result_callback({"error": "how this call goes has already been decided"})
+            return
+        await params.result_callback({"ending": True})
+        if not await self.speech.wait_until_finished():
+            logger.warning("farewell did not finish within the cap, reporting anyway")
+        await self._report_and_let_go(Finished())
+
+    async def fail(self, reason: str) -> None:
+        """Report that the bot cannot serve the call, and end its leg now: it has nothing to say."""
+        await self.session.report(Failed(reason))
+        if self.worker is not None:
+            await self.worker.queue_frame(EndWorkerFrame())
+
+    def stream_closed(self) -> None:
+        """Stand down the grace watch: the engine closed the stream, so there is nothing to end."""
+        if self.stream_watch is not None:
+            self.stream_watch.cancel()
+
+    async def _report_and_let_go(self, report: Report) -> None:
+        if self.worker is None:
+            return
+        worker = self.worker
+        if not await self.session.report(report):
+            await worker.queue_frame(EndWorkerFrame())
+            return
+
+        async def end_if_still_open() -> None:
+            await asyncio.sleep(PBX_STREAM_GRACE_SECONDS)
+            logger.warning(
+                f"media stream still open {PBX_STREAM_GRACE_SECONDS:g}s after reporting to the "
+                "PBX, ending the pipeline"
+            )
+            await worker.queue_frame(EndWorkerFrame())
+
+        self.stream_watch = asyncio.create_task(end_if_still_open())
+
+
 TRANSFER_FAILED_NOTE = (
     "[The transfer did not go through: {why}. The caller is still on the line with you. Tell them,"
     " in the language you have been speaking with them, and carry on helping them.]"
@@ -2226,14 +2404,17 @@ def build_tool_schemas(
     *,
     caller_lookup: CallerLookup | None = None,
     weather: bool = False,
+    briefed: BriefedCall | None = None,
 ) -> list[FunctionSchema]:
-    """List the model's tools: hangup and transfer, the language switch, and the two lookups.
+    """List the model's tools: hangup and transfer, the PBX's choices, the language switch, lookups.
 
     Each only when it can act. A tool the model is offered and cannot use is a promise to the caller
     that is never kept, which is the same reason the prompts for them are appended conditionally.
+    On a call siphon-pbx briefed, `end_call` reports the conversation finished rather than hanging
+    up, since the flow decides what happens next; transfer still needs the control plane.
     """
     tools: list[FunctionSchema] = []
-    if with_control:
+    if with_control or briefed is not None:
         tools.append(
             FunctionSchema(
                 name="end_call",
@@ -2244,24 +2425,52 @@ def build_tool_schemas(
                 ),
                 properties={},
                 required=[],
-                handler=end_call,
+                handler=briefed.end_call if briefed is not None else end_call,
             )
         )
-        if TRANSFER_TARGET:
-            tools.append(
-                FunctionSchema(
-                    name="transfer_call",
-                    description=(
-                        "Put the caller through to a person. Call it first, and after "
-                        "it returns tell them you are transferring them: the transfer "
-                        "happens once your words have finished playing, and the call is "
-                        "not yours afterwards."
-                    ),
-                    properties={},
-                    required=[],
-                    handler=transfer_call,
-                )
+    if briefed is not None and briefed.session.brief.options:
+        options = briefed.session.brief.options
+        tools.append(
+            FunctionSchema(
+                name="choose_option",
+                description=(
+                    "Pass the caller on to what they asked for. Call it first, then tell them "
+                    "you are passing them on; the call moves on once your words have finished. "
+                    "The options: "
+                    + "; ".join(
+                        f"{option.option} ({option.means})" if option.means else option.option
+                        for option in options
+                    )
+                    + "."
+                ),
+                properties={
+                    "option": {
+                        "type": "string",
+                        # The brief's list and nothing else; the PBX routes anything else out of
+                        # the block's no-match port, which is not what the caller asked for.
+                        "enum": [option.option for option in options],
+                        "description": "The option the caller asked for.",
+                    }
+                },
+                required=["option"],
+                handler=briefed.choose_option,
             )
+        )
+    if with_control and TRANSFER_TARGET:
+        tools.append(
+            FunctionSchema(
+                name="transfer_call",
+                description=(
+                    "Put the caller through to a person. Call it first, and after "
+                    "it returns tell them you are transferring them: the transfer "
+                    "happens once your words have finished playing, and the call is "
+                    "not yours afterwards."
+                ),
+                properties={},
+                required=[],
+                handler=transfer_call,
+            )
+        )
     if speaking is not None:
         tools.append(
             FunctionSchema(
@@ -2830,15 +3039,22 @@ def preload_local_models() -> None:
     )
 
 
-def build_llm_service(with_hangup: bool) -> LLMService[Any]:
-    """Build the LLM service for the selected backend, tuned for a conversation in real time."""
+def build_llm_service(with_hangup: bool, brief: SessionBrief | None = None) -> LLMService[Any]:
+    """Build the LLM service for the selected backend, tuned for a conversation in real time.
+
+    `with_hangup` is a control plane: hangup, and transfer when there is a destination. `brief`
+    is siphon-pbx's for this call, whose instructions and options the model is told, and whose
+    `end_call` reports rather than hangs up.
+    """
     system_instruction = (
         resolve_system_prompt(os.environ)
-        + (HANGUP_PROMPT if with_hangup else "")
+        + (HANGUP_PROMPT if with_hangup or brief is not None else "")
         + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
         + speaking_language_prompt(configured_speaking_languages())
         + (CALLER_LOOKUP_PROMPT if CALLER_LOOKUP_URL else "")
         + (WEATHER_PROMPT if WEATHER_ENABLED else "")
+        + (SESSION_PROMPT.format(instructions=brief.instructions) if brief is not None else "")
+        + (CHOOSE_OPTION_PROMPT if brief is not None and brief.options else "")
     )
     builders: dict[str, Callable[[str], LLMService[Any]]] = {
         "anthropic": _build_anthropic_llm_service,
@@ -3191,6 +3407,7 @@ def build_worker(
     observer_factory: ObserverFactory | None = None,
     caller: str | None = None,
     placed: PlacedCall | None = None,
+    session: VoiceSession | None = None,
 ) -> PipelineWorker:
     """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
 
@@ -3204,15 +3421,19 @@ def build_worker(
 
     `caller` is the caller's number from the media socket's URL, already checked by `parse_caller`,
     or None. Only the caller_lookup tool reads it. `placed` is the call this bot placed, when the
-    engine is dialling in for one; the bot opens it as the caller.
+    engine is dialling in for one; the bot opens it as the caller. `session` is the siphon-pbx
+    session the call was handed over in, already briefed, which the bot reports its outcome to.
     """
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
     speech_to_text = build_speech_to_text()
-    llm = build_llm_service(with_hangup=control is not None)
+    llm = build_llm_service(
+        with_hangup=control is not None, brief=session.brief if session is not None else None
+    )
     text_to_speech = build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
     echo_guard = EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+    briefed = BriefedCall(session=session, speech=speech_monitor) if session is not None else None
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
     # the context carries only the call.
@@ -3225,6 +3446,7 @@ def build_worker(
         speaking_language,
         caller_lookup=CallerLookup(CALLER_LOOKUP_URL, caller) if CALLER_LOOKUP_URL else None,
         weather=WEATHER_ENABLED,
+        briefed=briefed,
     )
     if tools:
         context.set_tools(ToolsSchema(standard_tools=tools))
@@ -3278,6 +3500,8 @@ def build_worker(
 
     if resources is not None:
         resources.worker = worker
+    if briefed is not None:
+        briefed.worker = worker
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(_worker: object, frame: ErrorFrame) -> None:
@@ -3300,6 +3524,14 @@ def build_worker(
             f" (processor {getattr(processor, 'name', '?')},"
             f" still usable: {getattr(processor, 'is_usable', '?')})"
         )
+
+        if briefed is not None:
+            # The PBX's call, so the PBX's to end: told the bot failed, the flow takes the block's
+            # failure path, which a hangup from here would deny it.
+            await briefed.fail(
+                f"a stage of the bot failed ({getattr(processor, 'name', 'unknown stage')})"
+            )
+            return
 
         control_call = control.call_for(serializer.call_id) if control is not None else None
         # `control is not None` is redundant at runtime -- control_call is only ever set through
@@ -3334,6 +3566,8 @@ def build_worker(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(_transport: object, _client: object) -> None:
         logger.info("engine disconnected, call over")
+        if briefed is not None:
+            briefed.stream_closed()
 
     return worker
 
@@ -3344,10 +3578,11 @@ async def serve_call(
     observer_factory: ObserverFactory | None = None,
     caller: str | None = None,
     placed: PlacedCall | None = None,
+    session: VoiceSession | None = None,
 ) -> None:
     """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
     await websocket.accept()
-    worker = build_worker(websocket, control, observer_factory, caller, placed)
+    worker = build_worker(websocket, control, observer_factory, caller, placed, session)
     runner = WorkerRunner()
     await runner.add_workers(worker)
     # Returns when the pipeline ends, which is when the engine closes the socket. Everything the
@@ -3357,9 +3592,14 @@ async def serve_call(
 
 
 def build_app(
-    control: ControlPlane | None, observer_factory: ObserverFactory | None = None
+    control: ControlPlane | None,
+    observer_factory: ObserverFactory | None = None,
+    voice_sessions: VoiceSessionClient | None = None,
 ) -> FastAPI:
-    """Build the HTTP surface: one WebSocket route the engine dials, once per call."""
+    """Build the HTTP surface: one WebSocket route the engine dials, once per call.
+
+    With `voice_sessions`, a dial-in naming a siphon-pbx session is briefed before it is served.
+    """
     app = FastAPI()
 
     @app.websocket("/{path:path}")
@@ -3381,8 +3621,10 @@ def build_app(
         elif raw_caller is not None:
             logger.warning("ignoring a caller parameter that is not 6 to 15 digits")
         placed = control.placed_calls.claim(websocket.query_params) if control is not None else None
+        # Before the socket is accepted, so the brief is in hand before the bot can say anything.
+        session = await open_voice_session(voice_sessions, websocket.query_params)
         try:
-            await serve_call(websocket, control, observer_factory, caller, placed)
+            await serve_call(websocket, control, observer_factory, caller, placed, session=session)
         except WebSocketDisconnect:
             # The ordinary end of a call: the engine closed first.
             logger.info("engine closed the media socket")
@@ -3420,6 +3662,9 @@ async def main(
         resolve_system_prompt(os.environ)
         refuse_a_caller_lookup_url_without_the_caller(CALLER_LOOKUP_URL)
         speaking_languages = configured_speaking_languages()
+        voice_sessions = build_voice_session_client(
+            PBX_URL, os.environ.get(PBX_SECRET_VARIABLE, "").strip()
+        )
     except ValueError as error:
         sys.exit(str(error))
     if missing:
@@ -3520,11 +3765,13 @@ async def main(
         )
         + f", interrupt after {MIN_INTERRUPT_WORDS} word(s)"
     )
+    if voice_sessions is not None:
+        logger.info(f"siphon-pbx sessions: briefed by and reporting to {PBX_URL}")
     logger.info(f"listening on ws://{host}:{port}/ -- point the engine's ws_uri here")
 
     server = uvicorn.Server(
         uvicorn.Config(
-            build_app(control, observer_factory),
+            build_app(control, observer_factory, voice_sessions),
             host=host,
             port=port,
             log_level="warning",

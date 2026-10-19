@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A bot behind siphon-pbx is briefed before it speaks and reports how the call went.**
+  `pipecat_siphon.VoiceSessionClient` fetches a voice session's brief
+  (`GET /voice/sessions/{token}`, the bot's secret as a bearer) and sends its one report
+  (`chose` / `finished` / `failed`). `VoiceSession` keeps that to one report per call. Briefs
+  read as the PBX's own serializer emits them, and anything else reads as no brief and never
+  raises. In the agent example, `BOT_PBX_URL` and `SIPHON_PBX_BOT_SECRET` turn it on. The block's
+  instructions join the system prompt and its options become a `choose_option` tool. `end_call`
+  reports `finished` rather than hanging up, a pipeline error reports `failed`, and a missing
+  brief falls back to the bot's own configuration.
 - **The agent example can look up the caller's account details, and the weather.** With
   `BOT_CALLER_LOOKUP_URL` set, a URL with `{caller}` in it, the model gets a `caller_lookup` tool
   that fetches it for the number in the media socket's `caller` query parameter and passes the JSON

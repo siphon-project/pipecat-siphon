@@ -2023,7 +2023,9 @@ class TestObserverHook:
             agent_bot, "build_transport", lambda _websocket, serializer: _Transport(serializer)
         )
         monkeypatch.setattr(agent_bot, "build_speech_to_text", FrameProcessor)
-        monkeypatch.setattr(agent_bot, "build_llm_service", lambda with_hangup: FrameProcessor())
+        monkeypatch.setattr(
+            agent_bot, "build_llm_service", lambda with_hangup, brief=None: FrameProcessor()
+        )
         monkeypatch.setattr(agent_bot, "build_text_to_speech", FrameProcessor)
         monkeypatch.setattr(agent_bot, "PipelineWorker", _RecordingWorker)
         return serializers, workers
@@ -2731,6 +2733,7 @@ class TestCallerNumberFromTheStreamUrl:
             _observer_factory: object = None,
             caller: str | None = None,
             _placed: object = None,
+            **_rest: object,
         ) -> None:
             served.append(caller)
 
@@ -3198,3 +3201,345 @@ class TestWeatherTool:
         assert set(offered) == {"weather"}
         assert set(offered["weather"].properties) == {"place"}
         assert offered["weather"].required == ["place"]
+
+
+PBX_TOKEN = "9f86d081884c7d659a2feaa0c55ad015"
+PBX_SECRET = "s3cret-for-tests-only"
+
+
+def _menu_brief() -> Any:
+    from pbx_fixtures import BRIEF_MENU
+    from pipecat_siphon import parse_brief
+
+    brief = parse_brief(BRIEF_MENU)
+    assert brief is not None
+    return brief
+
+
+def _open_brief() -> Any:
+    from pbx_fixtures import BRIEF_OPEN
+    from pipecat_siphon import parse_brief
+
+    brief = parse_brief(BRIEF_OPEN)
+    assert brief is not None
+    return brief
+
+
+def _briefed_call(pbx: Any, brief: Any) -> tuple[Any, _FakeWorker]:
+    """Hand over a call with `brief`, its line already played and its worker recorded."""
+    from agent_bot import BriefedCall
+    from pipecat_siphon import VoiceSession, VoiceSessionClient
+
+    session = VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, brief)
+    worker = _FakeWorker()
+    briefed = BriefedCall(session=session, speech=_FinishedSpeech())  # type: ignore[arg-type]
+    briefed.worker = worker  # type: ignore[assignment]
+    return briefed, worker
+
+
+class TestThePbxBriefIsFetchedBeforeTheBotSpeaks:
+    """The media route opens the PBX session the dial-in URL names, before the call is served."""
+
+    @staticmethod
+    def _route(monkeypatch: pytest.MonkeyPatch, pbx: Any | None) -> tuple[Any, list[Any]]:
+        from fastapi.routing import APIWebSocketRoute
+
+        import agent_bot
+        from pipecat_siphon import VoiceSessionClient
+
+        served: list[Any] = []
+
+        async def serve_call(*_arguments: Any, session: Any = None, **_rest: Any) -> None:
+            # What the PBX had been asked by the time the call is served.
+            served.append((session, len(pbx.requests) if pbx is not None else 0))
+
+        monkeypatch.setattr(agent_bot, "serve_call", serve_call)
+        client = VoiceSessionClient(pbx.url, PBX_SECRET) if pbx is not None else None
+        app = agent_bot.build_app(None, voice_sessions=client)
+        route = next(route for route in app.routes if isinstance(route, APIWebSocketRoute))
+        return route, served
+
+    async def test_the_brief_is_in_hand_when_the_call_is_served(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        route, served = self._route(monkeypatch, pbx)
+        websocket: Any = SimpleNamespace(query_params={"call": "abc", "session": PBX_TOKEN})
+
+        await route.endpoint(websocket)
+
+        ((session, asked),) = served
+        assert asked == 1
+        assert session.brief == _menu_brief()
+        (request,) = pbx.requests
+        assert request["path"] == f"/voice/sessions/{PBX_TOKEN}"
+        assert request["headers"]["Authorization"] == f"Bearer {PBX_SECRET}"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"call": "abc"},
+            {"call": "abc", "session": "../../api/v1/organisations"},
+            {"call": "abc", "session": ""},
+        ],
+    )
+    async def test_no_plain_session_token_asks_the_pbx_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any, query: dict[str, str]
+    ) -> None:
+        route, served = self._route(monkeypatch, pbx)
+
+        await route.endpoint(SimpleNamespace(query_params=query))
+
+        assert served == [(None, 0)]
+        assert pbx.requests == []
+
+    async def test_a_refused_brief_still_answers_the_call(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        pbx.brief_status = 404
+        route, served = self._route(monkeypatch, pbx)
+
+        await route.endpoint(SimpleNamespace(query_params={"session": PBX_TOKEN}))
+
+        assert served == [(None, 1)]
+
+    async def test_a_session_without_a_pbx_configured_answers_without_a_brief(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        route, served = self._route(monkeypatch, None)
+
+        await route.endpoint(SimpleNamespace(query_params={"session": PBX_TOKEN}))
+
+        assert served == [(None, 0)]
+
+
+class TestThePbxConfiguration:
+    def test_neither_set_is_no_pbx(self) -> None:
+        from agent_bot import build_voice_session_client
+
+        assert build_voice_session_client("", "") is None
+
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            ("http://127.0.0.1:8080", ""),
+            ("", PBX_SECRET),
+            ("pbx.example.invalid", PBX_SECRET),
+        ],
+    )
+    def test_half_a_configuration_is_refused(self, url: str, secret: str) -> None:
+        from agent_bot import build_voice_session_client
+
+        with pytest.raises(ValueError):
+            build_voice_session_client(url, secret)
+
+    def test_both_set_is_a_client(self) -> None:
+        from agent_bot import build_voice_session_client
+        from pipecat_siphon import VoiceSessionClient
+
+        client = build_voice_session_client("https://pbx.example.invalid", PBX_SECRET)
+        assert isinstance(client, VoiceSessionClient)
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestTheBriefShapesTheConversation:
+    """The block's instructions reach the model, and its options become the one way to choose."""
+
+    def test_the_options_are_the_only_choices_offered(self, pbx: Any) -> None:
+        from agent_bot import build_tool_schemas
+
+        briefed, _ = _briefed_call(pbx, _menu_brief())
+        offered = {
+            schema.name: schema for schema in build_tool_schemas(False, None, briefed=briefed)
+        }
+
+        assert set(offered) == {"choose_option", "end_call"}
+        option = offered["choose_option"].properties["option"]
+        assert option["enum"] == ["sales", "support"]
+        assert "buying something new" in offered["choose_option"].description
+        assert offered["end_call"].handler == briefed.end_call
+
+    def test_an_open_conversation_has_nothing_to_choose(self, pbx: Any) -> None:
+        from agent_bot import build_tool_schemas
+
+        briefed, _ = _briefed_call(pbx, _open_brief())
+        offered = [schema.name for schema in build_tool_schemas(False, None, briefed=briefed)]
+
+        assert offered == ["end_call"]
+
+    def test_no_transfer_without_a_control_plane_even_when_briefed(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "sip:desk@example.invalid")
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        briefed, _ = _briefed_call(pbx, _menu_brief())
+        offered = [
+            schema.name for schema in agent_bot.build_tool_schemas(False, None, briefed=briefed)
+        ]
+        prompt: Any = agent_bot.build_llm_service(with_hangup=False, brief=briefed.session.brief)
+
+        assert "transfer_call" not in offered
+        assert "transfer_call" not in prompt.settings.system_instruction
+
+    def test_the_prompt_carries_the_instructions_and_says_how_to_choose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        menu: Any = agent_bot.build_llm_service(with_hangup=False, brief=_menu_brief()).settings
+        open_: Any = agent_bot.build_llm_service(with_hangup=False, brief=_open_brief()).settings
+        unbriefed: Any = agent_bot.build_llm_service(with_hangup=False).settings
+
+        assert "Ask what the caller needs and route them." in menu.system_instruction
+        assert "choose_option" in menu.system_instruction
+        assert "end_call" in menu.system_instruction
+        assert "Answer questions about opening hours." in open_.system_instruction
+        assert "choose_option" not in open_.system_instruction
+        assert unbriefed.system_instruction == agent_bot.resolve_system_prompt({})
+
+    def test_a_briefed_call_offers_its_tools_from_the_worker(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """`build_worker` is where a session becomes tools; the route only hands it over."""
+        import agent_bot
+        from pipecat_siphon import VoiceSession, VoiceSessionClient
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        offered = _record_tool_lists(monkeypatch)
+        session = VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, _menu_brief())
+        websocket: Any = object()
+
+        agent_bot.build_worker(websocket, None, session=session)
+
+        assert offered == [["end_call", "choose_option"]]
+
+
+class TestTheOutcomeIsReported:
+    """Every way the bot finishes a briefed call tells the PBX, once, and lets go of the stream."""
+
+    @pytest.fixture(autouse=True)
+    def _short_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "PBX_STREAM_GRACE_SECONDS", 0.05)
+
+    async def test_choosing_an_option_reports_it_after_the_line_has_played(self, pbx: Any) -> None:
+        from pbx_fixtures import REPORT_CHOSE_SALES
+
+        briefed, worker = _briefed_call(pbx, _menu_brief())
+        call = _ResultOnly({"option": "sales"})
+
+        await briefed.choose_option(call)
+
+        assert call.results == [{"chosen": "sales"}]
+        assert [request["body"] for request in pbx.requests] == [REPORT_CHOSE_SALES]
+        # The PBX moves the call on, which closes the stream; the bot only waits for that.
+        assert not worker.ended()
+        await asyncio.sleep(0.1)
+        assert worker.ended()
+
+    async def test_the_stream_closing_in_time_leaves_nothing_to_end(self, pbx: Any) -> None:
+        briefed, worker = _briefed_call(pbx, _menu_brief())
+
+        await briefed.choose_option(_ResultOnly({"option": "support"}))
+        briefed.stream_closed()
+        await asyncio.sleep(0.1)
+
+        assert not worker.ended()
+
+    async def test_an_option_not_on_the_menu_is_refused_and_not_reported(self, pbx: Any) -> None:
+        briefed, worker = _briefed_call(pbx, _menu_brief())
+        call = _ResultOnly({"option": "billing"})
+
+        await briefed.choose_option(call)
+
+        assert "error" in call.results[0]
+        assert "sales" in call.results[0]["error"]
+        assert pbx.requests == []
+        assert not worker.ended()
+
+    async def test_ending_the_conversation_reports_it_finished(self, pbx: Any) -> None:
+        from pbx_fixtures import REPORT_FINISHED
+
+        briefed, _ = _briefed_call(pbx, _open_brief())
+        call = _ResultOnly()
+
+        await briefed.end_call(call)
+
+        assert call.results == [{"ending": True}]
+        assert [request["body"] for request in pbx.requests] == [REPORT_FINISHED]
+
+    async def test_after_one_report_the_tools_refuse_another(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _menu_brief())
+        await briefed.choose_option(_ResultOnly({"option": "sales"}))
+        again = _ResultOnly({"option": "support"})
+        ending = _ResultOnly()
+
+        await briefed.choose_option(again)
+        await briefed.end_call(ending)
+
+        assert "error" in again.results[0]
+        assert "error" in ending.results[0]
+        assert len(pbx.requests) == 1
+
+    async def test_a_report_the_pbx_did_not_take_ends_the_stream_now(self, pbx: Any) -> None:
+        """Nobody on the other side will move the call, so waiting would only be silence."""
+        pbx.report_status = 404
+        briefed, worker = _briefed_call(pbx, _open_brief())
+
+        await briefed.end_call(_ResultOnly())
+
+        assert worker.ended()
+
+    async def test_a_failed_pipeline_reports_failed_and_ends_the_stream(self, pbx: Any) -> None:
+        briefed, worker = _briefed_call(pbx, _open_brief())
+
+        await briefed.fail("the voice could not be reached")
+
+        (request,) = pbx.requests
+        assert request["body"] == b'{"outcome":"failed","reason":"the voice could not be reached"}'
+        assert worker.ended()
+
+    async def test_a_pipeline_error_on_a_briefed_call_reports_it(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """Wired, not only written: the worker's own error handler is what reports."""
+        from pipecat.frames.frames import ErrorFrame
+
+        import agent_bot
+        from pipecat_siphon import Failed, VoiceSession, VoiceSessionClient
+
+        TestObserverHook._stub_the_call(monkeypatch)
+        handlers: dict[str, Any] = {}
+        queued: list[Any] = []
+        recording_worker: Any = vars(agent_bot)["PipelineWorker"]
+
+        class _HandlerRecordingWorker(recording_worker):  # type: ignore[misc]
+            def event_handler(self, name: str) -> Any:
+                register = super().event_handler(name)
+
+                def recording(handler: Any) -> Any:
+                    handlers[name] = handler
+                    return register(handler)
+
+                return recording
+
+            async def queue_frame(self, frame: Any, *_arguments: Any, **_keywords: Any) -> None:
+                queued.append(frame)
+
+        monkeypatch.setattr(agent_bot, "PipelineWorker", _HandlerRecordingWorker)
+        session = VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, _open_brief())
+        websocket: Any = object()
+        agent_bot.build_worker(websocket, None, session=session)
+
+        await handlers["on_pipeline_error"](None, ErrorFrame(error="synthesizer refused"))
+
+        (request,) = pbx.requests
+        assert b'"outcome":"failed"' in request["body"]
+        assert any(type(frame).__name__ == "EndWorkerFrame" for frame in queued)
+        assert isinstance(session.reported, Failed)

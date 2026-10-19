@@ -443,6 +443,29 @@ URL, so the bot's port must be reachable only by whatever dials it.
 and reads the current temperature, conditions and wind from [open-meteo](https://open-meteo.com/),
 which needs no key. It gives up after 3 s.
 
+### Behind siphon-pbx
+
+When a siphon-pbx flow's voice block hands a call to the bot, the engine dials it with
+`&session=<token>` on the URL. With both of these set, the bot fetches that session's brief before
+it speaks, and reports how the conversation went back to the PBX, so the flow leaves the block on
+the report instead of waiting out its deadline:
+
+| variable | format | default |
+|---|---|---|
+| `BOT_PBX_URL` | the PBX's base URL (`https://pbx.example.invalid`) | unset: no brief is fetched |
+| `SIPHON_PBX_BOT_SECRET` | the secret the bot was given in siphon-pbx | unset |
+
+Set both or neither; one without the other stops the bot at startup. The brief's instructions are
+added to the system prompt for that call. When the block declares options, the model gets a
+`choose_option` tool limited to them, which reports the caller's choice once the line passing them
+on has played. `end_call` reports the conversation finished instead of hanging up, because what
+happens to the call next is the flow's decision. A pipeline error reports the bot failed. Each call
+reports once. After a report the PBX took, the bot waits up to 10 s for the PBX to close its stream
+before ending the pipeline itself. After one it did not take, the bot ends the pipeline at once. A
+brief that is refused, unreachable within 2 s, or not the documented shape is logged, and the call
+is answered with the bot's own configuration. Neither the secret nor the token is logged.
+`pipecat_siphon.VoiceSessionClient` and `VoiceSession` are the same pieces for a bot of your own.
+
 `examples/probe.py` speaks the engine's half of the media wire — connect, `start`, stream silence
 — and reports how much audio comes back and how long the first frame took. No phone, no SIP
 stack, no engine. It is the fastest way to tell "the AI is broken" from "the media path is
