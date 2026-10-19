@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
+The package gains two pieces beside the serializer: `PlacedCalls`, which places a call through
+siphon-sip's control plane and follows it to an outcome, and `VoiceSessionClient` /
+`VoiceSession`, which fetch a siphon-pbx voice session's brief and send its report. It now names
+`aiohttp`, which pipecat already required at the same range. `__version__` reads 0.3.0; it had
+been left at 0.1.0 since the first release.
+
 ### Added
 
 - **The agent example can call the caller back.** With `BOT_CALL_BACK_URI` set (a SIP URI with
