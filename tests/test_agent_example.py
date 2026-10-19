@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from loguru import logger
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -2024,7 +2025,9 @@ class TestObserverHook:
         )
         monkeypatch.setattr(agent_bot, "build_speech_to_text", FrameProcessor)
         monkeypatch.setattr(
-            agent_bot, "build_llm_service", lambda with_hangup, brief=None: FrameProcessor()
+            agent_bot,
+            "build_llm_service",
+            lambda with_hangup, brief=None, call_back=False: FrameProcessor(),
         )
         monkeypatch.setattr(agent_bot, "build_text_to_speech", FrameProcessor)
         monkeypatch.setattr(agent_bot, "PipelineWorker", _RecordingWorker)
@@ -3543,3 +3546,387 @@ class TestTheOutcomeIsReported:
         assert b'"outcome":"failed"' in request["body"]
         assert any(type(frame).__name__ == "EndWorkerFrame" for frame in queued)
         assert isinstance(session.reported, Failed)
+
+
+CALL_BACK_TEMPLATE = "sip:{number}@trunk.example.invalid;user=phone"
+
+
+class TestAssertedNumber:
+    """The number a callback rings is the one the network asserted, and only that."""
+
+    @pytest.mark.parametrize(
+        ("fixture", "expected"),
+        [
+            ("ASSERTED_SIP", "+15550123"),
+            ("ASSERTED_TEL", "+15550124"),
+            ("ASSERTED_TWICE", "+15550125"),
+            ("ASSERTED_IN_ONE_LINE", "+15550126"),
+            ("ASSERTED_LOWER_CASE", "+15550127"),
+            ("ASSERTED_BUT_WITHHELD", None),
+            ("NOT_ASSERTED", None),
+        ],
+    )
+    def test_reads_the_asserted_identity(self, fixture: str, expected: str | None) -> None:
+        import control_event_fixtures
+        from agent_bot import asserted_number
+
+        assert asserted_number(getattr(control_event_fixtures, fixture)) == expected
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            "a string",
+            {},
+            {"invite": None},
+            {"invite": {"headers": "P-Asserted-Identity: <tel:+15550123>"}},
+            {"invite": {"headers": [["P-Asserted-Identity"]]}},
+            {"invite": {"headers": [["P-Asserted-Identity", 15550123]]}},
+            {"invite": {"headers": [[None, "<tel:+15550123>"]]}},
+            {"invite": {"headers": [["P-Asserted-Identity", "<tel:+1555>"]]}},
+            {"invite": {"headers": [["P-Asserted-Identity", "<sip:+15550123>"]]}},
+            {"invite": {"headers": [["P-Asserted-Identity", "<tel:+15550123;ext=1"]]}},
+            {"invite": {"headers": [["P-Asserted-Identity", "<mailto:a@example.invalid>"]]}},
+        ],
+    )
+    def test_anything_else_is_no_number_and_never_raises(self, payload: Any) -> None:
+        from agent_bot import asserted_number
+
+        assert asserted_number(payload) is None
+
+
+class _HandedOverCall(_FakeControlCall):
+    """A handed-over call, with the `StasisStart` payload siphon gives it."""
+
+    def __init__(self, sip_call_id: str, payload: Any) -> None:
+        super().__init__(sip_call_id=sip_call_id, channel_id="handed-over-1")
+        self.payload = payload
+
+
+class _CallBackRequest(_ResultOnly):
+    """One `call_back` tool call, on the call `app_resources` describes."""
+
+    def __init__(self, arguments: dict[str, Any], app_resources: Any) -> None:
+        super().__init__(arguments)
+        self.app_resources = app_resources
+
+
+class _CallingBack:
+    """A bot with call_back configured, on one handed-over call, and what it placed."""
+
+    SIP_CALL_ID = "handed-over@example.invalid"
+
+    def __init__(self, payload: Any, client: _PlacingClient | None = None) -> None:
+        from agent_bot import CallBacks, CallBackSettings, CallResources
+
+        self.client = client or _PlacingClient()
+        self.control = _placing_control(self.client)
+        self.settings = CallBackSettings(
+            uri_template=CALL_BACK_TEMPLATE,
+            ws_uri="ws://198.51.100.10:9001/stream?call={call_id}",
+            from_uri="sip:service@example.invalid",
+            profile="agent",
+            maximum_delay_minutes=60,
+        )
+        self.control.call_backs = CallBacks(self.control, self.settings)
+        self.call = _HandedOverCall(self.SIP_CALL_ID, payload)
+        self.resources = CallResources(
+            serializer=SimpleNamespace(call_id=self.SIP_CALL_ID),  # type: ignore[arg-type]
+            speech=_FinishedSpeech(),  # type: ignore[arg-type]
+            control=self.control,
+        )
+        self.holding: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> "_CallingBack":
+        self.holding = asyncio.create_task(self.control._handle_call(self.call))
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *_exception: object) -> None:
+        self.call.end()
+        if self.holding is not None:
+            await self.holding
+        assert self.control.call_backs is not None
+        self.control.call_backs.cancel_all()
+
+    async def ask(self, **arguments: Any) -> Any:
+        from agent_bot import call_back
+
+        request = _CallBackRequest(arguments, self.resources)
+        await call_back(request)  # type: ignore[arg-type]
+        (result,) = request.results
+        return result
+
+    async def hang_up_and_settle(self) -> None:
+        self.call.end()
+        if self.holding is not None:
+            await self.holding
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+
+@pytest.fixture
+def _quick_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_bot
+
+    monkeypatch.setattr(agent_bot, "CALL_BACK_SECONDS_PER_MINUTE", 0.05)
+
+
+@pytest.mark.usefixtures("_quick_minutes")
+class TestCallingBack:
+    """The model arranges a callback; the bot rings the asserted number once the call is over."""
+
+    async def test_rings_the_asserted_number_once_this_call_is_over(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        async with _CallingBack(ASSERTED_SIP) as bot:
+            result = await bot.ask(minutes=0, reason="the invoice they asked about")
+            assert result == {"scheduled": True, "in_minutes": 0}
+            await asyncio.sleep(0.1)
+            assert bot.client.originated == [], "rang back while the caller was still on"
+
+            await bot.hang_up_and_settle()
+
+            (originate,) = bot.client.originated
+            assert originate["to"] == "sip:+15550123@trunk.example.invalid;user=phone"
+            assert originate["from_uri"] == "sip:service@example.invalid"
+            assert originate["ws_uri"].startswith("ws://198.51.100.10:9001/stream?call={call_id}")
+            assert originate["profile"] == "agent"
+            assert originate["timeout"] == 30
+            (placed,) = bot.control.placed_calls.pending()
+            assert placed.context == {"reason": "the invoice they asked about"}
+
+    async def test_waits_the_minutes_it_was_asked_to(self) -> None:
+        from control_event_fixtures import ASSERTED_TEL
+
+        async with _CallingBack(ASSERTED_TEL) as bot:
+            assert await bot.ask(minutes=3, reason="x") == {"scheduled": True, "in_minutes": 3}
+            await bot.hang_up_and_settle()
+            await asyncio.sleep(0.1)
+            assert bot.client.originated == []
+            await asyncio.sleep(0.15)
+            assert [originate["to"] for originate in bot.client.originated] == [
+                "sip:+15550124@trunk.example.invalid;user=phone"
+            ]
+
+    @pytest.mark.parametrize("fixture", ["ASSERTED_BUT_WITHHELD", "NOT_ASSERTED"])
+    async def test_no_asserted_number_arranges_nothing(self, fixture: str) -> None:
+        import control_event_fixtures
+
+        async with _CallingBack(getattr(control_event_fixtures, fixture)) as bot:
+            result = await bot.ask(minutes=0, reason="x")
+            await bot.hang_up_and_settle()
+
+        assert result["available"] is False
+        assert bot.client.originated == []
+
+    async def test_a_call_with_no_control_handle_arranges_nothing(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        async with _CallingBack(ASSERTED_SIP) as bot:
+            bot.resources.serializer = SimpleNamespace(call_id="unknown@example.invalid")  # type: ignore[assignment]
+            result = await bot.ask(minutes=0, reason="x")
+
+        assert result["available"] is False
+
+    @pytest.mark.parametrize("minutes", [-1, 61, "5", True, 2.5, None])
+    async def test_minutes_out_of_range_are_refused(self, minutes: Any) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        async with _CallingBack(ASSERTED_SIP) as bot:
+            result = await bot.ask(minutes=minutes, reason="x")
+            await bot.hang_up_and_settle()
+
+        assert "error" in result
+        assert bot.client.originated == []
+
+    async def test_one_callback_per_number(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        async with _CallingBack(ASSERTED_SIP) as bot:
+            await bot.ask(minutes=0, reason="first")
+            second = await bot.ask(minutes=5, reason="second")
+            await bot.hang_up_and_settle()
+
+            assert "error" in second
+            assert len(bot.client.originated) == 1
+
+    async def test_the_reason_is_cut_to_its_cap(self) -> None:
+        import agent_bot
+        from control_event_fixtures import ASSERTED_SIP
+
+        async with _CallingBack(ASSERTED_SIP) as bot:
+            await bot.ask(minutes=0, reason="  " + "r" * 500 + "  ")
+            await bot.hang_up_and_settle()
+            (placed,) = bot.control.placed_calls.pending()
+
+        assert placed.context["reason"] == "r" * agent_bot.CALL_BACK_REASON_MAXIMUM_LENGTH
+
+    async def test_a_refused_originate_is_logged_masked_and_frees_the_number(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+        try:
+            async with _CallingBack(
+                ASSERTED_SIP, _PlacingClient(error=RuntimeError("refused"))
+            ) as bot:
+                await bot.ask(minutes=0, reason="x")
+                await bot.hang_up_and_settle()
+                assert len(bot.client.originated) == 1
+                assert bot.control.call_backs is not None
+                assert bot.control.call_backs.pending() == []
+        finally:
+            logger.remove(sink)
+
+        assert any("callback" in line and "failed" in line for line in lines)
+        assert not any("5550123" in line for line in lines)
+
+    async def test_stopping_the_bot_logs_every_callback_it_loses(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="ERROR")
+        try:
+            async with _CallingBack(ASSERTED_SIP) as bot:
+                await bot.ask(minutes=30, reason="x")
+                assert bot.control.call_backs is not None
+                bot.control.call_backs.cancel_all()
+                await bot.hang_up_and_settle()
+        finally:
+            logger.remove(sink)
+
+        assert bot.client.originated == []
+        assert any("lost" in line for line in lines)
+        assert not any("5550123" in line for line in lines)
+
+    async def test_nothing_logged_shows_the_whole_number(self) -> None:
+        from control_event_fixtures import ASSERTED_SIP
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+        try:
+            async with _CallingBack(ASSERTED_SIP) as bot:
+                await bot.ask(minutes=0, reason="x")
+                await bot.hang_up_and_settle()
+                assert len(bot.client.originated) == 1
+        finally:
+            logger.remove(sink)
+
+        assert any("callback" in line for line in lines)
+        assert not any("5550123" in line for line in lines)
+
+
+class TestCallBackIsOfferedOnlyWhenConfigured:
+    def test_offered_with_a_control_plane_that_can_call_back(self) -> None:
+        from agent_bot import build_tool_schemas
+
+        offered = {
+            schema.name: schema for schema in build_tool_schemas(True, None, call_back_minutes=60)
+        }
+        assert "call_back" in offered
+        minutes = offered["call_back"].properties["minutes"]
+        assert (minutes["minimum"], minutes["maximum"]) == (0, 60)
+        assert offered["call_back"].required == ["minutes", "reason"]
+
+    def test_not_offered_otherwise(self) -> None:
+        from agent_bot import build_tool_schemas
+
+        assert "call_back" not in [schema.name for schema in build_tool_schemas(True, None)]
+        assert "call_back" not in [
+            schema.name for schema in build_tool_schemas(False, None, call_back_minutes=60)
+        ]
+
+    def test_the_prompt_mentions_it_only_when_offered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        with_it: Any = agent_bot.build_llm_service(with_hangup=True, call_back=True).settings
+        without: Any = agent_bot.build_llm_service(with_hangup=True).settings
+        assert "call_back" in with_it.system_instruction
+        assert "call_back" not in without.system_instruction
+
+    def test_the_worker_offers_it_when_the_control_plane_can_call_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "")
+        monkeypatch.setattr(agent_bot, "build_speaking_language_controller", lambda: None)
+        offered = _record_tool_lists(monkeypatch)
+        control = _placing_control(_PlacingClient())
+        websocket: Any = object()
+
+        agent_bot.build_worker(websocket, control)
+        control.call_backs = agent_bot.CallBacks(
+            control,
+            agent_bot.CallBackSettings(
+                uri_template=CALL_BACK_TEMPLATE,
+                ws_uri="ws://198.51.100.10:9001/stream?call={call_id}",
+                from_uri=None,
+                profile="agent",
+                maximum_delay_minutes=60,
+            ),
+        )
+        agent_bot.build_worker(websocket, control)
+
+        assert offered == [["end_call"], ["end_call", "call_back"]]
+
+
+class TestCallBackSettings:
+    @staticmethod
+    def _arguments(**overrides: Any) -> Any:
+        fields = {
+            "control_url": "ws://127.0.0.1:9092/control",
+            "call_ws_uri": "ws://198.51.100.10:9001/stream?call={call_id}",
+            "call_profile": "agent",
+        }
+        return SimpleNamespace(**{**fields, **overrides})
+
+    def test_unset_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALL_BACK_URI", "")
+        assert agent_bot.call_back_settings_from_arguments(self._arguments()) is None
+
+    def test_set_reads_the_rest(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALL_BACK_URI", CALL_BACK_TEMPLATE)
+        monkeypatch.setattr(agent_bot, "CALL_BACK_FROM", "sip:service@example.invalid")
+        monkeypatch.setattr(agent_bot, "CALL_BACK_MAXIMUM_DELAY_MINUTES", 15)
+        settings = agent_bot.call_back_settings_from_arguments(self._arguments())
+        assert settings == agent_bot.CallBackSettings(
+            uri_template=CALL_BACK_TEMPLATE,
+            ws_uri="ws://198.51.100.10:9001/stream?call={call_id}",
+            from_uri="sip:service@example.invalid",
+            profile="agent",
+            maximum_delay_minutes=15,
+        )
+
+    @pytest.mark.parametrize(
+        ("template", "overrides", "maximum"),
+        [
+            ("sip:+15550100@trunk.example.invalid", {}, 60),
+            (CALL_BACK_TEMPLATE, {"control_url": None}, 60),
+            (CALL_BACK_TEMPLATE, {"call_ws_uri": None}, 60),
+            (CALL_BACK_TEMPLATE, {}, -1),
+        ],
+    )
+    def test_half_a_configuration_is_refused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        template: str,
+        overrides: dict[str, Any],
+        maximum: int,
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CALL_BACK_URI", template)
+        monkeypatch.setattr(agent_bot, "CALL_BACK_MAXIMUM_DELAY_MINUTES", maximum)
+        with pytest.raises(ValueError):
+            agent_bot.call_back_settings_from_arguments(self._arguments(**overrides))

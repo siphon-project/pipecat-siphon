@@ -174,6 +174,27 @@ class TestPlace:
         assert placed.context == {"reason": "a callback"}
         assert placed.to == "sip:+15550100@trunk.example"
 
+    async def test_logs_name_the_call_by_its_label_and_never_its_destination(self) -> None:
+        """A caller's number rung back is theirs; the logs say only what the bot was told to."""
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+        try:
+            placed = await _registry().place(
+                _FakeClient(),
+                to="sip:+15550199@trunk.example",
+                ws_uri="ws://198.51.100.10:9001/",
+                destination_label="a callback to ******99",
+            )
+            await asyncio.sleep(GUARD_SECONDS * 3)
+        finally:
+            logger.remove(sink)
+
+        assert placed.to == "sip:+15550199@trunk.example"
+        assert any("a callback to ******99" in line for line in lines)
+        assert not any("5550199" in line for line in lines)
+
     async def test_two_calls_get_two_channels(self) -> None:
         client = _FakeClient()
         registry = _registry()

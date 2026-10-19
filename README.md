@@ -443,6 +443,27 @@ URL, so the bot's port must be reachable only by whatever dials it.
 and reads the current temperature, conditions and wind from [open-meteo](https://open-meteo.com/),
 which needs no key. It gives up after 3 s.
 
+### Calling the caller back
+
+With a control plane, the model can arrange a callback: `call_back(minutes, reason)` rings the
+caller back once this call is over, `minutes` from now, and opens that call as the caller would,
+about `reason`.
+
+| variable | format | default |
+|---|---|---|
+| `BOT_CALL_BACK_URI` | SIP URI with `{number}` in it (`sip:{number}@trunk.example.invalid;user=phone`) | unset: no `call_back` tool |
+| `BOT_CALL_BACK_MAX_DELAY` | minutes | 60 |
+| `BOT_CALL_BACK_FROM` | SIP URI the callback presents | siphon's default |
+
+`{number}` is the number the network asserted for the caller: the first P-Asserted-Identity on
+the INVITE siphon handed over that names a number, `+` and all. The model never names it, and the
+media socket's `caller` parameter is not used, because whoever dials the bot can set it and a
+callback costs money. A call with no asserted number, or one the caller withheld (`Privacy: id`),
+is told the number is not available. There is one callback per number at a time. It needs
+`--control-url` and `BOT_CALL_WS_URI`, and starting with `BOT_CALL_BACK_URI` but without either
+stops the bot. Callbacks are held by the running bot, so stopping it loses any not yet placed,
+and each one lost is logged as an error. Numbers are logged masked.
+
 ### Behind siphon-pbx
 
 When a siphon-pbx flow's voice block hands a call to the bot, the engine dials it with
