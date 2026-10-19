@@ -140,11 +140,11 @@ The half-rate check is the one that earns the scenario. A wire-rate negotiation 
 does nothing still passes a connectivity test, and a downlink rendered at the wrong rate still
 passes "there is audio coming back".
 
-Measured on the development machine, against siphon-rtp 0.9.0 and siphon-sip on 1.9.1: the wire
-came up at 16000 Hz with every one of 200 uplink frames at 640 bytes, 500 Hz returned at **28 900x**
-the control bin and 1300 Hz at **29 100x**, the bot's marker at **7 300x** — and the marker sat
-**4 500x** above its 1200 Hz ghost, against a required 20x. 200 downlink packets, one SSRC, zero
-sequence gaps, 50.3 packets/second.
+Measured on the development machine, against siphon-rtp 0.15.2 and siphon-sip on 1.15.0: the wire
+came up at 16000 Hz with every one of 200 uplink frames at 640 bytes, 500 Hz returned at **28 500x**
+the control bin and 1300 Hz at **28 800x**, the bot's marker at **7 200x** — and the marker sat
+**4 300x** above its 1200 Hz ghost, against a required 20x. 225 downlink packets, one SSRC, zero
+sequence gaps, 50.2 packets/second.
 
 ## Why the timings are trustworthy
 

@@ -67,6 +67,12 @@ All notable changes to this project are documented here. The format follows
   not flip it. Kokoro has no Dutch, so a language the local voice cannot speak natively stops the
   bot at startup. With none of these set, every service is built exactly as before.
 
+### Changed
+
+- **The quickstart and the integration harness run siphon-rtp 0.15.2 and siphon-sip 1.15.0**
+  (were 0.9.0 and 1.9.1). The bridge protocol is unchanged across those releases; all three
+  harness scenarios pass against them.
+
 ### Fixed
 
 - **The agent example takes Google's application default credentials for speech.** With

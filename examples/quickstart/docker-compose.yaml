@@ -30,7 +30,7 @@ services:
   # turn boundaries, and the WebSocket bridge that carries L16 to the bot.
   engine:
     # Override to run a locally built engine — e.g. testing an unreleased fix.
-    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:${SIPHON_RTP_VERSION:-0.9.0}}
+    image: ${SIPHON_RTP_IMAGE:-ghcr.io/siphon-project/siphon-rtp:${SIPHON_RTP_VERSION:-0.15.2}}
     network_mode: host
     restart: unless-stopped
     command:
@@ -211,7 +211,7 @@ services:
   sip:
     # Override to run a locally built SIP stack — e.g. testing an unreleased fix, the same
     # escape hatch the engine has.
-    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:${SIPHON_SIP_VERSION:-1.9.1}}
+    image: ${SIPHON_SIP_IMAGE:-ghcr.io/siphon-project/siphon-sip:${SIPHON_SIP_VERSION:-1.15.0}}
     network_mode: host
     restart: unless-stopped
     depends_on:
