@@ -65,7 +65,7 @@ jobs:
       - name: Install the package at its declared pipecat floor
         run: pip install -e . "pipecat-ai[websocket]==1.8.1" pytest pytest-asyncio websockets
       - name: Test the package only
-        run: pytest -q tests/test_protocol.py tests/test_serializer.py tests/test_end_to_end.py tests/test_outbound.py
+        run: pytest -q tests/test_protocol.py tests/test_serializer.py tests/test_end_to_end.py tests/test_outbound.py tests/test_voice_session.py
 
   # ── The wheel and the sdist have to build, and carry what they claim ──────────────────────
   # Cheap, and it catches the packaging mistakes that are otherwise found at release: a module

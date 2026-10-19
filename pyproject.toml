@@ -25,6 +25,8 @@ classifiers = [
 ]
 dependencies = [
     "pipecat-ai>=1.8.0,<2",
+    # Already required by pipecat-ai at this range; named because voice_session imports it.
+    "aiohttp>=3.11.12,<4",
 ]
 
 [project.urls]

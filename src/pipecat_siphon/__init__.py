@@ -44,11 +44,26 @@ from pipecat_siphon.serializer import (
     SpeechFrameMode,
     StereoInputMode,
 )
+from pipecat_siphon.voice_session import (
+    BriefOption,
+    Chose,
+    Failed,
+    Finished,
+    Report,
+    SessionBrief,
+    VoiceSession,
+    VoiceSessionClient,
+    encode_report,
+    parse_brief,
+    session_token_from,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "BriefOption",
     "CallOutcome",
+    "Chose",
     "ClearData",
     "ControlCall",
     "ControlMessage",
@@ -58,6 +73,8 @@ __all__ = [
     "Endianness",
     "ErrorData",
     "EventData",
+    "Failed",
+    "Finished",
     "MarkData",
     "MediaFormat",
     "PlacedCall",
@@ -67,6 +84,8 @@ __all__ = [
     "PlayStartData",
     "PlayStopData",
     "RenegotiateData",
+    "Report",
+    "SessionBrief",
     "SiphonFrameSerializer",
     "SiphonProtocolError",
     "SpeechData",
@@ -76,8 +95,13 @@ __all__ = [
     "StartData",
     "StereoInputMode",
     "StopData",
+    "VoiceSession",
+    "VoiceSessionClient",
     "__version__",
     "encode_control",
+    "encode_report",
     "outcome_from_event",
+    "parse_brief",
     "parse_control",
+    "session_token_from",
 ]
