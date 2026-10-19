@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The agent example can call the caller back.** With `BOT_CALL_BACK_URI` set (a SIP URI with
+  `{number}`) and a control plane, the model gets a `call_back(minutes, reason)` tool. It rings
+  the number asserted in the handed-over INVITE's P-Asserted-Identity once the call is over,
+  `minutes` later (at most `BOT_CALL_BACK_MAX_DELAY`, 60), and opens that call about `reason`.
+  A withheld or missing identity means no callback, and the model never names the number. There
+  is one callback per number, held in-process: each one lost when the bot stops is logged.
+  `PlacedCalls.place` takes a `destination_label` for logs that must not show the destination.
 - **A bot behind siphon-pbx is briefed before it speaks and reports how the call went.**
   `pipecat_siphon.VoiceSessionClient` fetches a voice session's brief
   (`GET /voice/sessions/{token}`, the bot's secret as a bearer) and sends its one report

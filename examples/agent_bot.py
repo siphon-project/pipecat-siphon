@@ -1095,6 +1095,175 @@ finished playing. Only choose an option the caller asked for."""
 """Appended only when the brief has options. Tool first, words after, as HANGUP_PROMPT explains."""
 
 
+CALL_BACK_URI = os.environ.get("BOT_CALL_BACK_URI", "").strip()
+"""Where a callback rings, as a SIP URI with `{number}` in it. Empty: no call_back tool.
+
+`{number}` is the caller's number as the network asserted it (P-Asserted-Identity), `+` and all:
+`sip:{number}@trunk.example.invalid;user=phone`. Never a number the model names, nor the media
+socket's `caller` parameter, which whoever dials the bot can set: a callback costs money, and a
+model that could choose where it rings could be talked into ringing anyone."""
+
+CALL_BACK_PLACEHOLDER = "{number}"
+
+CALL_BACK_MAXIMUM_DELAY_MINUTES = int(os.environ.get("BOT_CALL_BACK_MAX_DELAY", "") or 60)
+"""The furthest ahead, in minutes, the model may arrange a callback.
+
+Callbacks are held by this process and are lost if it stops; each one lost is logged as an error.
+A cap keeps what a restart can lose small."""
+
+CALL_BACK_FROM = os.environ.get("BOT_CALL_BACK_FROM", "").strip() or None
+"""The From URI a callback presents. Unset: siphon's default for an originate."""
+
+CALL_BACK_RING_TIMEOUT_SECONDS = 30
+"""How long a callback rings before siphon gives up on it."""
+
+CALL_BACK_REASON_MAXIMUM_LENGTH = 200
+"""What the callback is about, cut to this: it becomes the placed call's opening turn."""
+
+CALL_BACK_SECONDS_PER_MINUTE = 60.0
+"""Seconds in one of the tool's minutes. A constant so the tests can shorten a minute."""
+
+ASSERTED_NUMBER = re.compile(r"\+?[0-9]{6,15}")
+"""A number a callback may ring: E.164 digits, with the `+` an assertion usually carries."""
+
+CALL_BACK_PROMPT = """
+
+When the caller asks to be called back, call the call_back tool with how many minutes from now and
+what the call should be about, then tell them when to expect it. It rings the number they are
+calling from; if it says that number is not available, tell them you cannot call them back."""
+"""Appended only when the tool is configured, for the reason HANGUP_PROMPT gives."""
+
+
+@dataclass(frozen=True)
+class CallBackSettings:
+    """Where callbacks ring, how the engine reaches the bot for them, and how far ahead they go."""
+
+    uri_template: str
+    ws_uri: str
+    from_uri: str | None
+    profile: str
+    maximum_delay_minutes: int
+
+
+def call_back_settings_from_arguments(arguments: argparse.Namespace) -> CallBackSettings | None:
+    """Read the callback settings, or None when `BOT_CALL_BACK_URI` is not set.
+
+    Raises:
+        ValueError: If callbacks are configured without what placing one needs.
+
+    """
+    if not CALL_BACK_URI:
+        return None
+    if CALL_BACK_PLACEHOLDER not in CALL_BACK_URI:
+        raise ValueError(
+            f"BOT_CALL_BACK_URI has no {CALL_BACK_PLACEHOLDER}, so every callback would ring the "
+            f"same number: put {CALL_BACK_PLACEHOLDER} where the caller's number goes"
+        )
+    if not arguments.control_url:
+        raise ValueError(
+            "BOT_CALL_BACK_URI places callbacks through the control plane: set --control-url"
+        )
+    if not arguments.call_ws_uri:
+        raise ValueError(
+            "BOT_CALL_BACK_URI needs the address the engine reaches this bot on, with its "
+            "{call_id}: set --call-ws-uri or BOT_CALL_WS_URI"
+        )
+    if CALL_BACK_MAXIMUM_DELAY_MINUTES < 0:
+        raise ValueError(
+            "BOT_CALL_BACK_MAX_DELAY must be 0 or more minutes, not "
+            f"{CALL_BACK_MAXIMUM_DELAY_MINUTES}"
+        )
+    return CallBackSettings(
+        uri_template=CALL_BACK_URI,
+        ws_uri=arguments.call_ws_uri,
+        from_uri=CALL_BACK_FROM,
+        profile=arguments.call_profile,
+        maximum_delay_minutes=CALL_BACK_MAXIMUM_DELAY_MINUTES,
+    )
+
+
+def _identities(value: str) -> list[str]:
+    """Split a P-Asserted-Identity value at the commas between identities, not those quoted."""
+    identities: list[str] = []
+    current: list[str] = []
+    quoted = False
+    bracketed = False
+    for character in value:
+        if character == '"' and not bracketed:
+            quoted = not quoted
+        elif character == "<" and not quoted:
+            bracketed = True
+        elif character == ">" and not quoted:
+            bracketed = False
+        elif character == "," and not quoted and not bracketed:
+            identities.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+    identities.append("".join(current))
+    return identities
+
+
+def _number_in(identity: str) -> str | None:
+    """Return the number a `tel:` or `sip:` identity names, or None if it names none."""
+    opening = identity.find("<")
+    if opening != -1:
+        closing = identity.find(">", opening)
+        if closing == -1:
+            return None
+        uri = identity[opening + 1 : closing]
+    else:
+        uri = identity
+    uri = uri.strip()
+    scheme, _, rest = uri.partition(":")
+    scheme = scheme.lower()
+    if scheme == "tel":
+        number = rest.split(";", 1)[0]
+        # RFC 3966 visual separators carry nothing.
+        number = re.sub(r"[-.()]", "", number)
+    elif scheme in ("sip", "sips"):
+        user, at, _host = rest.partition("@")
+        if not at:
+            return None
+        number = user.split(";", 1)[0]
+    else:
+        return None
+    return number if ASSERTED_NUMBER.fullmatch(number) else None
+
+
+def asserted_number(payload: Any) -> str | None:
+    """Return the caller's number as the network asserted it on a handed-over call, or None.
+
+    Read from the `StasisStart` payload's INVITE headers (`[name, value]` pairs, as siphon's
+    `build_stasis_payload` gives them): the first P-Asserted-Identity naming a number. None when
+    there is none, when the caller withheld their identity (`Privacy: id`), or when the payload is
+    not that shape. Never raises.
+    """
+    invite = payload.get("invite") if isinstance(payload, Mapping) else None
+    headers = invite.get("headers") if isinstance(invite, Mapping) else None
+    if not isinstance(headers, list):
+        return None
+    identities: list[str] = []
+    for pair in headers:
+        if not isinstance(pair, list | tuple) or len(pair) != 2:
+            continue
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        name = name.strip().lower()
+        if name == "privacy" and "id" in (
+            token.strip().lower() for token in re.split(r"[;,]", value)
+        ):
+            return None
+        if name == "p-asserted-identity":
+            identities.extend(_identities(value))
+    for identity in identities:
+        number = _number_in(identity)
+        if number is not None:
+            return number
+    return None
+
+
 def build_voice_session_client(url: str, secret: str) -> VoiceSessionClient | None:
     """Build the client for siphon-pbx's voice sessions, or None when neither half is configured.
 
@@ -1395,6 +1564,10 @@ class ControlPlane:
         self._client: Any | None = None
         self._connected = asyncio.Event()
         self._forgetting: set[asyncio.Task[None]] = set()
+        # Whoever waits for a call to be over: a callback, which must not ring during the call.
+        self._endings: dict[str, list[asyncio.Future[None]]] = {}
+        # Set when callbacks are configured; the call_back tool exists only then.
+        self.call_backs: CallBacks | None = None
 
     def attach_client(self, client: Any) -> None:
         """Make `client` the connection calls are placed on: the live one, once it is up."""
@@ -1489,9 +1662,20 @@ class ControlPlane:
             )
         self._deliver_transfer_verdict(sip_call_id, verdict)
 
+    async def wait_until_over(self, sip_call_id: str) -> None:
+        """Return once the call is no longer one this control plane holds."""
+        if sip_call_id not in self._calls:
+            return
+        ending: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._endings.setdefault(sip_call_id, []).append(ending)
+        await ending
+
     def _forget(self, sip_call_id: str) -> None:
-        """Drop a call that has ended, and answer whoever still waits on its transfer."""
+        """Drop a call that has ended, and answer whoever still waits on its transfer or end."""
         self._calls.pop(sip_call_id, None)
+        for ending in self._endings.pop(sip_call_id, []):
+            if not ending.done():
+                ending.set_result(None)
         # siphon flushes `call_ended` before the stream closes, so this is the fallback for a
         # stream that closed without one: the call is gone all the same.
         self._deliver_transfer_verdict(
@@ -1523,6 +1707,7 @@ class ControlPlane:
             profile=request.profile,
             ring_timeout=request.ring_timeout,
             context=request.context,
+            destination_label=request.destination_label,
             # The placed call's events are read by `PlacedCall`, the stream's only reader; the
             # transfer verdicts among them still have to land here.
             on_event=lambda event: self._watch_event(joined.get("sip_call_id"), event),
@@ -1647,6 +1832,8 @@ class CallRequest:
     profile: str
     ring_timeout: int
     context: Mapping[str, str]
+    # What the logs call the destination, when the number is not the operator's to see in full.
+    destination_label: str | None = None
 
 
 def call_request_from_arguments(arguments: argparse.Namespace) -> CallRequest | None:
@@ -1704,6 +1891,111 @@ async def place_one_call(control: ControlPlane, request: CallRequest) -> int:
         return 1
     logger.info(f"the call to {request.to} is over: {ended}")
     return 0
+
+
+class CallBacks:
+    """The callbacks arranged and not yet placed, at most one per number.
+
+    Each waits its minutes, then for the call it was arranged on to be over, so that 0 minutes is
+    "right after this call" and never during it, and then rings through `ControlPlane.place` like
+    `--call` does. They live in this process: stopping it loses them, and each lost is logged.
+    """
+
+    def __init__(self, control: ControlPlane, settings: CallBackSettings) -> None:
+        """Hold callbacks for `control`, placed as `settings` says."""
+        self.settings = settings
+        self._control = control
+        self._pending: dict[str, tuple[asyncio.Task[None], int]] = {}
+
+    def pending(self) -> list[str]:
+        """List the numbers a callback is arranged for and not yet placed."""
+        return list(self._pending)
+
+    def arrange(self, number: str, minutes: int, reason: str, after_call: str | None) -> bool:
+        """Arrange a callback to `number`. False if one is already arranged for it."""
+        if number in self._pending:
+            return False
+        task = asyncio.create_task(self._ring_back(number, minutes, reason, after_call))
+        self._pending[number] = (task, minutes)
+        logger.info(f"callback to {mask_number(number)} arranged, in {minutes} min")
+        return True
+
+    async def _ring_back(
+        self, number: str, minutes: int, reason: str, after_call: str | None
+    ) -> None:
+        label = f"callback to {mask_number(number)}"
+        try:
+            await asyncio.sleep(minutes * CALL_BACK_SECONDS_PER_MINUTE)
+            if after_call is not None:
+                await self._control.wait_until_over(after_call)
+            request = CallRequest(
+                to=self.settings.uri_template.replace(CALL_BACK_PLACEHOLDER, number),
+                ws_uri=self.settings.ws_uri,
+                from_uri=self.settings.from_uri,
+                profile=self.settings.profile,
+                ring_timeout=CALL_BACK_RING_TIMEOUT_SECONDS,
+                context={"reason": reason} if reason else {},
+                destination_label=label,
+            )
+            logger.info(f"placing the {label}")
+            try:
+                await self._control.place(request)
+            except Exception as error:
+                # The type only: what siphon says about a refused originate can name the target.
+                logger.error(f"the {label} failed: {type(error).__name__}")
+        finally:
+            self._pending.pop(number, None)
+
+    def cancel_all(self) -> None:
+        """Drop every callback not yet placed, logging each: the bot is stopping."""
+        for number, (task, minutes) in list(self._pending.items()):
+            if not task.done():
+                task.cancel()
+                logger.error(
+                    f"callback to {mask_number(number)} arranged for {minutes} min lost: the bot "
+                    "is stopping"
+                )
+        self._pending.clear()
+
+
+async def call_back(params: FunctionCallParams) -> None:
+    """Arrange a callback to the caller's asserted number, `minutes` from now, about `reason`.
+
+    The number is never an argument, for the reason `transfer_call`'s destination is not: a number
+    the model could name is one a caller could talk it into ringing.
+    """
+    resources = params.app_resources
+    if not isinstance(resources, CallResources) or resources.control.call_backs is None:
+        await params.result_callback({"error": "a callback cannot be arranged from here"})
+        return
+    call_backs = resources.control.call_backs
+    maximum = call_backs.settings.maximum_delay_minutes
+    minutes = params.arguments.get("minutes")
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or not 0 <= minutes <= maximum:
+        await params.result_callback(
+            {"error": f"minutes must be a whole number from 0 to {maximum}"}
+        )
+        return
+    raw_reason = params.arguments.get("reason")
+    reason = (
+        raw_reason.strip()[:CALL_BACK_REASON_MAXIMUM_LENGTH] if isinstance(raw_reason, str) else ""
+    )
+
+    sip_call_id = resources.serializer.call_id
+    control_call = resources.control.call_for(sip_call_id)
+    if control_call is None:
+        await params.result_callback(_not_available("this call cannot be called back"))
+        return
+    number = asserted_number(getattr(control_call, "payload", None))
+    if number is None:
+        await params.result_callback(
+            _not_available("the caller's number is withheld or was not passed on")
+        )
+        return
+    if not call_backs.arrange(number, minutes, reason, after_call=sip_call_id):
+        await params.result_callback({"error": "a callback to this caller is already arranged"})
+        return
+    await params.result_callback({"scheduled": True, "in_minutes": minutes})
 
 
 @dataclass
@@ -2405,6 +2697,7 @@ def build_tool_schemas(
     caller_lookup: CallerLookup | None = None,
     weather: bool = False,
     briefed: BriefedCall | None = None,
+    call_back_minutes: int | None = None,
 ) -> list[FunctionSchema]:
     """List the model's tools: hangup and transfer, the PBX's choices, the language switch, lookups.
 
@@ -2412,6 +2705,7 @@ def build_tool_schemas(
     that is never kept, which is the same reason the prompts for them are appended conditionally.
     On a call siphon-pbx briefed, `end_call` reports the conversation finished rather than hanging
     up, since the flow decides what happens next; transfer still needs the control plane.
+    `call_back_minutes`, the furthest ahead a callback may go, offers them; they need it too.
     """
     tools: list[FunctionSchema] = []
     if with_control or briefed is not None:
@@ -2469,6 +2763,30 @@ def build_tool_schemas(
                 properties={},
                 required=[],
                 handler=transfer_call,
+            )
+        )
+    if with_control and call_back_minutes is not None:
+        tools.append(
+            FunctionSchema(
+                name="call_back",
+                description=(
+                    "Arrange for the caller to be called back on the number they are calling "
+                    "from. Call it first, then tell them when to expect the call."
+                ),
+                properties={
+                    "minutes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": call_back_minutes,
+                        "description": "Minutes from now; 0 is as soon as this call is over.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "What the callback is about, in a few words.",
+                    },
+                },
+                required=["minutes", "reason"],
+                handler=call_back,
             )
         )
     if speaking is not None:
@@ -3039,17 +3357,20 @@ def preload_local_models() -> None:
     )
 
 
-def build_llm_service(with_hangup: bool, brief: SessionBrief | None = None) -> LLMService[Any]:
+def build_llm_service(
+    with_hangup: bool, brief: SessionBrief | None = None, call_back: bool = False
+) -> LLMService[Any]:
     """Build the LLM service for the selected backend, tuned for a conversation in real time.
 
     `with_hangup` is a control plane: hangup, and transfer when there is a destination. `brief`
     is siphon-pbx's for this call, whose instructions and options the model is told, and whose
-    `end_call` reports rather than hangs up.
+    `end_call` reports rather than hangs up. `call_back` says the call_back tool is offered.
     """
     system_instruction = (
         resolve_system_prompt(os.environ)
         + (HANGUP_PROMPT if with_hangup or brief is not None else "")
         + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
+        + (CALL_BACK_PROMPT if with_hangup and call_back else "")
         + speaking_language_prompt(configured_speaking_languages())
         + (CALLER_LOOKUP_PROMPT if CALLER_LOOKUP_URL else "")
         + (WEATHER_PROMPT if WEATHER_ENABLED else "")
@@ -3427,8 +3748,11 @@ def build_worker(
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
     speech_to_text = build_speech_to_text()
+    call_backs = control.call_backs if control is not None else None
     llm = build_llm_service(
-        with_hangup=control is not None, brief=session.brief if session is not None else None
+        with_hangup=control is not None,
+        brief=session.brief if session is not None else None,
+        call_back=call_backs is not None,
     )
     text_to_speech = build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
@@ -3447,6 +3771,9 @@ def build_worker(
         caller_lookup=CallerLookup(CALLER_LOOKUP_URL, caller) if CALLER_LOOKUP_URL else None,
         weather=WEATHER_ENABLED,
         briefed=briefed,
+        call_back_minutes=(
+            call_backs.settings.maximum_delay_minutes if call_backs is not None else None
+        ),
     )
     if tools:
         context.set_tools(ToolsSchema(standard_tools=tools))
@@ -3715,6 +4042,12 @@ async def main(
         )
         + (f", caller_lookup -> {CALLER_LOOKUP_URL}" if CALLER_LOOKUP_URL else "")
         + (", weather" if WEATHER_ENABLED else "")
+        + (
+            f", call_back -> {control.call_backs.settings.uri_template} within "
+            f"{control.call_backs.settings.maximum_delay_minutes} min"
+            if control is not None and control.call_backs is not None
+            else ""
+        )
     )
     # Which language the voice speaks, for the same reason: an accent is not visible in a log.
     if speaking_languages.starting is not None:
@@ -3795,6 +4128,8 @@ async def main(
     try:
         await server.serve()
     finally:
+        if control.call_backs is not None:
+            control.call_backs.cancel_all()
         for task in (call_task, control_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -3857,6 +4192,7 @@ def run(arguments: argparse.Namespace, observer_factory: ObserverFactory | None 
     """
     try:
         call = call_request_from_arguments(arguments)
+        call_back_settings = call_back_settings_from_arguments(arguments)
     except ValueError as error:
         sys.exit(str(error))
     control_plane = (
@@ -3870,6 +4206,8 @@ def run(arguments: argparse.Namespace, observer_factory: ObserverFactory | None 
         if arguments.control_url
         else None
     )
+    if control_plane is not None and call_back_settings is not None:
+        control_plane.call_backs = CallBacks(control_plane, call_back_settings)
     try:
         status = asyncio.run(
             main(arguments.host, arguments.port, control_plane, observer_factory, call)

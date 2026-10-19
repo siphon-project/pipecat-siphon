@@ -123,6 +123,10 @@ services:
       # Only for `--call`, a run that places a call rather than waiting for one.
       BOT_CALL_WS_URI: "${BOT_CALL_WS_URI:-}"
       BOT_CALL_CONTEXT: "${BOT_CALL_CONTEXT:-}"
+      # The call_back tool: where it rings (with {number}), how far ahead, and from whom.
+      BOT_CALL_BACK_URI: "${BOT_CALL_BACK_URI:-}"
+      BOT_CALL_BACK_MAX_DELAY: "${BOT_CALL_BACK_MAX_DELAY:-}"
+      BOT_CALL_BACK_FROM: "${BOT_CALL_BACK_FROM:-}"
       # Model choices. Empty leaves the example's own defaults for the selected backend.
       BOT_LLM_MODEL: "${BOT_LLM_MODEL:-}"
       BOT_STT_MODEL: "${BOT_STT_MODEL:-}"

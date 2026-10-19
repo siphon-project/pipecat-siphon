@@ -169,10 +169,15 @@ class PlacedCall:
         context: Mapping[str, str],
         dial_in_timeout_seconds: float,
         release: Callable[[str], None],
+        destination_label: str | None = None,
     ) -> None:
-        """Reserve the call under `channel`. `release` drops it from its registry once it ends."""
+        """Reserve the call under `channel`. `release` drops it from its registry once it ends.
+
+        `destination_label` is what the logs call the destination, `to` itself when not given.
+        """
         self.channel = channel
         self.to = to
+        self.destination_label = destination_label or to
         self.context = dict(context)
         self._dial_in_timeout_seconds = dial_in_timeout_seconds
         self._release = release
@@ -260,7 +265,7 @@ class PlacedCall:
         self._answered.set_result(outcome)
         if self._ring_guard is not None:
             self._ring_guard.cancel()
-        logger.info(f"placed call {self.channel} to {self.to}: {outcome}")
+        logger.info(f"placed call {self.channel} to {self.destination_label}: {outcome}")
         if not self._dialled_in:
             self._dial_in_guard = asyncio.create_task(self._guard_dial_in())
 
@@ -274,15 +279,15 @@ class PlacedCall:
             if guard is not None and guard is not asyncio.current_task():
                 guard.cancel()
         self._release(self.channel)
-        logger.info(f"placed call {self.channel} to {self.to} over: {outcome}")
+        logger.info(f"placed call {self.channel} to {self.destination_label} over: {outcome}")
 
     async def _guard_ringing(self, deadline_seconds: float) -> None:
         await asyncio.sleep(deadline_seconds)
         if self._answered.done():
             return
         logger.error(
-            f"placed call {self.channel} to {self.to}: no answer and no ending from siphon after "
-            f"{deadline_seconds:g}s, past its own ring timeout -- hanging it up"
+            f"placed call {self.channel} to {self.destination_label}: no answer and no ending "
+            f"from siphon after {deadline_seconds:g}s, past its own ring timeout -- hanging it up"
         )
         await self._hang_up()
         self._finish(CallOutcome("timed_out", reason="siphon reported no outcome"))
@@ -292,9 +297,9 @@ class PlacedCall:
         if self._dialled_in or self._ended.done():
             return
         logger.error(
-            f"placed call {self.channel} to {self.to} was answered, but the engine has not dialled "
-            f"the bot after {self._dial_in_timeout_seconds:g}s -- hanging up rather than leaving "
-            "the callee on a silent line"
+            f"placed call {self.channel} to {self.destination_label} was answered, but the engine "
+            f"has not dialled the bot after {self._dial_in_timeout_seconds:g}s -- hanging up "
+            "rather than leaving the callee on a silent line"
         )
         await self._hang_up()
         self._finish(CallOutcome("failed", reason="answered, but the engine never dialled the bot"))
@@ -336,13 +341,15 @@ class PlacedCalls:
         ring_timeout: int = 30,
         context: Mapping[str, str] | None = None,
         on_event: EventListener | None = None,
+        destination_label: str | None = None,
     ) -> PlacedCall:
         """Place a call to `to` whose media the engine brings to `ws_uri` when it is answered.
 
         `ws_uri` is the bot's own address as the engine reaches it, siphon's placeholders and all;
         `placed=<channel>` is added to it. `ring_timeout` is siphon's, in whole seconds. `context`
         travels with the call to whoever claims its dial-in. `on_event` sees every control event
-        on the call, since this is the only reader of its stream.
+        on the call, since this is the only reader of its stream. `destination_label` is what the
+        logs call the destination instead of `to`, for a number that is somebody else's to see.
 
         Raises:
             ValueError: If `ring_timeout` is under one second (siphon reads 0 as "ring forever")
@@ -357,8 +364,9 @@ class PlacedCalls:
             raise ValueError(f"ring_timeout must be at least 1 second, not {ring_timeout}")
         channel = f"placed-{uuid.uuid4().hex}"
         dialled = with_placed_channel(ws_uri, channel)
+        label = destination_label or to
         placed = PlacedCall(
-            channel, to, context or {}, self._dial_in_timeout_seconds, self._release
+            channel, to, context or {}, self._dial_in_timeout_seconds, self._release, label
         )
         # Pending before the INVITE goes out: an instant answer can bring the engine's dial-in
         # ahead of the originate's reply, and it must find its call.
@@ -375,7 +383,7 @@ class PlacedCalls:
             )
         except BaseException as error:
             self._release(channel)
-            logger.error(f"placing a call to {to} failed: {error}")
+            logger.error(f"placing a call to {label} failed: {error}")
             raise
         if not callable(getattr(call, "next_event", None)) or not callable(
             getattr(call, "hangup", None)
@@ -383,13 +391,13 @@ class PlacedCalls:
             self._release(channel)
             message = (
                 f"originate returned a {type(call).__name__}, not the placed call: this control "
-                f"client cannot follow a call it places. The call to {to} rings on until siphon's "
-                "ring timeout; upgrade siphon-control to 0.9.0 or newer"
+                f"client cannot follow a call it places. The call to {label} rings on until "
+                "siphon's ring timeout; upgrade siphon-control to 0.9.0 or newer"
             )
             logger.error(message)
             raise TypeError(message)
         placed._start(call, ring_timeout + self._ring_guard_seconds, on_event)
-        logger.info(f"placed call {channel} to {to}: calling, sip call id {call.sip_call_id}")
+        logger.info(f"placed call {channel} to {label}: calling, sip call id {call.sip_call_id}")
         return placed
 
     def claim(self, query: Mapping[str, str]) -> PlacedCall | None:
