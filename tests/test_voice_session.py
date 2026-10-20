@@ -15,6 +15,9 @@ from loguru import logger
 
 from fake_pbx import FakePbx
 from pbx_fixtures import (
+    BRIEF_CONTEXT_FULL,
+    BRIEF_CONTEXT_ORGANISATION,
+    BRIEF_CONTEXT_UNSET,
     BRIEF_ESCAPED,
     BRIEF_MENU,
     BRIEF_OPEN,
@@ -24,7 +27,12 @@ from pbx_fixtures import (
 )
 from pipecat_siphon import (
     BriefOption,
+    CallContext,
     Chose,
+    ContextCalled,
+    ContextCaller,
+    ContextOrganisation,
+    ContextTrunk,
     Failed,
     Finished,
     SessionBrief,
@@ -125,6 +133,126 @@ class TestParseBrief:
         document = json.loads(BRIEF_OPEN)
         document["instructions"] = "x" * MAX_BRIEF_BYTES
         assert parse_brief(json.dumps(document).encode()) is None
+
+
+ORGANISATION = ContextOrganisation(
+    id="00000000-0000-4000-8000-00000000000a",
+    name="Example Office",
+    time_zone="Europe/Amsterdam",
+    external_ref="CUST-0042",
+    locale="nl",
+)
+
+
+class TestCallContext:
+    """`context`, as siphon-pbx's own `CallContext` serializer puts it in the brief."""
+
+    def test_a_brief_without_one_has_none(self) -> None:
+        brief = parse_brief(BRIEF_MENU)
+        assert brief is not None
+        assert brief.context is None
+
+    def test_full(self) -> None:
+        brief = parse_brief(BRIEF_CONTEXT_FULL)
+        assert brief is not None
+        assert brief.context == CallContext(
+            organisation=ORGANISATION,
+            called=ContextCalled(
+                uri="sip:+15550100@pbx.example.invalid;user=phone", number="+15550100"
+            ),
+            caller=ContextCaller(privacy="none", number="+15550142", display_name="Test Caller"),
+            direction="inbound",
+            trunk=ContextTrunk(id="22222222-2222-4222-8222-222222222222", name="Carrier"),
+        )
+
+    def test_organisation_only(self) -> None:
+        brief = parse_brief(BRIEF_CONTEXT_ORGANISATION)
+        assert brief is not None
+        assert brief.context == CallContext(
+            organisation=ContextOrganisation(
+                id="00000000-0000-4000-8000-00000000000a",
+                name="Example Office",
+                time_zone="Europe/Amsterdam",
+                external_ref="CUST-0042",
+                locale="en",
+            )
+        )
+
+    def test_unset_values_and_a_withheld_caller(self) -> None:
+        brief = parse_brief(BRIEF_CONTEXT_UNSET)
+        assert brief is not None
+        context = brief.context
+        assert context is not None
+        assert context.organisation.external_ref is None
+        assert context.organisation.locale is None
+        assert context.called == ContextCalled(uri="sip:5550199@pbx.example.invalid")
+        assert context.caller == ContextCaller(privacy="id")
+        assert context.direction == "outbound"
+        assert context.trunk is None
+
+    def test_a_withheld_caller_never_carries_a_number_even_if_sent_one(self) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        document["context"]["caller"]["privacy"] = "id"
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None and brief.context is not None
+        assert brief.context.caller == ContextCaller(privacy="id")
+
+    def test_a_privacy_it_does_not_know_reads_as_withheld(self) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        document["context"]["caller"]["privacy"] = "header"
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None and brief.context is not None
+        assert brief.context.caller == ContextCaller(privacy="id")
+
+    def test_a_direction_it_does_not_know_reads_as_none(self) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        document["context"]["direction"] = "sideways"
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None and brief.context is not None
+        assert brief.context.direction is None
+        assert brief.context.organisation == ORGANISATION
+
+    @pytest.mark.parametrize("version", [0, 2, "1", None, True])
+    def test_a_version_it_does_not_know_is_no_context(self, version: Any) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        document["context"]["version"] = version
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None
+        assert brief.context is None
+        assert brief.call_id == "b2b-00000000000000a1@example.invalid"
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("context",), "a string"),
+            (("context", "organisation"), None),
+            (("context", "organisation", "name"), 7),
+            (("context", "organisation", "external_ref"), 42),
+            (("context", "called", "uri"), None),
+            (("context", "called", "number"), 15550100),
+            (("context", "caller", "display_name"), ["Test"]),
+            (("context", "trunk"), "Carrier"),
+        ],
+    )
+    def test_a_malformed_context_drops_only_the_context(
+        self, path: tuple[str, ...], value: Any
+    ) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        target = document
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None
+        assert brief.context is None
+        assert brief.instructions == "Ask what the caller wants."
+
+    def test_fields_it_does_not_know_are_ignored(self) -> None:
+        document = json.loads(BRIEF_CONTEXT_FULL)
+        document["context"]["later"] = {"x": 1}
+        document["context"]["caller"]["verified"] = True
+        document["context"]["called"]["label"] = "Sales line"
+        assert parse_brief(json.dumps(document).encode()) == parse_brief(BRIEF_CONTEXT_FULL)
 
 
 class TestEncodeReport:

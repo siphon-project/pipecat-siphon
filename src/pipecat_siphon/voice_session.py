@@ -21,7 +21,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -57,6 +57,60 @@ class BriefOption:
     means: str = ""
 
 
+CONTEXT_VERSION = 1
+"""The `context` version this reads. Any other counts as no context at all, as siphon-pbx asks."""
+
+
+@dataclass(frozen=True)
+class ContextOrganisation:
+    """The organisation whose call it is. `external_ref` is the operator's own key for it."""
+
+    id: str
+    name: str
+    time_zone: str
+    external_ref: str | None = None
+    locale: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextCalled:
+    """The number dialled: the request URI as received, and E.164 where the PBX could make it."""
+
+    uri: str
+    number: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextCaller:
+    """Who is calling. A withheld caller (`privacy` "id") carries neither number nor name."""
+
+    privacy: Literal["none", "id"]
+    number: str | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextTrunk:
+    """The organisation's own trunk the call came over, when exactly one matched its source."""
+
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """Whose call it is, as much as the bot's `context` setting in siphon-pbx lets it be told.
+
+    `organisation` alone for a bot set to `organisation`; the rest too, where known, for `full`.
+    """
+
+    organisation: ContextOrganisation
+    called: ContextCalled | None = None
+    caller: ContextCaller | None = None
+    direction: Literal["inbound", "outbound"] | None = None
+    trunk: ContextTrunk | None = None
+
+
 @dataclass(frozen=True)
 class SessionBrief:
     """What a bot is told about the call it has been handed.
@@ -69,6 +123,8 @@ class SessionBrief:
     instructions: str
     options: tuple[BriefOption, ...]
     deadline_secs: int
+    # None for a PBX that sends none, a bot set to `none`, or a context this cannot read.
+    context: CallContext | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +157,92 @@ def _option_from(value: Any) -> BriefOption | None:
     if not isinstance(option, str) or not option or not isinstance(means, str):
         return None
     return BriefOption(option=option, means=means)
+
+
+class _Malformed(Exception):
+    """A `context` field of the wrong shape: the context is dropped, the brief is kept."""
+
+
+def _text(document: Mapping[str, Any], key: str) -> str:
+    value = document.get(key)
+    if not isinstance(value, str):
+        raise _Malformed(key)
+    return value
+
+
+def _optional_text(document: Mapping[str, Any], key: str) -> str | None:
+    value = document.get(key)
+    if value is not None and not isinstance(value, str):
+        raise _Malformed(key)
+    return value
+
+
+def _part(document: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
+    value = document.get(key)
+    if value is not None and not isinstance(value, Mapping):
+        raise _Malformed(key)
+    return value
+
+
+def _caller_from(document: Mapping[str, Any]) -> ContextCaller:
+    number = _optional_text(document, "number")
+    display_name = _optional_text(document, "display_name")
+    if document.get("privacy") != "none":
+        # Withheld, or a privacy this does not know: read as withheld either way, and whatever came
+        # with it is not kept. The PBX never undoes a caller's withholding, and neither does this.
+        return ContextCaller(privacy="id")
+    return ContextCaller(privacy="none", number=number, display_name=display_name)
+
+
+def parse_context(value: Any) -> CallContext | None:
+    """Read a brief's `context`: None if there is none, of another version, or it is malformed.
+
+    Never raises. A malformed context drops the context and nothing else: the call is still served,
+    with the bot's own configuration.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        logger.warning("the brief's context is not an object; serving without it")
+        return None
+    version = value.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != CONTEXT_VERSION:
+        logger.info(
+            f"the brief's context is version {version!r}, not {CONTEXT_VERSION}; ignoring it"
+        )
+        return None
+    try:
+        organisation = _part(value, "organisation")
+        if organisation is None:
+            raise _Malformed("organisation")
+        called = _part(value, "called")
+        caller = _part(value, "caller")
+        trunk = _part(value, "trunk")
+        direction = value.get("direction")
+        return CallContext(
+            organisation=ContextOrganisation(
+                id=_text(organisation, "id"),
+                name=_text(organisation, "name"),
+                time_zone=_text(organisation, "time_zone"),
+                external_ref=_optional_text(organisation, "external_ref"),
+                locale=_optional_text(organisation, "locale"),
+            ),
+            called=(
+                ContextCalled(uri=_text(called, "uri"), number=_optional_text(called, "number"))
+                if called is not None
+                else None
+            ),
+            caller=_caller_from(caller) if caller is not None else None,
+            direction=direction if direction in ("inbound", "outbound") else None,
+            trunk=(
+                ContextTrunk(id=_text(trunk, "id"), name=_text(trunk, "name"))
+                if trunk is not None
+                else None
+            ),
+        )
+    except _Malformed as malformed:
+        logger.warning(f"the brief's context has a malformed {malformed}; serving without it")
+        return None
 
 
 def parse_brief(raw: bytes | str) -> SessionBrief | None:
@@ -142,6 +284,7 @@ def parse_brief(raw: bytes | str) -> SessionBrief | None:
         instructions=instructions,
         options=tuple(options),
         deadline_secs=deadline,
+        context=parse_context(document.get("context")),
     )
 
 
