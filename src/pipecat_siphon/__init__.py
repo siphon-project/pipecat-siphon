@@ -46,7 +46,12 @@ from pipecat_siphon.serializer import (
 )
 from pipecat_siphon.voice_session import (
     BriefOption,
+    CallContext,
     Chose,
+    ContextCalled,
+    ContextCaller,
+    ContextOrganisation,
+    ContextTrunk,
     Failed,
     Finished,
     Report,
@@ -55,6 +60,7 @@ from pipecat_siphon.voice_session import (
     VoiceSessionClient,
     encode_report,
     parse_brief,
+    parse_context,
     session_token_from,
 )
 
@@ -62,9 +68,14 @@ __version__ = "0.3.0"
 
 __all__ = [
     "BriefOption",
+    "CallContext",
     "CallOutcome",
     "Chose",
     "ClearData",
+    "ContextCalled",
+    "ContextCaller",
+    "ContextOrganisation",
+    "ContextTrunk",
     "ControlCall",
     "ControlMessage",
     "Direction",
@@ -102,6 +113,7 @@ __all__ = [
     "encode_report",
     "outcome_from_event",
     "parse_brief",
+    "parse_context",
     "parse_control",
     "session_token_from",
 ]

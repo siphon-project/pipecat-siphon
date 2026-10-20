@@ -2027,7 +2027,7 @@ class TestObserverHook:
         monkeypatch.setattr(
             agent_bot,
             "build_llm_service",
-            lambda with_hangup, brief=None, call_back=False: FrameProcessor(),
+            lambda with_hangup, **_settings: FrameProcessor(),
         )
         monkeypatch.setattr(agent_bot, "build_text_to_speech", FrameProcessor)
         monkeypatch.setattr(agent_bot, "PipelineWorker", _RecordingWorker)
@@ -3930,3 +3930,420 @@ class TestCallBackSettings:
         monkeypatch.setattr(agent_bot, "CALL_BACK_MAXIMUM_DELAY_MINUTES", maximum)
         with pytest.raises(ValueError):
             agent_bot.call_back_settings_from_arguments(self._arguments(**overrides))
+
+
+def _write(directory: Path, name: str, text: str) -> None:
+    (directory / name).write_text(text, encoding="utf-8")
+
+
+class TestCallConfigurationLoader:
+    """One YAML file per configuration key, read per call; anything wrong falls back loudly."""
+
+    @pytest.fixture(autouse=True)
+    def _defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.delenv("BOT_SYSTEM_PROMPT", raising=False)
+        monkeypatch.delenv("BOT_SYSTEM_PROMPT_FILE", raising=False)
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "sip:default-desk@example.invalid")
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+
+    def test_no_directory_or_no_key_is_the_bots_own(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        defaults = agent_bot.default_configuration()
+        assert defaults.key is None
+        assert defaults.transfer_target == "sip:default-desk@example.invalid"
+        assert defaults.system_prompt == agent_bot.resolve_system_prompt({})
+        assert agent_bot.load_configuration("", "CUST-0042") == defaults
+        assert agent_bot.load_configuration(str(tmp_path), None) == defaults
+
+    def test_a_file_overrides_what_it_names(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        _write(
+            tmp_path,
+            "CUST-0042.yaml",
+            "system_prompt: You answer the phone for a dental practice.\n"
+            "transfer_target: sip:front-desk@example.invalid\n"
+            "caller_lookup_url: https://accounts.example.invalid/patients/{caller}\n"
+            "caller_lookup_description: Look up the caller's next appointment.\n",
+        )
+        loaded = agent_bot.load_configuration(str(tmp_path), "CUST-0042")
+        assert loaded == agent_bot.CallConfiguration(
+            key="CUST-0042",
+            system_prompt="You answer the phone for a dental practice.",
+            transfer_target="sip:front-desk@example.invalid",
+            caller_lookup_url="https://accounts.example.invalid/patients/{caller}",
+            caller_lookup_description="Look up the caller's next appointment.",
+        )
+
+    def test_what_a_file_leaves_out_stays_the_bots_own(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        _write(tmp_path, "quiet.yaml", "transfer_target: ''\n")
+        loaded = agent_bot.load_configuration(str(tmp_path), "quiet")
+        defaults = agent_bot.default_configuration()
+        assert loaded.transfer_target == ""
+        assert loaded.system_prompt == defaults.system_prompt
+        assert loaded.key == "quiet"
+
+    def test_a_prompt_file_is_read_beside_the_configuration(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        _write(tmp_path, "office-prompt.md", "You answer for an office.\n")
+        _write(tmp_path, "office.yaml", "system_prompt_file: office-prompt.md\n")
+        loaded = agent_bot.load_configuration(str(tmp_path), "office")
+        assert loaded.system_prompt == "You answer for an office."
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "system_prompt: [not, text]\n",
+            "transfer_target: 42\n",
+            "colour: blue\n",
+            "- a list\n",
+            "system_prompt: a\nsystem_prompt_file: b.md\n",
+            "caller_lookup_url: https://accounts.example.invalid/patients\n",
+            "system_prompt_file: ../outside.md\n",
+            "system_prompt_file: missing.md\n",
+            "system_prompt: '   '\n",
+            "{unclosed\n",
+        ],
+    )
+    def test_a_file_that_is_wrong_falls_back_and_says_so(self, tmp_path: Path, text: str) -> None:
+        import agent_bot
+
+        (tmp_path.parent / "outside.md").write_text("escaped", encoding="utf-8")
+        _write(tmp_path, "broken.yaml", text)
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="ERROR")
+        try:
+            loaded = agent_bot.load_configuration(str(tmp_path), "broken")
+        finally:
+            logger.remove(sink)
+        assert loaded == agent_bot.default_configuration()
+        assert any("broken" in line for line in lines)
+
+    def test_a_key_with_no_file_falls_back(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        assert agent_bot.load_configuration(str(tmp_path), "nobody") == (
+            agent_bot.default_configuration()
+        )
+
+    @pytest.mark.parametrize("key", ["../etc/passwd", "a/b", "", "x" * 65, "CUST 42", ".hidden"])
+    def test_a_key_that_is_not_a_plain_name_reads_nothing(self, tmp_path: Path, key: str) -> None:
+        import agent_bot
+
+        _write(tmp_path, ".hidden.yaml", "transfer_target: sip:x@example.invalid\n")
+        assert agent_bot.load_configuration(str(tmp_path), key) == (
+            agent_bot.default_configuration()
+        )
+
+    def test_startup_names_every_file_that_would_fall_back(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        _write(tmp_path, "good.yaml", "transfer_target: sip:x@example.invalid\n")
+        _write(tmp_path, "bad-one.yaml", "colour: blue\n")
+        _write(tmp_path, "bad-two.yaml", "transfer_target: 42\n")
+        with pytest.raises(ValueError) as refused:
+            agent_bot.check_configurations(str(tmp_path))
+        assert "bad-one" in str(refused.value)
+        assert "bad-two" in str(refused.value)
+        assert "good" not in str(refused.value).replace("bad", "")
+
+    def test_startup_refuses_a_directory_that_is_not_there(self, tmp_path: Path) -> None:
+        import agent_bot
+
+        with pytest.raises(ValueError):
+            agent_bot.check_configurations(str(tmp_path / "absent"))
+        agent_bot.check_configurations("")
+
+
+class TestCallFacts:
+    """Whose call it is: from siphon-pbx's brief, or from siphon-sip's handover."""
+
+    def test_from_a_full_pbx_context(self) -> None:
+        import agent_bot
+        from pbx_fixtures import BRIEF_CONTEXT_FULL
+        from pipecat_siphon import parse_brief
+
+        brief = parse_brief(BRIEF_CONTEXT_FULL)
+        assert brief is not None
+        facts = agent_bot.call_facts_from_context(brief.context)
+        assert facts.configuration_key == "CUST-0042"
+        assert facts.caller == "15550142"
+        assert facts.organisation is not None
+        assert facts.organisation.name == "Example Office"
+
+    def test_from_an_organisation_only_context(self) -> None:
+        import agent_bot
+        from pbx_fixtures import BRIEF_CONTEXT_ORGANISATION
+        from pipecat_siphon import parse_brief
+
+        brief = parse_brief(BRIEF_CONTEXT_ORGANISATION)
+        assert brief is not None
+        facts = agent_bot.call_facts_from_context(brief.context)
+        assert facts.configuration_key == "CUST-0042"
+        assert facts.caller is None
+
+    def test_an_unset_reference_and_a_withheld_caller(self) -> None:
+        import agent_bot
+        from pbx_fixtures import BRIEF_CONTEXT_UNSET
+        from pipecat_siphon import parse_brief
+
+        brief = parse_brief(BRIEF_CONTEXT_UNSET)
+        assert brief is not None
+        facts = agent_bot.call_facts_from_context(brief.context)
+        assert facts.configuration_key is None
+        assert facts.caller is None
+
+    def test_no_context_is_no_facts(self) -> None:
+        import agent_bot
+
+        assert agent_bot.call_facts_from_context(None) == agent_bot.CallFacts()
+
+    def test_from_a_handover(self) -> None:
+        import agent_bot
+        from control_event_fixtures import ASSERTED_SIP
+
+        payload = {**ASSERTED_SIP, "vars": {"bot_configuration": "dialog-office"}}
+        facts = agent_bot.call_facts_from_handover(payload)
+        assert facts.configuration_key == "dialog-office"
+        assert facts.caller == "15550123"
+        assert facts.organisation is None
+
+    @pytest.mark.parametrize("variables", [{}, {"bot_configuration": 7}, None, "not a mapping"])
+    def test_a_handover_without_the_variable_names_no_configuration(self, variables: Any) -> None:
+        import agent_bot
+        from control_event_fixtures import ASSERTED_BUT_WITHHELD
+
+        facts = agent_bot.call_facts_from_handover({**ASSERTED_BUT_WITHHELD, "vars": variables})
+        assert facts.configuration_key is None
+        assert facts.caller is None
+
+    def test_a_handover_that_is_not_a_payload_is_no_facts(self) -> None:
+        import agent_bot
+
+        assert agent_bot.call_facts_from_handover(None) == agent_bot.CallFacts()
+
+
+class TestWaitingForTheHandover:
+    """Under IMS the engine dials the bot before siphon hands the call to the control plane."""
+
+    async def test_a_call_already_handed_over_is_returned_at_once(self) -> None:
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        call = _FakeControlCall(sip_call_id="early@example.invalid")
+        holding = asyncio.create_task(control._handle_call(call))
+        await asyncio.sleep(0)
+        assert await control.handed_over("early@example.invalid", 0.5) is call
+        call.end()
+        await holding
+
+    async def test_a_handover_that_arrives_while_waiting_is_returned(self) -> None:
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        call = _FakeControlCall(sip_call_id="late@example.invalid")
+        waiting = asyncio.create_task(control.handed_over("late@example.invalid", 2.0))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        holding = asyncio.create_task(control._handle_call(call))
+        assert await waiting is call
+        call.end()
+        await holding
+
+    async def test_no_handover_in_time_is_none(self) -> None:
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        assert await control.handed_over("never@example.invalid", 0.05) is None
+
+
+class TestResolvingACallsConfiguration:
+    """The route picks the configuration before the pipeline is built, from whichever source."""
+
+    @pytest.fixture(autouse=True)
+    def _directory(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        import agent_bot
+
+        monkeypatch.delenv("BOT_SYSTEM_PROMPT", raising=False)
+        monkeypatch.delenv("BOT_SYSTEM_PROMPT_FILE", raising=False)
+        monkeypatch.setattr(agent_bot, "CONFIGURATIONS_DIRECTORY", str(tmp_path))
+        monkeypatch.setattr(agent_bot, "HANDOVER_WAIT_SECONDS", 0.2)
+        _write(tmp_path, "CUST-0042.yaml", "system_prompt: For customer 42.\n")
+        _write(tmp_path, "dialog-office.yaml", "system_prompt: For the office line.\n")
+        return tmp_path
+
+    async def test_a_briefed_call_takes_its_organisations(self, pbx: Any) -> None:
+        import agent_bot
+        from pbx_fixtures import BRIEF_CONTEXT_FULL
+        from pipecat_siphon import VoiceSession, VoiceSessionClient, parse_brief
+
+        brief = parse_brief(BRIEF_CONTEXT_FULL)
+        assert brief is not None
+        session = VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, brief)
+        configuration, facts = await agent_bot.resolve_call(None, {}, session)
+        assert configuration.system_prompt == "For customer 42."
+        assert facts.caller == "15550142"
+
+    async def test_a_handed_over_call_takes_the_routing_scripts(self) -> None:
+        import agent_bot
+        from control_event_fixtures import ASSERTED_SIP
+
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        call = _HandedOverCall(
+            "ims@example.invalid", {**ASSERTED_SIP, "vars": {"bot_configuration": "dialog-office"}}
+        )
+
+        async def hand_over_later() -> None:
+            await asyncio.sleep(0.05)
+            await control._handle_call(call)
+
+        holding = asyncio.create_task(hand_over_later())
+        configuration, facts = await agent_bot.resolve_call(
+            control, {"call": "ims@example.invalid"}, None
+        )
+        assert configuration.system_prompt == "For the office line."
+        assert facts.caller == "15550123"
+        call.end()
+        await holding
+
+    async def test_no_handover_in_time_is_the_bots_own(self) -> None:
+        import agent_bot
+
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        configuration, facts = await agent_bot.resolve_call(
+            control, {"call": "nobody@example.invalid"}, None
+        )
+        assert configuration == agent_bot.default_configuration()
+        assert facts == agent_bot.CallFacts()
+
+    async def test_without_a_directory_nothing_is_waited_for(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "CONFIGURATIONS_DIRECTORY", "")
+        monkeypatch.setattr(agent_bot, "HANDOVER_WAIT_SECONDS", 30.0)
+        control = ControlPlane(application="a", token="t", url="ws://127.0.0.1:9/x")
+        started = time.monotonic()
+        configuration, _facts = await agent_bot.resolve_call(
+            control, {"call": "nobody@example.invalid"}, None
+        )
+        assert time.monotonic() - started < 1.0
+        assert configuration == agent_bot.default_configuration()
+
+
+@pytest.mark.usefixtures("_no_speaking_language")
+class TestAConfigurationShapesTheCall:
+    """What a configuration and the call's facts change in the pipeline built for the call."""
+
+    def test_the_prompt_is_the_configurations_and_names_the_organisation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+        from pipecat_siphon import ContextOrganisation
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        configuration = agent_bot.CallConfiguration(
+            key="CUST-0042",
+            system_prompt="For customer 42.",
+            transfer_target="sip:front-desk@example.invalid",
+            caller_lookup_url="",
+            caller_lookup_description=agent_bot.DEFAULT_CALLER_LOOKUP_DESCRIPTION,
+        )
+        facts = agent_bot.CallFacts(
+            organisation=ContextOrganisation(
+                id="o", name="Example Office", time_zone="Europe/Amsterdam"
+            )
+        )
+        settings: Any = agent_bot.build_llm_service(
+            with_hangup=True, configuration=configuration, facts=facts
+        ).settings
+        assert settings.system_instruction.startswith("For customer 42.")
+        assert "transfer_call" in settings.system_instruction
+        assert "Example Office" in settings.system_instruction
+        assert "Europe/Amsterdam" in settings.system_instruction
+
+    def test_a_time_zone_it_does_not_know_is_left_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+        from pipecat_siphon import ContextOrganisation
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        facts = agent_bot.CallFacts(
+            organisation=ContextOrganisation(id="o", name="Example Office", time_zone="Mars/Base")
+        )
+        settings: Any = agent_bot.build_llm_service(with_hangup=False, facts=facts).settings
+        assert "Example Office" in settings.system_instruction
+        assert "Mars/Base" not in settings.system_instruction
+
+    def test_the_configurations_transfer_target_is_the_one_offered_and_dialled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "")
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        offered = _record_tool_lists(monkeypatch)
+        control = _placing_control(_PlacingClient())
+        websocket: Any = object()
+        configuration = agent_bot.CallConfiguration(
+            key="office",
+            system_prompt="x",
+            transfer_target="sip:front-desk@example.invalid",
+            caller_lookup_url="",
+            caller_lookup_description=agent_bot.DEFAULT_CALLER_LOOKUP_DESCRIPTION,
+        )
+        agent_bot.build_worker(websocket, control)
+        agent_bot.build_worker(websocket, control, configuration=configuration)
+        assert offered == [["end_call"], ["end_call", "transfer_call"]]
+
+    async def test_a_transfer_rings_the_configurations_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "sip:default-desk@example.invalid")
+        monkeypatch.setattr(agent_bot, "TRANSFER_MODE", "refer")
+        sent: list[str] = []
+
+        class _Call:
+            async def transfer(self, target: str) -> None:
+                sent.append(target)
+
+        await agent_bot._start_the_transfer(_Call(), "sip:front-desk@example.invalid")
+        assert sent == ["sip:front-desk@example.invalid"]
+        assert agent_bot._bridge_dial_arguments(
+            SimpleNamespace(payload={}), "sip:b@example.invalid"
+        )["targets"] == [{"uri": "sip:b@example.invalid"}]
+
+    def test_a_trusted_caller_wins_over_the_urls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        TestObserverHook._stub_the_call(monkeypatch)
+        lookups: list[Any] = []
+        original = agent_bot.CallerLookup
+
+        def recording(url: str, caller: str | None) -> Any:
+            lookups.append((url, caller))
+            return original(url, caller)
+
+        monkeypatch.setattr(agent_bot, "CallerLookup", recording)
+        configuration = agent_bot.CallConfiguration(
+            key="office",
+            system_prompt="x",
+            transfer_target="",
+            caller_lookup_url="https://accounts.example.invalid/c/{caller}",
+            caller_lookup_description="d",
+        )
+        websocket: Any = object()
+        agent_bot.build_worker(
+            websocket,
+            None,
+            caller="99900000001",
+            configuration=configuration,
+            facts=agent_bot.CallFacts(caller="15550142"),
+        )
+        assert lookups == [("https://accounts.example.invalid/c/{caller}", "15550142")]

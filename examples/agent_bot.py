@@ -137,12 +137,15 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import uvicorn
+import yaml  # type: ignore[import-untyped]
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -196,7 +199,9 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import (
+    CallContext,
     Chose,
+    ContextOrganisation,
     Failed,
     Finished,
     Report,
@@ -1264,6 +1269,249 @@ def asserted_number(payload: Any) -> str | None:
     return None
 
 
+CONFIGURATIONS_DIRECTORY = os.environ.get("BOT_CONFIGURATIONS_DIR", "").strip()
+"""A directory of `<key>.yaml` files, one per configuration a call may name. Empty: none.
+
+One bot answers for many organisations or services this way. The key comes from whoever handed the
+call over, never from the media socket's URL: siphon-pbx's brief names it as the organisation's
+`external_ref`, and a siphon-sip routing script as the `bot_configuration` handover var. A call that
+names none, or one with no file, or a file that is wrong, gets the bot's own configuration, the
+last logged as an error. Files are read per call, so a change needs no restart."""
+
+CONFIGURATION_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
+"""A key that names a file in the directory and nothing outside it."""
+
+CONFIGURATION_FIELDS = (
+    "system_prompt",
+    "system_prompt_file",
+    "transfer_target",
+    "caller_lookup_url",
+    "caller_lookup_description",
+)
+"""What a configuration file may set. Anything else in one is refused, not ignored."""
+
+HANDOVER_CONFIGURATION_VARIABLE = "bot_configuration"
+"""The handover var a siphon-sip routing script names a call's configuration with."""
+
+HANDOVER_WAIT_SECONDS = 3.0
+"""How long a dial-in waits for its call's handover to name a configuration.
+
+siphon-sip dials the bot's stream before it hands the call to the control plane (the handover is
+carried out once the routing script returns), so the bot accepts first and then waits, briefly: a
+call that is never handed over is served with the bot's own configuration after this."""
+
+
+@dataclass(frozen=True)
+class CallConfiguration:
+    """What one call is served with: the bot's own settings, or a configuration file's over them."""
+
+    key: str | None
+    system_prompt: str
+    transfer_target: str
+    caller_lookup_url: str
+    caller_lookup_description: str
+
+
+def default_configuration() -> CallConfiguration:
+    """Return the bot's own configuration, from its environment."""
+    return CallConfiguration(
+        key=None,
+        system_prompt=resolve_system_prompt(os.environ),
+        transfer_target=TRANSFER_TARGET,
+        caller_lookup_url=CALLER_LOOKUP_URL,
+        caller_lookup_description=CALLER_LOOKUP_DESCRIPTION,
+    )
+
+
+def _read_configuration(directory: Path, key: str) -> CallConfiguration:
+    """Read `<key>.yaml` over the bot's own configuration.
+
+    Raises:
+        ValueError: Naming what is wrong with the file.
+
+    """
+    path = directory / f"{key}.yaml"
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"{path.name} cannot be read: {error}") from error
+    except yaml.YAMLError as error:
+        raise ValueError(f"{path.name} is not YAML: {error}") from error
+    if document is None:
+        document = {}
+    if not isinstance(document, dict):
+        raise ValueError(f"{path.name} is not a mapping of settings")
+    unknown = sorted(str(name) for name in document if name not in CONFIGURATION_FIELDS)
+    if unknown:
+        raise ValueError(f"{path.name} sets what a configuration cannot: {', '.join(unknown)}")
+    for name, value in document.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{path.name}: {name} is not text")
+    if "system_prompt" in document and "system_prompt_file" in document:
+        raise ValueError(f"{path.name} sets both system_prompt and system_prompt_file")
+    configuration = replace(default_configuration(), key=key)
+    if "system_prompt_file" in document:
+        prompt_path = (directory / document["system_prompt_file"]).resolve()
+        if prompt_path.parent != directory.resolve():
+            raise ValueError(f"{path.name}: system_prompt_file must be a file beside it")
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ValueError(f"{path.name}: system_prompt_file cannot be read: {error}") from error
+        configuration = replace(configuration, system_prompt=prompt)
+    if "system_prompt" in document:
+        configuration = replace(configuration, system_prompt=document["system_prompt"])
+    if not configuration.system_prompt.strip():
+        raise ValueError(f"{path.name}: the system prompt is empty")
+    configuration = replace(configuration, system_prompt=configuration.system_prompt.strip())
+    if "transfer_target" in document:
+        configuration = replace(configuration, transfer_target=document["transfer_target"].strip())
+    if "caller_lookup_url" in document:
+        url = document["caller_lookup_url"].strip()
+        try:
+            refuse_a_caller_lookup_url_without_the_caller(url)
+        except ValueError as error:
+            raise ValueError(f"{path.name}: {error}") from error
+        configuration = replace(configuration, caller_lookup_url=url)
+    if "caller_lookup_description" in document:
+        description = document["caller_lookup_description"].strip()
+        configuration = replace(
+            configuration,
+            caller_lookup_description=description or DEFAULT_CALLER_LOOKUP_DESCRIPTION,
+        )
+    return configuration
+
+
+def load_configuration(directory: str, key: str | None) -> CallConfiguration:
+    """Return the configuration `key` names in `directory`, or the bot's own. Never raises."""
+    if not directory or key is None:
+        return default_configuration()
+    if CONFIGURATION_KEY.fullmatch(key) is None:
+        logger.warning("ignoring a configuration key that is not a plain name")
+        return default_configuration()
+    if not (Path(directory) / f"{key}.yaml").is_file():
+        logger.warning(f"no configuration {key}; serving with the bot's own")
+        return default_configuration()
+    try:
+        configuration = _read_configuration(Path(directory), key)
+    except ValueError as error:
+        logger.error(f"configuration {key} not used, serving with the bot's own: {error}")
+        return default_configuration()
+    logger.info(f"serving with configuration {key}")
+    return configuration
+
+
+def check_configurations(directory: str) -> None:
+    """Refuse to start with a configuration that every call naming it would fall back from.
+
+    Raises:
+        ValueError: Naming the directory if it is not one, or every file that is wrong.
+
+    """
+    if not directory:
+        return
+    path = Path(directory)
+    if not path.is_dir():
+        raise ValueError(f"BOT_CONFIGURATIONS_DIR {directory} is not a directory")
+    problems: list[str] = []
+    for file in sorted(path.glob("*.yaml")):
+        if CONFIGURATION_KEY.fullmatch(file.stem) is None:
+            problems.append(f"{file.name}: not a name a call can give")
+            continue
+        try:
+            _read_configuration(path, file.stem)
+        except ValueError as error:
+            problems.append(str(error))
+    if problems:
+        raise ValueError("BOT_CONFIGURATIONS_DIR: " + "; ".join(problems))
+
+
+@dataclass(frozen=True)
+class CallFacts:
+    """Whose call it is, from whoever handed it over. Every field None where nobody said."""
+
+    configuration_key: str | None = None
+    # Digits only, as `caller_lookup` takes them; never from the media socket's URL.
+    caller: str | None = None
+    organisation: ContextOrganisation | None = None
+
+
+def _lookup_digits(number: str | None) -> str | None:
+    """Return a number as the caller lookup takes it, or None if it is not one."""
+    if number is None:
+        return None
+    digits = number.removeprefix("+")
+    return digits if CALLER_NUMBER.fullmatch(digits) else None
+
+
+def call_facts_from_context(context: CallContext | None) -> CallFacts:
+    """Read a siphon-pbx brief's `context`: the organisation's reference names the configuration."""
+    if context is None:
+        return CallFacts()
+    caller = context.caller
+    return CallFacts(
+        configuration_key=context.organisation.external_ref,
+        caller=_lookup_digits(caller.number) if caller is not None else None,
+        organisation=context.organisation,
+    )
+
+
+def call_facts_from_handover(payload: Any) -> CallFacts:
+    """Read a siphon-sip handover: its `bot_configuration` var, and the asserted caller."""
+    if not isinstance(payload, Mapping):
+        return CallFacts()
+    variables = payload.get("vars")
+    key = variables.get(HANDOVER_CONFIGURATION_VARIABLE) if isinstance(variables, Mapping) else None
+    return CallFacts(
+        configuration_key=key if isinstance(key, str) else None,
+        caller=_lookup_digits(asserted_number(payload)),
+    )
+
+
+def organisation_prompt(facts: CallFacts, now: datetime | None = None) -> str:
+    """Tell the model whose line it is answering, and the time there. Empty when nobody said.
+
+    Only what the operator set: the organisation's name and time zone. Nothing the caller controls,
+    a display name least of all, goes into the system prompt.
+    """
+    organisation = facts.organisation
+    if organisation is None:
+        return ""
+    prompt = f"\n\nThis call is for {organisation.name}."
+    try:
+        zone = ZoneInfo(organisation.time_zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return prompt
+    local = (now or datetime.now(zone)).astimezone(zone)
+    return prompt + f" It is {local:%A %d %B %Y, %H:%M} there ({organisation.time_zone})."
+
+
+async def resolve_call(
+    control: ControlPlane | None, query: Mapping[str, str], session: VoiceSession | None
+) -> tuple[CallConfiguration, CallFacts]:
+    """Find whose call this is and the configuration it names, before its pipeline is built.
+
+    A briefed call has it in its brief. A handed-over one has it in the handover, which arrives
+    after the dial-in, so that is waited for, `HANDOVER_WAIT_SECONDS` at most, and only when there
+    is a configuration directory to choose from.
+    """
+    if session is not None:
+        facts = call_facts_from_context(session.brief.context)
+    elif control is not None and CONFIGURATIONS_DIRECTORY and query.get("call"):
+        handed = await control.handed_over(query["call"], HANDOVER_WAIT_SECONDS)
+        if handed is None:
+            logger.warning(
+                f"no handover for this call within {HANDOVER_WAIT_SECONDS:g}s; serving with the "
+                "bot's own configuration"
+            )
+            facts = CallFacts()
+        else:
+            facts = call_facts_from_handover(getattr(handed, "payload", None))
+    else:
+        facts = CallFacts()
+    return load_configuration(CONFIGURATIONS_DIRECTORY, facts.configuration_key), facts
+
+
 def build_voice_session_client(url: str, secret: str) -> VoiceSessionClient | None:
     """Build the client for siphon-pbx's voice sessions, or None when neither half is configured.
 
@@ -1566,6 +1814,8 @@ class ControlPlane:
         self._forgetting: set[asyncio.Task[None]] = set()
         # Whoever waits for a call to be over: a callback, which must not ring during the call.
         self._endings: dict[str, list[asyncio.Future[None]]] = {}
+        # Whoever waits for a call to be handed over: a dial-in that came first.
+        self._arrivals: dict[str, list[asyncio.Future[Any]]] = {}
         # Set when callbacks are configured; the call_back tool exists only then.
         self.call_backs: CallBacks | None = None
 
@@ -1614,6 +1864,9 @@ class ControlPlane:
             return
 
         self._calls[sip_call_id] = call
+        for arrival in self._arrivals.pop(sip_call_id, []):
+            if not arrival.done():
+                arrival.set_result(call)
         logger.info(f"control channel attached to call {sip_call_id}")
         try:
             # Draining events is what keeps the handle alive for the call's life; it is also where
@@ -1661,6 +1914,24 @@ class ControlPlane:
                 )
             )
         self._deliver_transfer_verdict(sip_call_id, verdict)
+
+    async def handed_over(self, sip_call_id: str, timeout_seconds: float) -> Any | None:
+        """Return the call once it has been handed over, or None if it is not within the timeout."""
+        call = self._calls.get(sip_call_id)
+        if call is not None:
+            return call
+        arrival: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._arrivals.setdefault(sip_call_id, []).append(arrival)
+        try:
+            return await asyncio.wait_for(arrival, timeout_seconds)
+        except TimeoutError:
+            return None
+        finally:
+            waiting = self._arrivals.get(sip_call_id)
+            if waiting is not None and arrival in waiting:
+                waiting.remove(arrival)
+                if not waiting:
+                    del self._arrivals[sip_call_id]
 
     async def wait_until_over(self, sip_call_id: str) -> None:
         """Return once the call is no longer one this control plane holds."""
@@ -2005,6 +2276,8 @@ class CallResources:
     serializer: SiphonFrameSerializer
     speech: BotSpeechMonitor
     control: ControlPlane
+    # Where `transfer_call` sends the caller: the call's configuration's, the bot's own by default.
+    transfer_target: str = field(default_factory=lambda: TRANSFER_TARGET)
     # Set after the worker exists, which is after this object is handed to it. A transfer is an
     # ending for this bot even though it is not an ending for the caller, and ending the pipeline is
     # how the media socket gets closed.
@@ -2199,14 +2472,14 @@ async def _let_go_of_the_call(resources: CallResources, verdict: TransferVerdict
         await asyncio.sleep(BRIDGED_STREAM_GRACE_SECONDS)
         logger.warning(
             f"media stream still open {BRIDGED_STREAM_GRACE_SECONDS:g}s after the caller was "
-            f"bridged to {TRANSFER_TARGET}, ending the pipeline"
+            f"bridged to {resources.transfer_target}, ending the pipeline"
         )
         await worker.queue_frame(EndWorkerFrame())
 
     resources.bridged_stream_watch = asyncio.create_task(end_if_still_open())
 
 
-def _bridge_dial_arguments(control_call: Any) -> dict[str, Any]:
+def _bridge_dial_arguments(control_call: Any, transfer_target: str) -> dict[str, Any]:
     """Build the `dial` that rings the destination for the caller and bridges the two.
 
     The next hop and the identity come from the call's vars, which the routing script that handed
@@ -2216,7 +2489,7 @@ def _bridge_dial_arguments(control_call: Any) -> dict[str, Any]:
     payload = getattr(control_call, "payload", None)
     handed = payload.get("vars") if isinstance(payload, Mapping) else None
     handed = handed if isinstance(handed, Mapping) else {}
-    target: dict[str, Any] = {"uri": TRANSFER_TARGET}
+    target: dict[str, Any] = {"uri": transfer_target}
     if handed.get("transfer_next_hop"):
         target["next_hop"] = str(handed["transfer_next_hop"])
     arguments: dict[str, Any] = {
@@ -2234,14 +2507,14 @@ def _bridge_dial_arguments(control_call: Any) -> dict[str, Any]:
     return arguments
 
 
-async def _start_the_transfer(control_call: Any) -> None:
+async def _start_the_transfer(control_call: Any, transfer_target: str) -> None:
     """Send the transfer the configured mode asks for. Raises the SDK's error when it is refused."""
     if TRANSFER_MODE == "bridge":
-        await control_call.command("dial", _bridge_dial_arguments(control_call))
-        logger.info(f"ringing {TRANSFER_TARGET} to bridge the caller to it")
+        await control_call.command("dial", _bridge_dial_arguments(control_call, transfer_target))
+        logger.info(f"ringing {transfer_target} to bridge the caller to it")
         return
-    await control_call.transfer(TRANSFER_TARGET)
-    logger.info(f"asked the caller's phone to transfer to {TRANSFER_TARGET}")
+    await control_call.transfer(transfer_target)
+    logger.info(f"asked the caller's phone to transfer to {transfer_target}")
 
 
 async def _transfer_and_wait_for_the_verdict(
@@ -2258,7 +2531,7 @@ async def _transfer_and_wait_for_the_verdict(
     verdict = resources.control.expect_transfer_verdict(sip_call_id)
     resources.transfer_hold.engage()
     try:
-        await _start_the_transfer(control_call)
+        await _start_the_transfer(control_call, resources.transfer_target)
     except resources.control.error_class as error:
         # The caller hanging up first is the ordinary case, not a fault. If they have, the note
         # below is answered to nobody and the call's own teardown ends the pipeline.
@@ -2306,7 +2579,7 @@ async def transfer_call(params: FunctionCallParams) -> None:
     REFER was sent left exactly those callers on a silent line until the node gave up on the call.
     """
     resources = params.app_resources
-    if not isinstance(resources, CallResources) or not TRANSFER_TARGET:
+    if not isinstance(resources, CallResources) or not resources.transfer_target:
         await params.result_callback({"error": "this call cannot be transferred from here"})
         return
 
@@ -2698,6 +2971,8 @@ def build_tool_schemas(
     weather: bool = False,
     briefed: BriefedCall | None = None,
     call_back_minutes: int | None = None,
+    transfer_target: str | None = None,
+    caller_lookup_description: str | None = None,
 ) -> list[FunctionSchema]:
     """List the model's tools: hangup and transfer, the PBX's choices, the language switch, lookups.
 
@@ -2706,7 +2981,13 @@ def build_tool_schemas(
     On a call siphon-pbx briefed, `end_call` reports the conversation finished rather than hanging
     up, since the flow decides what happens next; transfer still needs the control plane.
     `call_back_minutes`, the furthest ahead a callback may go, offers them; they need it too.
+    `transfer_target` and `caller_lookup_description` are the call's configuration's, the bot's
+    own when not given.
     """
+    if transfer_target is None:
+        transfer_target = TRANSFER_TARGET
+    if caller_lookup_description is None:
+        caller_lookup_description = CALLER_LOOKUP_DESCRIPTION
     tools: list[FunctionSchema] = []
     if with_control or briefed is not None:
         tools.append(
@@ -2750,7 +3031,7 @@ def build_tool_schemas(
                 handler=briefed.choose_option,
             )
         )
-    if with_control and TRANSFER_TARGET:
+    if with_control and transfer_target:
         tools.append(
             FunctionSchema(
                 name="transfer_call",
@@ -2814,7 +3095,7 @@ def build_tool_schemas(
         tools.append(
             FunctionSchema(
                 name="caller_lookup",
-                description=CALLER_LOOKUP_DESCRIPTION,
+                description=caller_lookup_description,
                 # None, on purpose: see `CallerLookup`.
                 properties={},
                 required=[],
@@ -3358,21 +3639,29 @@ def preload_local_models() -> None:
 
 
 def build_llm_service(
-    with_hangup: bool, brief: SessionBrief | None = None, call_back: bool = False
+    with_hangup: bool,
+    brief: SessionBrief | None = None,
+    call_back: bool = False,
+    configuration: CallConfiguration | None = None,
+    facts: CallFacts | None = None,
 ) -> LLMService[Any]:
     """Build the LLM service for the selected backend, tuned for a conversation in real time.
 
     `with_hangup` is a control plane: hangup, and transfer when there is a destination. `brief`
     is siphon-pbx's for this call, whose instructions and options the model is told, and whose
     `end_call` reports rather than hangs up. `call_back` says the call_back tool is offered.
+    `configuration` is the call's, the bot's own when not given, and `facts` say whose line it is.
     """
+    if configuration is None:
+        configuration = default_configuration()
     system_instruction = (
-        resolve_system_prompt(os.environ)
+        configuration.system_prompt
+        + organisation_prompt(facts or CallFacts())
         + (HANGUP_PROMPT if with_hangup or brief is not None else "")
-        + (TRANSFER_PROMPT if with_hangup and TRANSFER_TARGET else "")
+        + (TRANSFER_PROMPT if with_hangup and configuration.transfer_target else "")
         + (CALL_BACK_PROMPT if with_hangup and call_back else "")
         + speaking_language_prompt(configured_speaking_languages())
-        + (CALLER_LOOKUP_PROMPT if CALLER_LOOKUP_URL else "")
+        + (CALLER_LOOKUP_PROMPT if configuration.caller_lookup_url else "")
         + (WEATHER_PROMPT if WEATHER_ENABLED else "")
         + (SESSION_PROMPT.format(instructions=brief.instructions) if brief is not None else "")
         + (CHOOSE_OPTION_PROMPT if brief is not None and brief.options else "")
@@ -3729,6 +4018,8 @@ def build_worker(
     caller: str | None = None,
     placed: PlacedCall | None = None,
     session: VoiceSession | None = None,
+    configuration: CallConfiguration | None = None,
+    facts: CallFacts | None = None,
 ) -> PipelineWorker:
     """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
 
@@ -3744,7 +4035,15 @@ def build_worker(
     or None. Only the caller_lookup tool reads it. `placed` is the call this bot placed, when the
     engine is dialling in for one; the bot opens it as the caller. `session` is the siphon-pbx
     session the call was handed over in, already briefed, which the bot reports its outcome to.
+    `configuration` is what the call is served with (the bot's own when not given), and `facts`
+    whose call it is: a caller number there, from whoever handed the call over, is the one the
+    caller lookup uses rather than the URL's.
     """
+    if configuration is None:
+        configuration = default_configuration()
+    facts = facts or CallFacts()
+    if facts.caller is not None:
+        caller = facts.caller
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
     speech_to_text = build_speech_to_text()
@@ -3753,6 +4052,8 @@ def build_worker(
         with_hangup=control is not None,
         brief=session.brief if session is not None else None,
         call_back=call_backs is not None,
+        configuration=configuration,
+        facts=facts,
     )
     text_to_speech = build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
@@ -3768,12 +4069,18 @@ def build_worker(
     tools = build_tool_schemas(
         control is not None,
         speaking_language,
-        caller_lookup=CallerLookup(CALLER_LOOKUP_URL, caller) if CALLER_LOOKUP_URL else None,
+        caller_lookup=(
+            CallerLookup(configuration.caller_lookup_url, caller)
+            if configuration.caller_lookup_url
+            else None
+        ),
         weather=WEATHER_ENABLED,
         briefed=briefed,
         call_back_minutes=(
             call_backs.settings.maximum_delay_minutes if call_backs is not None else None
         ),
+        transfer_target=configuration.transfer_target,
+        caller_lookup_description=configuration.caller_lookup_description,
     )
     if tools:
         context.set_tools(ToolsSchema(standard_tools=tools))
@@ -3784,7 +4091,12 @@ def build_worker(
     aggregators = LLMContextAggregatorPair(context, user_params=build_user_aggregator_params())
 
     resources = (
-        CallResources(serializer=serializer, speech=speech_monitor, control=control)
+        CallResources(
+            serializer=serializer,
+            speech=speech_monitor,
+            control=control,
+            transfer_target=configuration.transfer_target,
+        )
         if control is not None
         else None
     )
@@ -3909,7 +4221,22 @@ async def serve_call(
 ) -> None:
     """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
     await websocket.accept()
-    worker = build_worker(websocket, control, observer_factory, caller, placed, session)
+    # After the accept: siphon-sip hands a call over only once the stream it dials is up.
+    configuration, facts = (
+        await resolve_call(control, websocket.query_params, session)
+        if placed is None
+        else (default_configuration(), CallFacts())
+    )
+    worker = build_worker(
+        websocket,
+        control,
+        observer_factory,
+        caller,
+        placed,
+        session,
+        configuration=configuration,
+        facts=facts,
+    )
     runner = WorkerRunner()
     await runner.add_workers(worker)
     # Returns when the pipeline ends, which is when the engine closes the socket. Everything the
@@ -3988,6 +4315,7 @@ async def main(
         missing = missing_environment(providers, os.environ)
         resolve_system_prompt(os.environ)
         refuse_a_caller_lookup_url_without_the_caller(CALLER_LOOKUP_URL)
+        check_configurations(CONFIGURATIONS_DIRECTORY)
         speaking_languages = configured_speaking_languages()
         voice_sessions = build_voice_session_client(
             PBX_URL, os.environ.get(PBX_SECRET_VARIABLE, "").strip()
@@ -4100,6 +4428,11 @@ async def main(
     )
     if voice_sessions is not None:
         logger.info(f"siphon-pbx sessions: briefed by and reporting to {PBX_URL}")
+    if CONFIGURATIONS_DIRECTORY:
+        keys = sorted(file.stem for file in Path(CONFIGURATIONS_DIRECTORY).glob("*.yaml"))
+        logger.info(
+            f"configurations from {CONFIGURATIONS_DIRECTORY}: {', '.join(keys) or 'none yet'}"
+        )
     logger.info(f"listening on ws://{host}:{port}/ -- point the engine's ws_uri here")
 
     server = uvicorn.Server(

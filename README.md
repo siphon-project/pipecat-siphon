@@ -464,6 +464,37 @@ is told the number is not available. There is one callback per number at a time.
 stops the bot. Callbacks are held by the running bot, so stopping it loses any not yet placed,
 and each one lost is logged as an error. Numbers are logged masked.
 
+### One bot, many configurations
+
+`BOT_CONFIGURATIONS_DIR` points at a directory of `<key>.yaml` files. A call that names a key is
+served with that file's settings over the bot's own:
+
+```yaml
+# CUST-0042.yaml
+system_prompt: You answer the phone for a dental practice.  # or system_prompt_file, beside it
+transfer_target: sip:front-desk@example.invalid
+caller_lookup_url: https://accounts.example.invalid/patients/{caller}
+caller_lookup_description: Look up the caller's next appointment.
+```
+
+The key comes from whoever handed the call over, never from the media socket's URL. Behind
+siphon-pbx it is the organisation's `external_ref` from the brief's `context` (the bot's `context`
+setting must be `organisation` or `full`). Behind siphon-sip it is the `bot_configuration` var the
+routing script hands the call over with. siphon-sip dials the stream before it hands the call over,
+so the bot accepts the stream and then waits up to 3 s for the handover. It only waits when this
+directory is set.
+
+The same sources give the caller's number to `caller_lookup`, in place of the URL's `caller`:
+`context.caller` from siphon-pbx, the handover INVITE's P-Asserted-Identity from siphon-sip. A
+withheld caller gives none. When siphon-pbx names the organisation, the model is told its name and
+the local time in its time zone. Nothing the caller sets, a display name included, reaches the
+prompt.
+
+A call that names no key, a key with no file, or a file that is wrong is served with the bot's own
+settings; the last is logged as an error. Every file is checked at startup, and one that is wrong
+stops the bot. Files are re-read per call, so an edit needs no restart. Languages and voices stay
+the bot's own.
+
 ### Behind siphon-pbx
 
 When a siphon-pbx flow's voice block hands a call to the bot, the engine dials it with

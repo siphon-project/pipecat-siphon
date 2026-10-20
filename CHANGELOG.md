@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **One agent can serve many configurations, chosen by whoever handed the call over.**
+  `BOT_CONFIGURATIONS_DIR` holds `<key>.yaml` files that set the system prompt (or a prompt file
+  beside them), transfer target and caller lookup. siphon-pbx names the key with the brief's
+  `context.organisation.external_ref`. siphon-sip names it with a `bot_configuration` handover
+  var, waited for up to 3 s since the stream is dialled first. The caller lookup takes its number
+  from the same source instead of the URL, and a known organisation's name and local time reach
+  the prompt. A missing or wrong file falls back to the bot's own settings, and startup refuses
+  a wrong one.
+- **`SessionBrief.context`** reads siphon-pbx's versioned call context (`CallContext`, with
+  `parse_context`): an unknown version or a malformed context counts as none, and a withheld or
+  unrecognised privacy drops the caller's number and name.
+
 ## [0.3.0] - 2026-10-19
 
 The package gains two pieces beside the serializer: `PlacedCalls`, which places a call through

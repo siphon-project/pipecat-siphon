@@ -31,6 +31,40 @@ BRIEF_ESCAPED = (
     b'"options":[],"deadline_secs":0}'
 )
 
+# With `context`, from siphon-pbx dc168e2's `CallContext`
+# (`crates/siphon-pbx-core/src/call_context.rs`) inside the same `SessionBrief`.
+# A bot set to `full`: every part, the caller presented.
+BRIEF_CONTEXT_FULL = (
+    b'{"call_id":"b2b-00000000000000a1@example.invalid",'
+    b'"instructions":"Ask what the caller wants.","options":[],"deadline_secs":30,'
+    b'"context":{"version":1,"organisation":{"id":"00000000-0000-4000-8000-00000000000a",'
+    b'"external_ref":"CUST-0042","name":"Example Office","time_zone":"Europe/Amsterdam",'
+    b'"locale":"nl"},"called":{"number":"+15550100",'
+    b'"uri":"sip:+15550100@pbx.example.invalid;user=phone"},"caller":{"number":"+15550142",'
+    b'"display_name":"Test Caller","privacy":"none"},"direction":"inbound",'
+    b'"trunk":{"id":"22222222-2222-4222-8222-222222222222","name":"Carrier"}}}'
+)
+
+# A bot set to `organisation`: `version` and `organisation` only.
+BRIEF_CONTEXT_ORGANISATION = (
+    b'{"call_id":"b2b-00000000000000a1@example.invalid",'
+    b'"instructions":"Ask what the caller wants.","options":[],"deadline_secs":30,'
+    b'"context":{"version":1,"organisation":{"id":"00000000-0000-4000-8000-00000000000a",'
+    b'"external_ref":"CUST-0042","name":"Example Office","time_zone":"Europe/Amsterdam",'
+    b'"locale":"en"}}}'
+)
+
+# An organisation with no external reference or locale yet (`null`, not left out), a called number
+# that could not be put in E.164 (no `number`), a withheld caller (`privacy` alone), no trunk.
+BRIEF_CONTEXT_UNSET = (
+    b'{"call_id":"b2b-00000000000000a1@example.invalid",'
+    b'"instructions":"Ask what the caller wants.","options":[],"deadline_secs":30,'
+    b'"context":{"version":1,"organisation":{"id":"00000000-0000-4000-8000-00000000000a",'
+    b'"external_ref":null,"name":"Example Office","time_zone":"Europe/Amsterdam",'
+    b'"locale":null},"called":{"uri":"sip:5550199@pbx.example.invalid"},'
+    b'"caller":{"privacy":"id"},"direction":"outbound"}}'
+)
+
 # What the route accepts as a report.
 REPORT_CHOSE_SALES = b'{"outcome":"chose","option":"sales"}'
 REPORT_FINISHED = b'{"outcome":"finished"}'
