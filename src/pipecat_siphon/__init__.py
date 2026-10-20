@@ -64,7 +64,7 @@ from pipecat_siphon.voice_session import (
     session_token_from,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "BriefOption",

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-20
+
+The package reads siphon-pbx's versioned call context in a voice session's brief
+(`SessionBrief.context`, `CallContext`, `parse_context`). The agent example serves each call with
+the configuration whoever handed it over names.
+
 ### Added
 
 - **One agent can serve many configurations, chosen by whoever handed the call over.**
