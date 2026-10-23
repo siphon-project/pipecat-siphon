@@ -3379,6 +3379,38 @@ class DanglingWordUserTurnStopStrategy(BaseUserTurnStopStrategy):  # type: ignor
         await self._cancel_hold()
 
 
+class EchoGate(FrameProcessor):
+    """Give a speech-to-speech model silence instead of the line while the bot holds it.
+
+    `EchoGuard`'s job, for a model that hears audio rather than reading transcripts. It detects the
+    caller's speech in the audio itself, so the bot's own voice coming back on a leg whose echo the
+    engine cannot cancel is, to it, the caller interrupting: it stops a syllable into every
+    sentence. Seen on a carrier leg whose canceller locked on a weak peak and passed the echo on.
+
+    Silence rather than nothing, at the same length, so the model's audio clock keeps running and
+    its detector sees the bot's turn as quiet rather than as a gap. The cost is `EchoGuard`'s: a
+    caller cannot talk over the bot, and what they say into the gate is not heard. Set
+    `BOT_ECHO_GUARD_TAIL` to 0 to take the gate out, once the engine cancels the echo itself.
+    """
+
+    def __init__(self, speech: BotSpeechMonitor, tail_seconds: float) -> None:
+        """Gate against `speech`'s idea of who holds the line, for `tail_seconds` after it ends."""
+        super().__init__()
+        self._speech = speech
+        self._tail = tail_seconds
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Pass the caller's audio, or silence of the same length while the line is ours."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and self._speech.line_is_ours(self._tail):
+            frame = InputAudioRawFrame(
+                audio=bytes(len(frame.audio)),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+        await self.push_frame(frame, direction)
+
+
 def build_serializer() -> SiphonFrameSerializer:
     """Build the wire serializer, kept as its own object so the tools can read its `call_id`."""
     return SiphonFrameSerializer(
@@ -3885,12 +3917,14 @@ def _build_gemini_live_service(
 ) -> LLMService[Any]:
     """Build Gemini's native-audio service, which hears, answers and speaks in one model.
 
-    Its own voice activity detection decides the caller's turns and interruptions; nothing here
-    configures it, so a turn ends when Gemini's defaults say so. The tools and the prompt go to the
-    constructor rather than the context: tools arriving on the context make it reconnect, which is
-    a second session set up while the caller waits for the greeting.
+    Its own voice activity detection decides the caller's turns and interruptions, at a low
+    sensitivity to the start of speech: on a phone line, residual echo and line noise are not the
+    caller starting to talk, and at the default each was enough to cut the bot off. The tools and
+    the prompt go to the constructor rather than the context: tools arriving on the context make it
+    reconnect, which is a second session set up while the caller waits for the greeting.
     """
-    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+    from google.genai.types import StartSensitivity
+    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
 
     return GeminiLiveLLMService(
         api_key=_provider_key("llm", "gemini-live", "GOOGLE_API_KEY"),
@@ -3900,6 +3934,7 @@ def _build_gemini_live_service(
             system_instruction=system_instruction,
             voice=TTS_VOICE or DEFAULT_TTS_VOICE["gemini-live"],
             language=gemini_live_language(),
+            vad=GeminiVADParams(start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW),
             max_tokens=MAXIMUM_RESPONSE_TOKENS,
             **_sampling_settings("gemini-live"),
         ),
@@ -4190,10 +4225,16 @@ def build_worker(
     call_backs = control.call_backs if control is not None else None
     text_to_speech = None if one_model else build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
-    # Not for one model: it drops transcripts whatever their direction, and there the transcripts
-    # are the model's own record of what the caller said, travelling upstream. The engine's echo
-    # canceller is what keeps the bot from hearing itself.
-    echo_guard = None if one_model else EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+    # One model gets the gate instead of the guard: the guard drops transcripts whatever their
+    # direction, and there the transcripts are the model's own record of what the caller said,
+    # travelling upstream, while what the model hears is the audio. See `EchoGate`.
+    echo_guard: FrameProcessor | None = (
+        EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+        if not one_model
+        else EchoGate(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+        if ECHO_GUARD_TAIL_SECONDS > 0
+        else None
+    )
     briefed = BriefedCall(session=session, speech=speech_monitor) if session is not None else None
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
@@ -4572,7 +4613,12 @@ async def main(
     logger.info(
         "turn-taking: "
         + (
-            f"{LLM_PROVIDER}'s own speech detection; the engine's speech edges are ignored"
+            f"{LLM_PROVIDER}'s own speech detection; the engine's speech edges are ignored; "
+            + (
+                f"echo gate {ECHO_GUARD_TAIL_SECONDS:g}s tail (the caller cannot talk over the bot)"
+                if ECHO_GUARD_TAIL_SECONDS > 0
+                else "echo gate off (the caller can talk over the bot)"
+            )
             if speech_to_speech()
             else (
                 f"echo guard {ECHO_GUARD_TAIL_SECONDS:g}s tail"
