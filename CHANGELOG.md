@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The quickstart image builds again.** `siphon-control` 0.9.0 needs Rust 1.89, newer than Debian's
+  own rustc, so the stage that compiles it from its sdist failed. It now installs a pinned toolchain
+  through a pinned rustup-init, checked against its published SHA-256; only that build stage carries
+  it.
+
 ## [0.4.0] - 2026-10-20
 
 The package reads siphon-pbx's versioned call context in a voice session's brief
