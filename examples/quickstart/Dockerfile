@@ -11,15 +11,37 @@
 # sdist it publishes alongside those wheels.
 #
 # Temporary. Once siphon-control ships wheels for 3.13 this stage goes, and the install below is a
-# plain `siphon-control` again. Debian's own rustc and cargo are recent enough for the crate, and
-# its only native dependency is `ring`, which needs nothing past a C compiler.
+# plain `siphon-control` again. Its only native dependency is `ring`, which needs nothing past a C
+# compiler, but the crates declare a minimum Rust (1.89 for 0.9.0) newer than Debian's own rustc, so
+# the toolchain comes from rustup: a pinned rustup-init, checked against its published SHA-256, and a
+# pinned toolchain. Only this stage carries it; the image below never does.
 FROM python:3.13-slim AS siphon-control
+
+ARG RUSTUP_VERSION=1.28.2
+ARG RUST_TOOLCHAIN=1.89.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
-        rustc \
-        cargo \
+        ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) target=x86_64-unknown-linux-gnu; \
+               sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;; \
+        arm64) target=aarch64-unknown-linux-gnu; \
+               sha256=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
+        *) echo "no pinned rustup-init for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${target}/rustup-init"; \
+    echo "${sha256}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
+    rm /tmp/rustup-init
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels siphon-control==0.9.0
 
