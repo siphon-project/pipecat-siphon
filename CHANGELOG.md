@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-23
+
+Nothing in the package itself changed beyond its version: the fix is the quickstart's image.
+
 ### Fixed
 
 - **The quickstart image builds again.** `siphon-control` 0.9.0 needs Rust 1.89, newer than Debian's
