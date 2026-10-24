@@ -49,6 +49,8 @@ from pipecat_siphon.voice_session import (
 )
 
 TOKEN = "9f86d081884c7d659a2feaa0c55ad015"
+CLUSTERED_TOKEN = TOKEN + ".pbx-node-2"
+"""What a clustered siphon-pbx node mints: the token, `.`, and the node that holds the session."""
 SECRET = "s3cret-for-tests-only"
 
 
@@ -282,6 +284,20 @@ class TestSessionTokenFrom:
         assert session_token_from({"call": "abc", "session": TOKEN}) == TOKEN
 
     @pytest.mark.parametrize(
+        "token",
+        [
+            CLUSTERED_TOKEN,
+            TOKEN + ".a",
+            TOKEN + ".node.eu-west_1",
+            TOKEN + ".n" + "x" * 62,
+            TOKEN + ".7",
+        ],
+    )
+    def test_a_node_suffix_is_kept_whole(self, token: str) -> None:
+        """siphon-pbx routes on the suffix, so the token is passed on exactly as minted."""
+        assert session_token_from({"session": token}) == token
+
+    @pytest.mark.parametrize(
         "query",
         [
             {},
@@ -292,6 +308,19 @@ class TestSessionTokenFrom:
             {"session": TOKEN + "/report"},
             {"session": TOKEN + "?x=1"},
             {"session": TOKEN + " "},
+            # A node suffix as siphon-pbx's `NodeId` refuses it: empty, not starting with a
+            # letter or digit, too long, or carrying anything that walks a path.
+            {"session": TOKEN + "."},
+            {"session": TOKEN + ".."},
+            {"session": TOKEN + "..node"},
+            {"session": TOKEN + ".-node"},
+            {"session": TOKEN + "._node"},
+            {"session": TOKEN + ".n" + "x" * 63},
+            {"session": TOKEN + ".node/report"},
+            {"session": TOKEN + ".node/../x"},
+            {"session": TOKEN + ".node%2F"},
+            {"session": "." + TOKEN},
+            {"session": "short.node"},
         ],
     )
     def test_anything_but_a_plain_token_is_no_session(self, query: dict[str, str]) -> None:
@@ -316,6 +345,15 @@ class TestVoiceSessionClient:
         assert request["method"] == "GET"
         assert request["path"] == f"/voice/sessions/{TOKEN}"
         assert request["headers"]["Authorization"] == f"Bearer {SECRET}"
+
+    async def test_a_clustered_token_reaches_the_pbx_unchanged(self, pbx: FakePbx) -> None:
+        client = VoiceSessionClient(pbx.url, SECRET)
+        assert await client.fetch_brief(CLUSTERED_TOKEN) is not None
+        assert await client.report(CLUSTERED_TOKEN, Finished()) is True
+        assert [request["path"] for request in pbx.requests] == [
+            f"/voice/sessions/{CLUSTERED_TOKEN}",
+            f"/voice/sessions/{CLUSTERED_TOKEN}/report",
+        ]
 
     async def test_sends_no_origin_header_which_the_pbx_reads_as_a_browser(
         self, pbx: FakePbx

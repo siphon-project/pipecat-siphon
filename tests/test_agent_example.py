@@ -3369,10 +3369,47 @@ class TestThePbxBriefIsFetchedBeforeTheBotSpeaks:
         assert request["headers"]["Authorization"] == f"Bearer {PBX_SECRET}"
 
     @pytest.mark.parametrize(
+        "token",
+        [
+            # A single siphon-pbx node, or one from before tokens carried a node.
+            PBX_TOKEN,
+            # A clustered node's: the node holding the session, which the PBX routes on.
+            PBX_TOKEN + ".pbx-node-2",
+        ],
+    )
+    async def test_the_token_reaches_the_pbx_exactly_as_minted(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any, token: str
+    ) -> None:
+        route, served = self._route(monkeypatch, pbx)
+
+        await route.endpoint(SimpleNamespace(query_params={"call": "abc", "session": token}))
+
+        ((session, _asked),) = served
+        assert session.brief == _menu_brief()
+        assert [request["path"] for request in pbx.requests] == [f"/voice/sessions/{token}"]
+
+    async def test_a_dial_in_without_a_session_is_answered_quietly(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """siphon-rtp dialling the bot directly, with no siphon-pbx at all, is the ordinary case."""
+        route, served = self._route(monkeypatch, pbx)
+        warnings: list[str] = []
+        sink = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
+        try:
+            await route.endpoint(SimpleNamespace(query_params={"call": "abc"}))
+        finally:
+            logger.remove(sink)
+
+        assert served == [(None, 0)]
+        assert pbx.requests == []
+        assert warnings == []
+
+    @pytest.mark.parametrize(
         "query",
         [
             {"call": "abc"},
             {"call": "abc", "session": "../../api/v1/organisations"},
+            {"call": "abc", "session": PBX_TOKEN + ".node/../x"},
             {"call": "abc", "session": ""},
         ],
     )
