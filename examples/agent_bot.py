@@ -11,7 +11,7 @@ call itself driven over the control plane rather than left as an anonymous audio
 Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chosen for each:
 
     BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live | openai-realtime
-    BOT_STT_PROVIDER   deepgram  | elevenlabs | google | openai | local
+    BOT_STT_PROVIDER   deepgram  | elevenlabs | soniox | google | openai | local
                        | gemini-live | openai-realtime
     BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local
                        | gemini-live | openai-realtime
@@ -414,6 +414,7 @@ LLM_PROVIDERS = ("anthropic", "google", "openai", "local", *SPEECH_TO_SPEECH_PRO
 STT_PROVIDERS = (
     "deepgram",
     "elevenlabs",
+    "soniox",
     "google",
     "openai",
     "local",
@@ -478,8 +479,8 @@ _ROLE_PRESET = (
 selects it whole rather than leaving the backend's recognizer and voice beside it."""
 
 STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _ROLE_PRESET[1])
-"""Who transcribes the caller: `deepgram`, `elevenlabs`, `google`, `openai`, or `local` for
-faster-whisper."""
+"""Who transcribes the caller: `deepgram`, `elevenlabs`, `soniox`, `google`, `openai`, or `local`
+for faster-whisper."""
 
 TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _ROLE_PRESET[2])
 """Who speaks for the bot: `cartesia`, `elevenlabs`, `google`, `openai`, or `local` for Kokoro."""
@@ -572,6 +573,8 @@ DEFAULT_STT_MODEL: dict[str, str] = {
     "deepgram": "nova-3-general",
     # The streaming one: plain `scribe_v2` is ElevenLabs' batch model, a request per utterance.
     "elevenlabs": "scribe_v2_realtime",
+    # pipecat 1.12's own default, pinned so a pipecat upgrade does not change the model.
+    "soniox": "stt-rt-v5",
     # Google's own model for 8 kHz telephone audio, which is exactly what arrives here. It is also
     # the one model of theirs that refuses a speech-adaptation config, so do not add one.
     "google": "telephony",
@@ -598,9 +601,11 @@ STT_MODEL = os.environ.get("BOT_STT_MODEL", "").strip() or DEFAULT_STT_MODEL.get
 DEFAULT_STT_LANGUAGE: dict[str, str] = {
     # A public number takes calls in whatever language the caller speaks, and a recognizer pinned
     # to one of them transcribes the rest into confident nonsense. Deepgram and ElevenLabs offer
-    # this; on ElevenLabs `multi` means no language sent, which is its own auto-detection.
+    # this; on ElevenLabs `multi` means no language sent, which is its own auto-detection. Soniox
+    # hears every language whatever it is told: there a language is only a hint.
     "deepgram": "multi",
     "elevenlabs": "multi",
+    "soniox": "multi",
     # Google wants BCP-47, and its telephony model is per-language.
     "google": "en-US",
     "openai": "en",
@@ -3079,7 +3084,9 @@ def build_speaking_language_controller() -> SpeakingLanguageController | None:
         languages,
         provider=TTS_PROVIDER,
         default_voice=default_tts_voice(),
-        recognizer_language=STT_LANGUAGE,
+        # `multi` for one that hears every language, which the controller then leaves alone: a
+        # Soniox language is a hint it cannot change through pipecat's `language` setting.
+        recognizer_language="multi" if recognizer_hears_every_language() else STT_LANGUAGE,
     )
 
 
@@ -3564,6 +3571,7 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ("llm", "local"): (),
     ("stt", "deepgram"): (("DEEPGRAM_API_KEY", "speech-to-text key"),),
     ("stt", "elevenlabs"): (("ELEVENLABS_API_KEY", "ElevenLabs API key"),),
+    ("stt", "soniox"): (("SONIOX_API_KEY", "speech-to-text key"),),
     # Nothing here: Google's speech APIs take application default credentials, which need not be
     # a variable at all. `refuse_missing_google_cloud_credentials` checks them instead.
     ("stt", "google"): (),
@@ -4121,6 +4129,7 @@ def build_speech_to_text() -> STTService:
     builders: dict[str, Callable[[], STTService]] = {
         "deepgram": _build_deepgram_stt_service,
         "elevenlabs": _build_elevenlabs_stt_service,
+        "soniox": _build_soniox_stt_service,
         "google": _build_google_stt_service,
         "openai": _build_openai_stt_service,
         "local": _build_local_stt_service,
@@ -4162,6 +4171,38 @@ def _build_elevenlabs_stt_service() -> STTService:
         ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
+
+
+def _build_soniox_stt_service() -> STTService:
+    """Build Soniox's recognizer, which hears every language and reports each transcript's own.
+
+    Finalized on the engine's speech edges, pipecat's default for it: the serializer turns the end
+    of the caller's speech into the VAD frame that sends Soniox its finalize, and Soniox's own
+    endpoint detection stays off. A configured language is sent as a hint, which biases it toward
+    that language without stopping it hearing the others; see `recognizer_hears_every_language`.
+    """
+    from pipecat.services.soniox.stt import SonioxSTTService
+
+    return SonioxSTTService(
+        api_key=_provider_key("stt", "soniox", "SONIOX_API_KEY"),
+        vad_force_turn_endpoint=True,
+        settings=SonioxSTTService.Settings(
+            model=STT_MODEL,
+            language_hints=(None if STT_LANGUAGE.lower() == "multi" else [Language(STT_LANGUAGE)]),
+            enable_language_identification=True,
+        ),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
+
+
+def recognizer_hears_every_language() -> bool:
+    """Whether the selected recognizer transcribes any language, rather than one it is pinned to.
+
+    `multi` on the providers that take it, and Soniox whatever its language, which it reads as a
+    hint. A recognizer that hears every language is left alone when the bot switches language,
+    and reports each transcript's own, so the voice can follow the caller.
+    """
+    return STT_LANGUAGE.lower() == "multi" or STT_PROVIDER == "soniox"
 
 
 def _build_google_stt_service() -> STTService:
@@ -4835,16 +4876,16 @@ async def main(
             )
             + (", following the caller" if speaking_languages.follow_caller else "")
         )
-    if speaking_languages.follow_caller and STT_LANGUAGE.lower() != "multi":
+    if speaking_languages.follow_caller and not recognizer_hears_every_language():
         logger.warning(
             f"BOT_TTS_FOLLOW_CALLER is on, but the recognizer is pinned to {STT_LANGUAGE} and "
             "reports nothing else, so the voice will only change when the caller asks for it. "
-            "Follow the caller with a recognizer on multi (deepgram or elevenlabs)."
+            "Follow the caller with a recognizer on multi (deepgram or elevenlabs), or soniox."
         )
     if (
         not speech_to_speech()
         and speaking_languages.starting is not None
-        and STT_LANGUAGE.lower() != "multi"
+        and not recognizer_hears_every_language()
         and base_language(STT_LANGUAGE) != base_language(speaking_languages.starting)
     ):
         # Warned rather than changed: the recognizer's language is BOT_STT_LANGUAGE's, and the
