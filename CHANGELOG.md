@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
   While the bot speaks, plus `BOT_ECHO_GUARD_TAIL`, the model hears silence instead of the line, so
   an echo the engine could not cancel does not cut it off (0 takes the gate out), and its start of
   speech is detected at low sensitivity.
+- **The agent example speaks with ElevenLabs.** `BOT_TTS_PROVIDER=elevenlabs` streams over
+  ElevenLabs' WebSocket API as raw PCM at the pipeline's 16 kHz, so nothing resamples it, beside any
+  recognizer and model. It needs `ELEVENLABS_API_KEY` and an account voice id in `BOT_TTS_VOICE`,
+  both named at startup when missing, and runs `eleven_flash_v2_5` unless `BOT_TTS_MODEL` says
+  otherwise, a low-latency model that takes the language code, so `BOT_TTS_LANGUAGE` and
+  `BOT_TTS_VOICES` reach it. The quickstart image installs it with the `elevenlabs` extra.
 
 ## [0.4.1] - 2026-10-23
 
