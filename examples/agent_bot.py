@@ -11,7 +11,8 @@ call itself driven over the control plane rather than left as an anonymous audio
 Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chosen for each:
 
     BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live | openai-realtime
-    BOT_STT_PROVIDER   deepgram  | google | openai | local | gemini-live | openai-realtime
+    BOT_STT_PROVIDER   deepgram  | elevenlabs | google | openai | local
+                       | gemini-live | openai-realtime
     BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local
                        | gemini-live | openai-realtime
 
@@ -140,11 +141,11 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -410,7 +411,14 @@ off is refused at startup; see `refuse_a_split_speech_to_speech`."""
 LLM_PROVIDERS = ("anthropic", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """Who answers a turn."""
 
-STT_PROVIDERS = ("deepgram", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
+STT_PROVIDERS = (
+    "deepgram",
+    "elevenlabs",
+    "google",
+    "openai",
+    "local",
+    *SPEECH_TO_SPEECH_PROVIDERS,
+)
 """Who transcribes the caller."""
 
 TTS_PROVIDERS = (
@@ -470,7 +478,8 @@ _ROLE_PRESET = (
 selects it whole rather than leaving the backend's recognizer and voice beside it."""
 
 STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _ROLE_PRESET[1])
-"""Who transcribes the caller: `deepgram`, `google`, `openai`, or `local` for faster-whisper."""
+"""Who transcribes the caller: `deepgram`, `elevenlabs`, `google`, `openai`, or `local` for
+faster-whisper."""
 
 TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _ROLE_PRESET[2])
 """Who speaks for the bot: `cartesia`, `elevenlabs`, `google`, `openai`, or `local` for Kokoro."""
@@ -561,6 +570,8 @@ warning on every call, so a pinned temperature is withheld there and the startup
 
 DEFAULT_STT_MODEL: dict[str, str] = {
     "deepgram": "nova-3-general",
+    # The streaming one: plain `scribe_v2` is ElevenLabs' batch model, a request per utterance.
+    "elevenlabs": "scribe_v2_realtime",
     # Google's own model for 8 kHz telephone audio, which is exactly what arrives here. It is also
     # the one model of theirs that refuses a speech-adaptation config, so do not add one.
     "google": "telephony",
@@ -586,8 +597,10 @@ STT_MODEL = os.environ.get("BOT_STT_MODEL", "").strip() or DEFAULT_STT_MODEL.get
 
 DEFAULT_STT_LANGUAGE: dict[str, str] = {
     # A public number takes calls in whatever language the caller speaks, and a recognizer pinned
-    # to one of them transcribes the rest into confident nonsense. Only Deepgram offers this.
+    # to one of them transcribes the rest into confident nonsense. Deepgram and ElevenLabs offer
+    # this; on ElevenLabs `multi` means no language sent, which is its own auto-detection.
     "deepgram": "multi",
+    "elevenlabs": "multi",
     # Google wants BCP-47, and its telephony model is per-language.
     "google": "en-US",
     "openai": "en",
@@ -3227,6 +3240,46 @@ def build_tool_schemas(
     return tools
 
 
+def elevenlabs_reported_languages(languages: Iterable[str]) -> dict[str, str]:
+    """Map the ISO 639-3 code ElevenLabs reports for each of `languages`, and English, to it.
+
+    Built from pipecat's own conversion, one language at a time, so the codes are the ones its
+    ElevenLabs service sends: `nld` for `nl` and for `nl-BE` alike, `eng` for English.
+    """
+    from pipecat.services.elevenlabs.stt import language_to_elevenlabs_language
+
+    reported: dict[str, str] = {}
+    for code in ("en", *languages):
+        language = as_pipecat_language(code)
+        if isinstance(language, Language):
+            reported.setdefault(language_to_elevenlabs_language(language), code)
+    return reported
+
+
+class RecognizerLanguageCodes(FrameProcessor):
+    """Rewrite the language a transcript reports into the code this bot was configured with.
+
+    ElevenLabs reports `nld` where everything downstream matches `nl`: `configured_language_for`
+    finds no configured language in it and `is_english` no English, so the voice could not follow
+    a caller and the hold for an unfinished English sentence never applied. A code it does not know
+    is passed on as reported, which is right: it is neither English nor a configured language.
+    """
+
+    def __init__(self, codes: Mapping[str, str]) -> None:
+        """Rewrite each reported code in `codes` to the code it maps to."""
+        super().__init__()
+        self._codes = dict(codes)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Pass every frame on, a transcript with its language translated when known."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)) and frame.language:
+            configured = self._codes.get(str(frame.language).lower())
+            if configured is not None:
+                frame.language = cast(Any, as_pipecat_language(configured))
+        await self.push_frame(frame, direction)
+
+
 class EchoGuard(FrameProcessor):
     """Drop transcriptions that arrive while the line is the bot's own.
 
@@ -3510,6 +3563,7 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     # Nothing: the model server's address has a default and takes no key.
     ("llm", "local"): (),
     ("stt", "deepgram"): (("DEEPGRAM_API_KEY", "speech-to-text key"),),
+    ("stt", "elevenlabs"): (("ELEVENLABS_API_KEY", "ElevenLabs API key"),),
     # Nothing here: Google's speech APIs take application default credentials, which need not be
     # a variable at all. `refuse_missing_google_cloud_credentials` checks them instead.
     ("stt", "google"): (),
@@ -4066,6 +4120,7 @@ def build_speech_to_text() -> STTService:
     """Build the recognizer for the selected provider, at the pipeline's rate."""
     builders: dict[str, Callable[[], STTService]] = {
         "deepgram": _build_deepgram_stt_service,
+        "elevenlabs": _build_elevenlabs_stt_service,
         "google": _build_google_stt_service,
         "openai": _build_openai_stt_service,
         "local": _build_local_stt_service,
@@ -4082,6 +4137,29 @@ def _build_deepgram_stt_service() -> STTService:
         # A raw language string here, unlike the two below: Deepgram's own codes include `multi`,
         # which is not a language and so has no member in pipecat's enum.
         settings=DeepgramSTTService.Settings(model=STT_MODEL, language=STT_LANGUAGE),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
+
+
+def _build_elevenlabs_stt_service() -> STTService:
+    """Build ElevenLabs' realtime recognizer, which also takes `multi`.
+
+    Committed on the engine's speech edges: the serializer turns the end of the caller's speech into
+    the VAD frame pipecat's manual commit waits for, so the recognizer's own VAD stays out of it.
+    On `multi` no language is sent and each transcript reports the one it heard, in ISO 639-3,
+    which `RecognizerLanguageCodes` translates on the way out.
+    """
+    from pipecat.services.elevenlabs.stt import CommitStrategy, ElevenLabsRealtimeSTTService
+
+    detect = STT_LANGUAGE.lower() == "multi"
+    return ElevenLabsRealtimeSTTService(
+        api_key=_provider_key("stt", "elevenlabs", "ELEVENLABS_API_KEY"),
+        commit_strategy=CommitStrategy.MANUAL,
+        include_language_detection=detect,
+        settings=ElevenLabsRealtimeSTTService.Settings(
+            model=STT_MODEL,
+            language=None if detect else as_pipecat_language(STT_LANGUAGE),
+        ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
@@ -4376,6 +4454,13 @@ def build_worker(
     # One model that hears and speaks, or a recognizer and a voice around a model that reads text.
     one_model = speech_to_speech()
     speech_to_text = None if one_model else build_speech_to_text()
+    recognizer_language_codes = (
+        RecognizerLanguageCodes(
+            elevenlabs_reported_languages(configured_speaking_languages().available)
+        )
+        if speech_to_text is not None and STT_PROVIDER == "elevenlabs"
+        else None
+    )
     call_backs = control.call_backs if control is not None else None
     text_to_speech = None if one_model else build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
@@ -4446,6 +4531,9 @@ def build_worker(
             [
                 transport.input(),
                 *([speech_to_text] if speech_to_text is not None else []),
+                # Straight after the recognizer, so every stage after it reads the codes it was
+                # configured with.
+                *([recognizer_language_codes] if recognizer_language_codes is not None else []),
                 # After the recognizer, which keeps getting audio, and ahead of the turn logic: see
                 # `TransferHold`. Only with a control plane, since only then is there a transfer.
                 *([resources.transfer_hold] if resources is not None else []),
@@ -4751,7 +4839,7 @@ async def main(
         logger.warning(
             f"BOT_TTS_FOLLOW_CALLER is on, but the recognizer is pinned to {STT_LANGUAGE} and "
             "reports nothing else, so the voice will only change when the caller asks for it. "
-            "Follow the caller with a recognizer on multi (deepgram)."
+            "Follow the caller with a recognizer on multi (deepgram or elevenlabs)."
         )
     if (
         not speech_to_speech()
@@ -4763,7 +4851,8 @@ async def main(
         # local recognizer's default model is English-only, so moving it here would stop the bot.
         logger.warning(
             f"the bot speaks {speaking_languages.starting} but the recognizer is pinned to "
-            f"{STT_LANGUAGE}: set BOT_STT_LANGUAGE to match, or to multi on deepgram, or callers "
+            f"{STT_LANGUAGE}: set BOT_STT_LANGUAGE to match, or to multi on deepgram or "
+            "elevenlabs, or callers "
             "answering in that language are transcribed as the other one"
         )
     # The turn-taking posture, for the same reason: "it interrupted itself" and "it would not let me
