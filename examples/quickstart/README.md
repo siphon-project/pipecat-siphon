@@ -122,8 +122,8 @@ The bot does three jobs and picks a provider for each, so they can be mixed:
 | variable | choices |
 |---|---|
 | `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
-| `BOT_STT_PROVIDER` | `deepgram`, `elevenlabs`, `soniox`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
-| `BOT_TTS_PROVIDER` | `cartesia`, `elevenlabs`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
+| `BOT_STT_PROVIDER` | `deepgram`, `elevenlabs`, `soniox`, `azure`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
+| `BOT_TTS_PROVIDER` | `cartesia`, `elevenlabs`, `azure`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
 
 `BOT_BACKEND` is a preset for all three at once: `cloud` is Claude, Deepgram and Cartesia, `local`
 keeps every model on this host (llama.cpp, faster-whisper, Kokoro) on whichever GPU the image was
@@ -139,6 +139,11 @@ fills all three roles or none, so it is selected as a backend rather than mixed,
 `marin`), under `OPENAI_API_KEY` alone. It hears 24 kHz only, so on this backend the bot converts
 the caller's audio from the wire's 16 kHz on the way in. A pinned `BOT_LLM_TEMPERATURE` or
 `BOT_LLM_SEED` does not reach it: the Realtime session has neither.
+
+`BOT_STT_PROVIDER=azure` and `BOT_TTS_PROVIDER=azure` use one Azure Speech resource, named by
+`AZURE_SPEECH_API_KEY` and `AZURE_SPEECH_REGION`, and the `azure` extra. The voice defaults to
+`en-US-AvaMultilingualNeural`, which speaks `BOT_TTS_LANGUAGE` natively; the recognizer listens in
+one locale, `BOT_STT_LANGUAGE` (`en-US` by default).
 
 `BOT_TTS_PROVIDER=elevenlabs` speaks through ElevenLabs' streaming WebSocket API, at the wire's
 16 kHz, on `eleven_flash_v2_5` unless `BOT_TTS_MODEL` says otherwise. It needs `ELEVENLABS_API_KEY`

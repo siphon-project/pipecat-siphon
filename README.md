@@ -409,7 +409,7 @@ default for both here, or Soniox.
 natively.** A voice reads every language in its own accent. On Cartesia, where a voice is a voice
 id on your account, give each language a native voice in `BOT_TTS_VOICES`, or use one of
 Cartesia's multilingual voices with the language set; ElevenLabs is the same, with the voice id in
-`BOT_TTS_VOICE`. Google's voice names carry their locale, so
+`BOT_TTS_VOICE`. Azure's default voice is multilingual and is held to the configured locale. Google's voice names carry their locale, so
 a language without a voice in the map gets the configured voice in that locale
 (`en-US-Chirp3-HD-Charon` becomes `nl-NL-Chirp3-HD-Charon`). OpenAI's speech endpoint takes no
 language, so its `gpt-` voices are instead instructed to use a native accent. The local voice,
