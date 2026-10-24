@@ -42,6 +42,11 @@ All notable changes to this project are documented here. The format follows
   it detects the language per transcript, so `BOT_TTS_FOLLOW_CALLER` and the hold for an unfinished
   English sentence work as on Deepgram; the ISO 639-3 codes it reports (`nld`) are translated to
   the configured ones (`nl`) before anything reads them.
+- **The agent example hears with Soniox.** `BOT_STT_PROVIDER=soniox` streams the caller to Soniox
+  (`stt-rt-v5`) at 16 kHz under `SONIOX_API_KEY`, finalized on the engine's speech edge. It hears
+  every language at once and reports each transcript's, so `BOT_TTS_FOLLOW_CALLER` works on it as
+  on Deepgram's `multi`; a `BOT_STT_LANGUAGE` is sent as a hint, and a language switch leaves it
+  alone, since Soniox reads hints and not pipecat's `language`.
 
 ### Fixed
 

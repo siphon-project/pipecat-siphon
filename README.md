@@ -403,7 +403,7 @@ another language: the voice, its language and a recognizer pinned to one languag
 the rest of the call. `BOT_TTS_FOLLOW_CALLER=true` also moves the voice to the language the
 recognizer hears, once two stretches of the caller's speech in a row are in it; that needs a
 recognizer that reports a language per transcript, which is Deepgram or ElevenLabs on `multi`, the
-default for both here.
+default for both here, or Soniox.
 
 **The language setting alone does not remove the accent; the voice has to speak that language
 natively.** A voice reads every language in its own accent. On Cartesia, where a voice is a voice

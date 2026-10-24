@@ -618,6 +618,16 @@ class TestMissingEnvironment:
             {"llm": "anthropic", "stt": "elevenlabs", "tts": "elevenlabs"}, environment
         ) == ["ELEVENLABS_API_KEY", "BOT_TTS_VOICE"]
 
+    def test_soniox_needs_its_key(self) -> None:
+        environment = {
+            "ANTHROPIC_API_KEY": "key",
+            "CARTESIA_API_KEY": "k",
+            "CARTESIA_VOICE_ID": "v",
+        }
+        assert missing_environment({**CLOUD_PROVIDERS, "stt": "soniox"}, environment) == [
+            "SONIOX_API_KEY"
+        ]
+
     def test_one_provider_in_two_roles_asks_for_its_key_once(self) -> None:
         """OpenAI for the model and the voice is one key, so the startup error must say it once."""
         assert missing_environment({"llm": "openai", "stt": "openai", "tts": "openai"}, {}) == [
@@ -786,6 +796,7 @@ class TestServiceImportsAreLazy:
             "cartesia": ("pipecat.services.cartesia",),
             "elevenlabs": ("pipecat.services.elevenlabs",),
             "deepgram": ("pipecat.services.deepgram",),
+            "soniox": ("pipecat.services.soniox",),
             "google": ("pipecat.services.google",),
             "openai": ("pipecat.services.openai",),
             "local": ("pipecat.services.whisper", "pipecat.services.kokoro"),
@@ -1878,6 +1889,7 @@ def _vendor_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "DEEPGRAM_API_KEY",
+        "SONIOX_API_KEY",
         "CARTESIA_API_KEY",
         "CARTESIA_VOICE_ID",
         "ELEVENLABS_API_KEY",
@@ -2148,6 +2160,75 @@ class _TranscriptRecorder(FrameProcessor):
         if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
             self.languages.append(str(frame.language) if frame.language else None)
         await self.push_frame(frame, direction)
+
+
+@pytest.mark.usefixtures("_vendor_credentials")
+class TestSonioxRecognizer:
+    """Soniox hears every language at once; a configured language is a hint, never a pin."""
+
+    def test_it_streams_at_the_pipeline_rate_and_reports_each_language(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.soniox.stt import SonioxSTTService
+
+        import agent_bot
+
+        _select(monkeypatch, "stt", "soniox")
+
+        built = agent_bot.build_speech_to_text()
+
+        assert isinstance(built, SonioxSTTService)
+        service: Any = built
+        assert service.settings.model == "stt-rt-v5"
+        assert service.settings.language_hints is None
+        assert service.settings.enable_language_identification is True
+        # Finalized when the engine's speech edge says the caller stopped, not by Soniox's own
+        # endpoint detection, which would be a second detector.
+        assert service._vad_force_turn_endpoint is True
+        assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+
+    def test_a_configured_language_is_sent_as_a_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pipecat.transcriptions.language import Language
+
+        import agent_bot
+
+        _select(monkeypatch, "stt", "soniox")
+        monkeypatch.setattr(agent_bot, "STT_LANGUAGE", "nl")
+
+        service: Any = agent_bot.build_speech_to_text()
+
+        assert service.settings.language_hints == [Language.NL]
+        assert service.settings.enable_language_identification is True
+
+    @pytest.mark.parametrize("language", ["multi", "nl"])
+    def test_it_counts_as_hearing_every_language(
+        self, monkeypatch: pytest.MonkeyPatch, language: str
+    ) -> None:
+        """So a language switch sends it nothing.
+
+        Soniox reads `language_hints` and ignores pipecat's `language`, so the delta a pinned
+        recognizer gets would reconnect its socket and change nothing.
+        """
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "STT_PROVIDER", "soniox")
+        monkeypatch.setattr(agent_bot, "STT_LANGUAGE", language)
+
+        assert agent_bot.recognizer_hears_every_language()
+
+    @pytest.mark.parametrize(
+        ("provider", "language", "expected"),
+        [("deepgram", "multi", True), ("deepgram", "nl", False), ("google", "en-US", False)],
+    )
+    def test_the_others_hear_every_language_only_on_multi(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, language: str, expected: bool
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "STT_PROVIDER", provider)
+        monkeypatch.setattr(agent_bot, "STT_LANGUAGE", language)
+
+        assert agent_bot.recognizer_hears_every_language() is expected
 
 
 class TestObserverHook:

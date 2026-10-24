@@ -100,6 +100,7 @@ services:
       # value here used to give.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:-}"
+      SONIOX_API_KEY: "${SONIOX_API_KEY:-}"
       CARTESIA_API_KEY: "${CARTESIA_API_KEY:-}"
       CARTESIA_VOICE_ID: "${CARTESIA_VOICE_ID:-}"
       ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"

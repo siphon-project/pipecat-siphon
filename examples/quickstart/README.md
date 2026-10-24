@@ -122,7 +122,7 @@ The bot does three jobs and picks a provider for each, so they can be mixed:
 | variable | choices |
 |---|---|
 | `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
-| `BOT_STT_PROVIDER` | `deepgram`, `elevenlabs`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
+| `BOT_STT_PROVIDER` | `deepgram`, `elevenlabs`, `soniox`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
 | `BOT_TTS_PROVIDER` | `cartesia`, `elevenlabs`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
 
 `BOT_BACKEND` is a preset for all three at once: `cloud` is Claude, Deepgram and Cartesia, `local`

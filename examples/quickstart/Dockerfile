@@ -59,9 +59,9 @@ ARG BOT_BACKEND=cloud
 #
 #   --build-arg BOT_EXTRAS=google,whisper,websocket    # Gemini's model, a local recognizer
 #
-# One extra per provider: anthropic, google, openai, deepgram, cartesia, elevenlabs, whisper, kokoro.
-# `websocket`
-# is not a provider and is always needed -- it carries the fastapi the media socket is served on.
+# One extra per provider: anthropic, google, openai, deepgram, soniox, cartesia, elevenlabs, whisper,
+# kokoro. `websocket` is not a provider and is always needed -- it carries the fastapi the media
+# socket is served on.
 ARG BOT_EXTRAS=
 
 WORKDIR /app
