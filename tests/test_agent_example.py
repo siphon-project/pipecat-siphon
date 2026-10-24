@@ -628,6 +628,11 @@ class TestMissingEnvironment:
             "SONIOX_API_KEY"
         ]
 
+    def test_azure_needs_its_key_and_region_once_for_both_roles(self) -> None:
+        assert missing_environment(
+            {"llm": "anthropic", "stt": "azure", "tts": "azure"}, {"ANTHROPIC_API_KEY": "key"}
+        ) == ["AZURE_SPEECH_API_KEY", "AZURE_SPEECH_REGION"]
+
     def test_one_provider_in_two_roles_asks_for_its_key_once(self) -> None:
         """OpenAI for the model and the voice is one key, so the startup error must say it once."""
         assert missing_environment({"llm": "openai", "stt": "openai", "tts": "openai"}, {}) == [
@@ -793,6 +798,7 @@ class TestServiceImportsAreLazy:
         # role; every other provider is one package serving whichever roles it fills.
         packages_by_provider = {
             "anthropic": ("pipecat.services.anthropic",),
+            "azure": ("pipecat.services.azure",),
             "cartesia": ("pipecat.services.cartesia",),
             "elevenlabs": ("pipecat.services.elevenlabs",),
             "deepgram": ("pipecat.services.deepgram",),
@@ -1890,6 +1896,8 @@ def _vendor_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_API_KEY",
         "DEEPGRAM_API_KEY",
         "SONIOX_API_KEY",
+        "AZURE_SPEECH_API_KEY",
+        "AZURE_SPEECH_REGION",
         "CARTESIA_API_KEY",
         "CARTESIA_VOICE_ID",
         "ELEVENLABS_API_KEY",
@@ -2229,6 +2237,119 @@ class TestSonioxRecognizer:
         monkeypatch.setattr(agent_bot, "STT_LANGUAGE", language)
 
         assert agent_bot.recognizer_hears_every_language() is expected
+
+
+@pytest.mark.usefixtures("_vendor_credentials", "_no_speaking_language")
+class TestAzureSpeech:
+    """Azure's recognizer and voice, under one key and region, at the pipeline's rate."""
+
+    def test_the_recognizer_streams_at_the_pipeline_rate_in_its_language(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.azure.stt import AzureSTTService
+
+        import agent_bot
+
+        _select(monkeypatch, "stt", "azure")
+
+        built = agent_bot.build_speech_to_text()
+
+        assert isinstance(built, AzureSTTService)
+        service: Any = built
+        assert service.settings.language == "en-US"
+        assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+
+    def test_a_pinned_recognizer_language_is_sent_as_azures_locale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "stt", "azure")
+        monkeypatch.setattr(agent_bot, "STT_LANGUAGE", "nl")
+
+        service: Any = agent_bot.build_speech_to_text()
+
+        assert service.settings.language == "nl-NL"
+
+    def test_the_voice_is_multilingual_and_streams_raw_pcm_at_the_pipeline_rate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from azure.cognitiveservices.speech import (  # type: ignore[import-untyped]
+            SpeechSynthesisOutputFormat,
+        )
+        from pipecat.services.azure.tts import AzureTTSService, sample_rate_to_output_format
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "azure")
+
+        built = agent_bot.build_text_to_speech()
+
+        assert isinstance(built, AzureTTSService)
+        service: Any = built
+        assert service.settings.voice == "en-US-AvaMultilingualNeural"
+        assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+        # A rate Azure has no raw format for falls back to 24 kHz without a word.
+        assert (
+            sample_rate_to_output_format(agent_bot.PIPELINE_SAMPLE_RATE)
+            == SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm
+        )
+
+    def test_the_voice_is_built_exactly_as_pipecat_would_when_no_language_is_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.azure.tts import AzureTTSService
+        from pipecat.utils.types import NOT_GIVEN
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "azure")
+        recorded = _record_settings(monkeypatch, AzureTTSService)
+
+        agent_bot.build_text_to_speech()
+
+        assert recorded[0] == {"voice": "en-US-AvaMultilingualNeural", "model": NOT_GIVEN}
+
+    def test_a_multilingual_voice_is_held_to_the_configured_language(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without `force_locale` a multilingual voice guesses the language from the text."""
+        import agent_bot
+
+        _select(monkeypatch, "tts", "azure")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+
+        service: Any = agent_bot.build_text_to_speech()
+
+        assert service.settings.language == "nl-NL"
+        assert service.settings.force_locale is True
+        assert "<lang xml:lang='nl-NL'>Goedemiddag</lang>" in service._construct_ssml("Goedemiddag")
+
+    def test_a_switch_mid_call_sends_the_locale_too(self) -> None:
+        """The same settings are the delta a language switch sends, so they carry the locale."""
+        import agent_bot
+
+        languages = agent_bot.resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGES": "en,nl"}, "azure", "en-US-AvaMultilingualNeural"
+        )
+
+        settings = agent_bot.speaking_settings(
+            "azure", "nl", languages, "en-US-AvaMultilingualNeural"
+        )
+
+        assert settings["language"] == "nl-NL"
+        assert settings["force_locale"] is True
+
+    def test_a_voice_of_its_own_per_language(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "tts", "azure")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        monkeypatch.setenv("BOT_TTS_VOICES", "nl=nl-NL-FennaNeural")
+
+        settings: Any = agent_bot.build_text_to_speech().settings
+
+        assert settings.voice == "nl-NL-FennaNeural"
 
 
 class TestObserverHook:

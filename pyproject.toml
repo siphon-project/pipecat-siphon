@@ -62,7 +62,7 @@ dev = [
     # 1.12 rather than the package's own 1.8 floor, because the agent example uses the empty-user-turn
     # recovery that arrived in it. The *package* still works on 1.8 and is still tested there -- see
     # the floor job in the release workflow -- so a library user is not pushed forward by an example.
-    "pipecat-ai[anthropic,cartesia,deepgram,elevenlabs,google,openai,soniox,websocket]>=1.12.0,<2",
+    "pipecat-ai[anthropic,azure,cartesia,deepgram,elevenlabs,google,openai,soniox,websocket]>=1.12.0,<2",
     # The ASGI server the example runs that fastapi app on. Same story: example-only, never
     # imported from src/, so the published wheel's dependencies are unchanged by either of these.
     "uvicorn>=0.32,<1",

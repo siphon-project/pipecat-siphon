@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The agent example hears and speaks with Azure.** `BOT_STT_PROVIDER=azure` and
+  `BOT_TTS_PROVIDER=azure` share one Speech resource (`AZURE_SPEECH_API_KEY`, `AZURE_SPEECH_REGION`,
+  named at startup when missing), both at 16 kHz. The recognizer listens in `BOT_STT_LANGUAGE`
+  (`en-US` by default); the voice is `en-US-AvaMultilingualNeural` unless `BOT_TTS_VOICE` says
+  otherwise, and a configured language is held with `<lang xml:lang>` so it is spoken natively.
+  pipecat 1.12's Azure voice never converts a language to Azure's locale (its base class shadows the
+  conversion), so the example sends the locale itself. Installed with the `azure` extra, which adds
+  `azure-cognitiveservices-speech` and `azure-core`.
+
 ## [0.5.0] - 2026-10-24
 
 The package's one change is the clustered siphon-pbx session token below; the rest is the agent
