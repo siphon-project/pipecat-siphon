@@ -10,16 +10,17 @@ call itself driven over the control plane rather than left as an anonymous audio
 
 Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chosen for each:
 
-    BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live
-    BOT_STT_PROVIDER   deepgram  | google | openai | local | gemini-live
-    BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local | gemini-live
+    BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live | openai-realtime
+    BOT_STT_PROVIDER   deepgram  | google | openai | local | gemini-live | openai-realtime
+    BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local
+                       | gemini-live | openai-realtime
 
 `BOT_BACKEND` is a preset for all three: `cloud` is Claude, Deepgram and Cartesia, `local` keeps
-every model on this host, and `gemini-live` is Gemini's native audio, one model that hears, answers
-and speaks, detecting the caller's turns itself. Each role can be overridden on its own, because
-the useful combinations are mixed -- a hosted model with a local recognizer, say. Everything that
-is not a model is the same object whichever is selected, which is what makes two providers
-comparable at all.
+every model on this host, and `gemini-live` and `openai-realtime` are Gemini's and OpenAI's native
+audio, one model that hears, answers and speaks, detecting the caller's turns itself. Each role can
+be overridden on its own, because the useful combinations are mixed -- a hosted model with a local
+recognizer, say. Everything that is not a model is the same object whichever is selected, which is
+what makes two providers comparable at all.
 
 Each provider asks for its own credential, read from the environment. The default selection wants:
 
@@ -199,7 +200,7 @@ from pipecat.turns.user_stop.base_user_turn_stop_strategy import (
     BaseUserTurnStopStrategy,
     UserTurnStoppedParams,
 )
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import (
@@ -221,6 +222,24 @@ from pipecat_siphon.voice_session import QUERY_PARAMETER as SESSION_QUERY_PARAME
 PIPELINE_SAMPLE_RATE = int(os.environ.get("BOT_SAMPLE_RATE", "") or 16000)
 """What the pipeline runs at. Match it to `ws_sample_rate` on the profile and nothing in this
 process resamples: the engine converts once, at the RTP boundary, where it is frame-exact."""
+
+OPENAI_REALTIME_SAMPLE_RATE = 24000
+"""The one PCM rate OpenAI's Realtime API takes in and gives back. pipecat appends the caller's
+audio to its input buffer as it arrives, unconverted, so it has to arrive at this rate."""
+
+
+def pipeline_input_sample_rate() -> int:
+    """Name the rate the caller's audio is handed to the pipeline at.
+
+    The wire's, except for OpenAI's Realtime model, which hears 24 kHz PCM and nothing else: handed
+    16 kHz it hears the caller half again as fast. The serializer converts from the wire to this
+    rate, once, so that is where the difference is made up. The bot's audio still leaves at
+    PIPELINE_SAMPLE_RATE.
+    """
+    return (
+        OPENAI_REALTIME_SAMPLE_RATE if LLM_PROVIDER == "openai-realtime" else PIPELINE_SAMPLE_RATE
+    )
+
 
 WIRE_PTIME_MS = 20
 """The engine's packetization time, announced in its `start` envelope.
@@ -380,7 +399,7 @@ def resolve_system_prompt(environment: Mapping[str, str]) -> str:
     return prompt
 
 
-SPEECH_TO_SPEECH_PROVIDERS = ("gemini-live",)
+SPEECH_TO_SPEECH_PROVIDERS = ("gemini-live", "openai-realtime")
 """Providers whose one model hears the caller, answers and speaks, so they fill all three roles.
 
 Audio goes to the model and audio comes back: there is no transcript to decide a turn on and no text
@@ -442,7 +461,7 @@ def _selected_provider(variable: str, preset: str) -> str:
 
 LLM_PROVIDER = _selected_provider("BOT_LLM_PROVIDER", _PRESET[0])
 """Who answers a turn: `anthropic`, `google`, `openai`, `local` for a server on this host, or
-`gemini-live` for Gemini's native audio."""
+`gemini-live` or `openai-realtime` for a model's native audio."""
 
 _ROLE_PRESET = (
     BACKEND_PRESETS[LLM_PROVIDER] if LLM_PROVIDER in SPEECH_TO_SPEECH_PROVIDERS else _PRESET
@@ -476,6 +495,8 @@ DEFAULT_LLM_MODEL: dict[str, str] = {
     # The Gemini API's name; on Vertex the same model has another. pipecat's own default moved
     # from a 2.5 native-audio preview to this between 1.12 and 1.13, which is why it is pinned.
     "gemini-live": "models/gemini-3.8-live",
+    # pipecat 1.12's own default, pinned so a pipecat upgrade does not change the model.
+    "openai-realtime": "gpt-realtime-2.1",
 }
 """Which model each provider is asked for when `BOT_LLM_MODEL` says nothing.
 
@@ -524,12 +545,19 @@ SEED_IS_ACCEPTED: dict[str, bool] = {
     "openai": True,
     "local": True,
     "gemini-live": True,
+    "openai-realtime": False,
 }
 """Which LLM providers take a sampling seed.
 
 A capability of the provider, not of the backend: the same pinned `BOT_LLM_SEED` has to reach an
 OpenAI-compatible server and be withheld from Anthropic, and keying that on "is this the local
 path" was wrong the moment a second provider spoke the same API."""
+
+TEMPERATURE_IS_ACCEPTED: dict[str, bool] = {"openai-realtime": False}
+"""The LLM providers that take no sampling temperature; every other one does.
+
+OpenAI's Realtime session has no temperature field, and pipecat drops one it is given with a
+warning on every call, so a pinned temperature is withheld there and the startup line says n/a."""
 
 DEFAULT_STT_MODEL: dict[str, str] = {
     "deepgram": "nova-3-general",
@@ -542,6 +570,9 @@ DEFAULT_STT_MODEL: dict[str, str] = {
     "local": "Systran/faster-distil-whisper-medium.en",
     # Empty: the model hears the caller itself.
     "gemini-live": "",
+    # The model hears the caller itself, and this writes down what it heard: the Realtime
+    # session's input transcription, off unless a model is named.
+    "openai-realtime": "gpt-4o-mini-transcribe",
 }
 """Which recognizer model each provider is asked for.
 
@@ -566,6 +597,8 @@ DEFAULT_STT_LANGUAGE: dict[str, str] = {
     "local": "en",
     # What the model is told it will hear and speak, when `BOT_TTS_LANGUAGE` names nothing.
     "gemini-live": "en-US",
+    # Left to the transcription model to detect, as Deepgram's `multi` does.
+    "openai-realtime": "multi",
 }
 """Which language each recognizer is pinned to when `BOT_STT_LANGUAGE` says nothing."""
 
@@ -591,6 +624,7 @@ DEFAULT_TTS_MODEL: dict[str, str] = {
     "local": "",
     # Empty: the voice is the model's own.
     "gemini-live": "",
+    "openai-realtime": "",
 }
 """Which synthesizer model each provider is asked for. Empty means the provider takes none."""
 
@@ -613,6 +647,8 @@ DEFAULT_TTS_VOICE: dict[str, str] = {
     "local": "af_heart",
     # One of Gemini's prebuilt voices, which speak every language the model does.
     "gemini-live": "Charon",
+    # One of the voices OpenAI recommends for its Realtime models.
+    "openai-realtime": "marin",
 }
 """Which voice each synthesizer is asked for when `BOT_TTS_VOICE` says nothing."""
 
@@ -3458,7 +3494,7 @@ def build_transport(
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            audio_in_sample_rate=pipeline_input_sample_rate(),
             audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
             # One WebSocket frame per ptime, rather than pipecat's default four 10 ms chunks.
             audio_out_10ms_chunks=WIRE_PTIME_MS // 10,
@@ -3495,6 +3531,9 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     # Nothing: the one model fills these roles, under the key above.
     ("stt", "gemini-live"): (),
     ("tts", "gemini-live"): (),
+    ("llm", "openai-realtime"): (("OPENAI_API_KEY", "OpenAI API key"),),
+    ("stt", "openai-realtime"): (),
+    ("tts", "openai-realtime"): (),
 }
 """What each provider cannot start without, in each role, and what the value is for.
 
@@ -3809,6 +3848,9 @@ def build_llm_service(
         "openai": _build_openai_llm_service,
         "local": _build_local_llm_service,
         "gemini-live": lambda instruction: _build_gemini_live_service(instruction, tools or []),
+        "openai-realtime": lambda instruction: _build_openai_realtime_service(
+            instruction, tools or []
+        ),
     }
     # Deliberately no `.get(..., default)`: an unrecognised provider is refused at startup, and a
     # silent fallback to one particular vendor would bill somebody for a typo.
@@ -3823,7 +3865,7 @@ def _sampling_settings(provider: str) -> dict[str, Any]:
     provider whose API has none, because sending it is an error rather than a no-op.
     """
     sampling: dict[str, Any] = {}
-    if LLM_TEMPERATURE is not None:
+    if LLM_TEMPERATURE is not None and TEMPERATURE_IS_ACCEPTED.get(provider, True):
         sampling["temperature"] = LLM_TEMPERATURE
     if LLM_SEED is not None and SEED_IS_ACCEPTED.get(provider, False):
         sampling["seed"] = LLM_SEED
@@ -3955,6 +3997,67 @@ def _build_gemini_live_service(
             vad=GeminiVADParams(start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW),
             max_tokens=MAXIMUM_RESPONSE_TOKENS,
             **_sampling_settings("gemini-live"),
+        ),
+    )
+
+
+def speech_to_speech_language() -> str:
+    """Name the language a speech-to-speech model is set to, for the startup line."""
+    if LLM_PROVIDER == "gemini-live":
+        return gemini_live_language()
+    return configured_speaking_languages().starting or STT_LANGUAGE
+
+
+def openai_realtime_transcription_language() -> str | None:
+    """Name the language the Realtime transcript is pinned to, or None to let it detect one.
+
+    The configured speaking language, else the recognizer's, as its base code: the transcription
+    API takes ISO-639-1, so `nl-BE` is sent as `nl`. `multi` pins nothing.
+    """
+    code = configured_speaking_languages().starting or STT_LANGUAGE
+    return None if code.lower() == "multi" else base_language(code)
+
+
+def _build_openai_realtime_service(
+    system_instruction: str, tools: list[FunctionSchema]
+) -> LLMService[Any]:
+    """Build OpenAI's Realtime service, which hears, answers and speaks in one model.
+
+    Its own server-side voice activity detection decides the caller's turns and interruptions, at
+    OpenAI's defaults. The language is the prompt's, which every model here is given; the model has
+    no language setting of its own. Its audio comes back at OPENAI_REALTIME_SAMPLE_RATE, labelled
+    as such, and the output transport converts it to the wire. What goes in is converted on the way
+    in: see `pipeline_input_sample_rate`.
+    """
+    from pipecat.services.openai.realtime.events import (
+        AudioConfiguration,
+        AudioInput,
+        AudioOutput,
+        InputAudioTranscription,
+        SessionProperties,
+    )
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+
+    return OpenAIRealtimeLLMService(
+        api_key=_provider_key("llm", "openai-realtime", "OPENAI_API_KEY"),
+        settings=OpenAIRealtimeLLMService.Settings(
+            model=LLM_MODEL,
+            system_instruction=system_instruction,
+            session_properties=SessionProperties(
+                audio=AudioConfiguration(
+                    input=AudioInput(
+                        transcription=InputAudioTranscription(
+                            model=STT_MODEL, language=openai_realtime_transcription_language()
+                        )
+                    ),
+                    output=AudioOutput(voice=TTS_VOICE or DEFAULT_TTS_VOICE["openai-realtime"]),
+                ),
+                # On the session rather than the context, as with Gemini Live: tools arriving on
+                # the context make it send a session update before it can greet the caller.
+                tools=ToolsSchema(standard_tools=tools) if tools else None,
+                max_output_tokens=MAXIMUM_RESPONSE_TOKENS,
+            ),
+            **_sampling_settings("openai-realtime"),
         ),
     )
 
@@ -4184,6 +4287,11 @@ def build_user_aggregator_params() -> LLMUserAggregatorParams:
     defaults, which choose one way of opening and closing a turn for every backend, and the two
     backends here need different ones: see `build_user_turn_strategies`.
     """
+    if LLM_PROVIDER == "openai-realtime":
+        # OpenAI's service only proposes the caller's start and end of speech, and these take the
+        # proposals up: they end the turn and interrupt the bot. The service recommends them
+        # itself, but pipecat lets any strategies named here override that, so they are named.
+        return LLMUserAggregatorParams(user_turn_strategies=ExternalUserTurnStrategies())
     if speech_to_speech():
         # The model decides the turn from the audio, and the serializer passes on no speech edges
         # for a local strategy to act on. Named rather than left unset, because unset is pipecat's
@@ -4356,7 +4464,7 @@ def build_worker(
             ]
         ),
         params=PipelineParams(
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            audio_in_sample_rate=pipeline_input_sample_rate(),
             audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         ),
         app_resources=resources,
@@ -4577,7 +4685,7 @@ async def main(
         f"models: llm={LLM_PROVIDER}/{LLM_MODEL}"
         + (f" at {LLM_BASE_URL}" if LLM_BASE_URL else "")
         + (
-            f" speech-to-speech in {gemini_live_language()}"
+            f" speech-to-speech in {speech_to_speech_language()}"
             f" with voice {TTS_VOICE or DEFAULT_TTS_VOICE[LLM_PROVIDER]}"
             if speech_to_speech()
             else f" stt={STT_PROVIDER}/{STT_MODEL}/{STT_LANGUAGE}"
@@ -4585,7 +4693,11 @@ async def main(
             + f" tts={TTS_PROVIDER}/{TTS_MODEL or TTS_VOICE or 'account voice'}"
         )
         # A run compared against another is only comparable at the same sampling, so say which.
-        + f" temperature={'default' if LLM_TEMPERATURE is None else LLM_TEMPERATURE}"
+        + (
+            f" temperature={'default' if LLM_TEMPERATURE is None else LLM_TEMPERATURE}"
+            if TEMPERATURE_IS_ACCEPTED.get(LLM_PROVIDER, True)
+            else " temperature=n/a"
+        )
         + (
             f" seed={'default' if LLM_SEED is None else LLM_SEED}"
             if SEED_IS_ACCEPTED.get(LLM_PROVIDER, False)

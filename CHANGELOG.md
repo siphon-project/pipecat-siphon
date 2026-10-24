@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The agent example runs on OpenAI's Realtime model.** `BOT_BACKEND=openai-realtime` is the
+  second speech-to-speech backend beside `gemini-live`: one model hears, answers and speaks, on
+  `gpt-realtime-2.1` with the voice `marin` unless `BOT_LLM_MODEL` / `BOT_TTS_VOICE` say otherwise,
+  under `OPENAI_API_KEY` alone. The Realtime API takes 24 kHz PCM only and pipecat passes the
+  caller's audio through unconverted, so on this backend the pipeline's input runs at 24 kHz and
+  the serializer converts from the wire; at 16 kHz the model would hear the caller half again as
+  fast. Its own speech detection ends the caller's turn and interrupts the bot through the
+  strategies the service recommends, which the Gemini strategies would have overridden. The
+  caller's side is transcribed (`gpt-4o-mini-transcribe`, `BOT_STT_MODEL`), in the configured
+  language when one is set. A pinned temperature or seed is withheld, since the session has
+  neither.
 - **The agent example runs on Gemini's native audio.** `BOT_BACKEND=gemini-live` replaces the
   recognizer, model and voice with one Gemini Live model that hears the caller and speaks, and
   decides the caller's turns and interruptions itself, so the serializer passes on none of the

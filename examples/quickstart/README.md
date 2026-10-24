@@ -121,9 +121,9 @@ The bot does three jobs and picks a provider for each, so they can be mixed:
 
 | variable | choices |
 |---|---|
-| `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local`, `gemini-live` |
-| `BOT_STT_PROVIDER` | `deepgram`, `google`, `openai`, `local`, `gemini-live` |
-| `BOT_TTS_PROVIDER` | `cartesia`, `elevenlabs`, `google`, `openai`, `local`, `gemini-live` |
+| `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
+| `BOT_STT_PROVIDER` | `deepgram`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
+| `BOT_TTS_PROVIDER` | `cartesia`, `elevenlabs`, `google`, `openai`, `local`, `gemini-live`, `openai-realtime` |
 
 `BOT_BACKEND` is a preset for all three at once: `cloud` is Claude, Deepgram and Cartesia, `local`
 keeps every model on this host (llama.cpp, faster-whisper, Kokoro) on whichever GPU the image was
@@ -134,6 +134,11 @@ with no recognizer or voice around it, and detects the caller's turns and interr
 fills all three roles or none, so it is selected as a backend rather than mixed, and needs only
 `GOOGLE_API_KEY`. `BOT_LLM_MODEL` picks the Live model, `BOT_TTS_VOICE` one of its voices
 (`Charon` by default) and `BOT_TTS_LANGUAGE` the one language it speaks.
+
+`BOT_BACKEND=openai-realtime` is the same for OpenAI's Realtime model (`gpt-realtime-2.1`, voice
+`marin`), under `OPENAI_API_KEY` alone. It hears 24 kHz only, so on this backend the bot converts
+the caller's audio from the wire's 16 kHz on the way in. A pinned `BOT_LLM_TEMPERATURE` or
+`BOT_LLM_SEED` does not reach it: the Realtime session has neither.
 
 `BOT_TTS_PROVIDER=elevenlabs` speaks through ElevenLabs' streaming WebSocket API, at the wire's
 16 kHz, on `eleven_flash_v2_5` unless `BOT_TTS_MODEL` says otherwise. It needs `ELEVENLABS_API_KEY`
