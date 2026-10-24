@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-24
+
+The package's one change is the clustered siphon-pbx session token below; the rest is the agent
+example's.
+
 ### Added
 
 - **The agent example runs on OpenAI's Realtime model.** `BOT_BACKEND=openai-realtime` is the
