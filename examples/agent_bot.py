@@ -11,9 +11,9 @@ call itself driven over the control plane rather than left as an anonymous audio
 Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chosen for each:
 
     BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live | openai-realtime
-    BOT_STT_PROVIDER   deepgram  | elevenlabs | soniox | google | openai | local
+    BOT_STT_PROVIDER   deepgram  | elevenlabs | soniox | azure | google | openai | local
                        | gemini-live | openai-realtime
-    BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local
+    BOT_TTS_PROVIDER   cartesia  | elevenlabs | azure | google | openai | local
                        | gemini-live | openai-realtime
 
 `BOT_BACKEND` is a preset for all three: `cloud` is Claude, Deepgram and Cartesia, `local` keeps
@@ -33,8 +33,8 @@ Each provider asks for its own credential, read from the environment. The defaul
     pip install "pipecat-ai[anthropic,deepgram,cartesia,websocket]" uvicorn
     python examples/agent_bot.py --host 0.0.0.0 --port 9001
 
-Install one extra per provider you point a role at (`google`, `openai`, `elevenlabs`, `whisper`,
-`kokoro`), and
+Install one extra per provider you point a role at (`google`, `openai`, `elevenlabs`, `azure`,
+`whisper`, `kokoro`), and
 note that Gemini and Google's speech APIs are different products: `GOOGLE_API_KEY` for the model,
 application default credentials for the recognizer and the voice -- `GOOGLE_APPLICATION_CREDENTIALS`
 pointing at a service-account JSON file, or on Google Cloud the instance's own service account with
@@ -415,6 +415,7 @@ STT_PROVIDERS = (
     "deepgram",
     "elevenlabs",
     "soniox",
+    "azure",
     "google",
     "openai",
     "local",
@@ -425,6 +426,7 @@ STT_PROVIDERS = (
 TTS_PROVIDERS = (
     "cartesia",
     "elevenlabs",
+    "azure",
     "google",
     "openai",
     "local",
@@ -483,7 +485,8 @@ STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _ROLE_PRESET[1])
 for faster-whisper."""
 
 TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _ROLE_PRESET[2])
-"""Who speaks for the bot: `cartesia`, `elevenlabs`, `google`, `openai`, or `local` for Kokoro."""
+"""Who speaks for the bot: `cartesia`, `elevenlabs`, `azure`, `google`, `openai`, or `local` for
+Kokoro."""
 
 
 def speech_to_speech() -> bool:
@@ -579,6 +582,8 @@ DEFAULT_STT_MODEL: dict[str, str] = {
     # the one model of theirs that refuses a speech-adaptation config, so do not add one.
     "google": "telephony",
     "openai": "gpt-4o-mini-transcribe",
+    # Empty: Azure chooses the model for the recognizer's locale.
+    "azure": "",
     # faster-whisper's distilled medium English model, pipecat's own local default today, named
     # here so the example does not drift with it.
     "local": "Systran/faster-distil-whisper-medium.en",
@@ -609,6 +614,8 @@ DEFAULT_STT_LANGUAGE: dict[str, str] = {
     # Google wants BCP-47, and its telephony model is per-language.
     "google": "en-US",
     "openai": "en",
+    # Azure recognizes one locale at a time, given as BCP-47.
+    "azure": "en-US",
     # Whisper has no `multi`, and the pinned model above is English-only. Choose a multilingual
     # model before changing this: pipecat refuses an English-only model paired with any other
     # language, and that refusal happens when the model loads, which here is startup.
@@ -638,6 +645,8 @@ DEFAULT_TTS_MODEL: dict[str, str] = {
     # how you get a voice and a model that disagree.
     "google": "",
     "openai": "gpt-4o-mini-tts",
+    # Empty: an Azure voice is its own model.
+    "azure": "",
     # Empty: Kokoro v1.0 serves one model and is selected by voice alone.
     "local": "",
     # Empty: the voice is the model's own.
@@ -662,6 +671,8 @@ DEFAULT_TTS_VOICE: dict[str, str] = {
     "elevenlabs": "",
     "google": "en-US-Chirp3-HD-Charon",
     "openai": "alloy",
+    # Multilingual, so a configured language is spoken natively without a voice map entry.
+    "azure": "en-US-AvaMultilingualNeural",
     "local": "af_heart",
     # One of Gemini's prebuilt voices, which speak every language the model does.
     "gemini-live": "Charon",
@@ -858,7 +869,8 @@ def _refuse_what_the_local_voice_cannot_speak(
                 f"the local voice (Kokoro) cannot speak {language!r}: it speaks only "
                 f"{', '.join(sorted(KOKORO_VOICE_PREFIXES))}, and would read {language!r} in an "
                 "English accent. Choose a hosted voice for it with BOT_TTS_PROVIDER "
-                "(cartesia, elevenlabs, google or openai), or remove it from BOT_TTS_LANGUAGES."
+                "(cartesia, elevenlabs, azure, google or openai), or remove it from "
+                "BOT_TTS_LANGUAGES."
             )
         voice = languages.voice_for(language) or default_voice
         if not voice or voice[0] not in prefixes:
@@ -921,9 +933,30 @@ def speaking_settings(
         "language": as_pipecat_language(language),
         "voice": speaking_voice(provider, language, languages, default_voice),
     }
+    if provider == "azure":
+        settings["language"] = azure_locale(language)
+        # Inside the voice as `<lang xml:lang>`: without it a multilingual voice guesses the
+        # language from the text, and a short Dutch reply can be read as English.
+        settings["force_locale"] = True
     if provider == "openai" and TTS_MODEL.startswith("gpt-"):
         settings["instructions"] = OPENAI_ACCENT_INSTRUCTIONS.format(language=language)
     return settings
+
+
+def azure_locale(language: str) -> str:
+    """Name `language` as the locale Azure's voice wants: `nl-NL` for `nl`.
+
+    pipecat 1.12's Azure voice never makes this conversion itself. `AzureTTSService` lists
+    `TTSService` before its Azure base, so the base class's `language_to_service_language`, which
+    returns the enum unchanged, shadows the Azure one, and the SSML says `xml:lang='nl'`. A locale
+    given as a string survives that path as itself, on construction and on a mid-call switch.
+    """
+    from pipecat.services.azure.common import language_to_azure_language
+
+    pipecat_language = as_pipecat_language(language)
+    if not isinstance(pipecat_language, Language):
+        return language
+    return language_to_azure_language(pipecat_language) or language
 
 
 def default_tts_voice() -> str:
@@ -3635,6 +3668,12 @@ def build_transport(
     )
 
 
+AZURE_SPEECH_ENVIRONMENT = (
+    ("AZURE_SPEECH_API_KEY", "Azure Speech key"),
+    ("AZURE_SPEECH_REGION", "Azure Speech region, such as westeurope"),
+)
+"""What Azure's recognizer and voice both need: one Speech resource's key, and its region."""
+
 REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ("llm", "anthropic"): (("ANTHROPIC_API_KEY", "Claude API key"),),
     ("llm", "google"): (("GOOGLE_API_KEY", "Gemini API key"),),
@@ -3648,6 +3687,7 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     # a variable at all. `refuse_missing_google_cloud_credentials` checks them instead.
     ("stt", "google"): (),
     ("stt", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
+    ("stt", "azure"): AZURE_SPEECH_ENVIRONMENT,
     # Nothing: the model downloads itself.
     ("stt", "local"): (),
     ("tts", "cartesia"): (
@@ -3660,6 +3700,7 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ),
     ("tts", "google"): (),
     ("tts", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
+    ("tts", "azure"): AZURE_SPEECH_ENVIRONMENT,
     ("tts", "local"): (),
     ("llm", "gemini-live"): (("GOOGLE_API_KEY", "Gemini API key"),),
     # Nothing: the one model fills these roles, under the key above.
@@ -4204,6 +4245,7 @@ def build_speech_to_text() -> STTService:
         "soniox": _build_soniox_stt_service,
         "google": _build_google_stt_service,
         "openai": _build_openai_stt_service,
+        "azure": _build_azure_stt_service,
         "local": _build_local_stt_service,
     }
     return builders[STT_PROVIDER]()
@@ -4290,6 +4332,22 @@ def _build_google_stt_service() -> STTService:
     )
 
 
+def _build_azure_stt_service() -> STTService:
+    """Build Azure's recognizer, in one locale, on its own phrase segmentation.
+
+    Azure ends a phrase after its own silence, 500 ms by default, and only then delivers the
+    transcript; the turn is still the engine's, which waits for that transcript as for any other.
+    """
+    from pipecat.services.azure.stt import AzureSTTService
+
+    return AzureSTTService(
+        api_key=_provider_key("stt", "azure", "AZURE_SPEECH_API_KEY"),
+        region=_provider_key("stt", "azure", "AZURE_SPEECH_REGION"),
+        settings=AzureSTTService.Settings(language=Language(STT_LANGUAGE)),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
+
+
 def _build_openai_stt_service() -> STTService:
     """Build OpenAI's recognizer."""
     from pipecat.services.openai.stt import OpenAISTTService
@@ -4322,6 +4380,7 @@ def build_text_to_speech() -> TTSService:
         "elevenlabs": _build_elevenlabs_tts_service,
         "google": _build_google_tts_service,
         "openai": _build_openai_tts_service,
+        "azure": _build_azure_tts_service,
         "local": _build_local_tts_service,
     }
     return builders[TTS_PROVIDER]()
@@ -4397,6 +4456,27 @@ def _build_google_tts_service() -> TTSService:
                 "voice": TTS_VOICE,
                 "model": TTS_MODEL or NOT_GIVEN,
                 **_starting_speaking_settings("google", TTS_VOICE),
+            }
+        ),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
+
+
+def _build_azure_tts_service() -> TTSService:
+    """Build Azure's voice, streamed through the Speech SDK as raw PCM at the pipeline's rate."""
+    from pipecat.services.azure.tts import AzureTTSService
+
+    # `NOT_GIVEN` rather than `None`, as for Google: pipecat reads None as a value to send.
+    from pipecat.utils.types import NOT_GIVEN
+
+    return AzureTTSService(
+        api_key=_provider_key("tts", "azure", "AZURE_SPEECH_API_KEY"),
+        region=_provider_key("tts", "azure", "AZURE_SPEECH_REGION"),
+        settings=AzureTTSService.Settings(
+            **{
+                "voice": TTS_VOICE,
+                "model": TTS_MODEL or NOT_GIVEN,
+                **_starting_speaking_settings("azure", TTS_VOICE),
             }
         ),
         sample_rate=PIPELINE_SAMPLE_RATE,
