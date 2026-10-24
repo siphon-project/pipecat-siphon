@@ -19,6 +19,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    InputAudioRawFrame,
     LLMContextFrame,
     STTMetadataFrame,
     TextFrame,
@@ -772,6 +773,7 @@ class TestServiceImportsAreLazy:
             "google": ("pipecat.services.google",),
             "openai": ("pipecat.services.openai",),
             "local": ("pipecat.services.whisper", "pipecat.services.kokoro"),
+            "gemini-live": ("pipecat.services.google",),
         }
         providers = set(agent_bot.LLM_PROVIDERS + agent_bot.STT_PROVIDERS + agent_bot.TTS_PROVIDERS)
         unmapped = providers - packages_by_provider.keys()
@@ -4347,3 +4349,315 @@ class TestAConfigurationShapesTheCall:
             facts=agent_bot.CallFacts(caller="15550142"),
         )
         assert lookups == [("https://accounts.example.invalid/c/{caller}", "15550142")]
+
+
+GEMINI_LIVE_PROVIDERS = {"llm": "gemini-live", "stt": "gemini-live", "tts": "gemini-live"}
+
+
+def _select_speech_to_speech(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point all three roles at Gemini Live, as `BOT_BACKEND=gemini-live` does."""
+    for role in ("llm", "stt", "tts"):
+        _select(monkeypatch, role, "gemini-live")
+
+
+class TestSpeechToSpeechSelection:
+    """Gemini Live hears, answers and speaks in one model, so it fills all three roles or none."""
+
+    def test_the_preset_is_a_backend(self) -> None:
+        refuse_an_unknown_backend("gemini-live")
+
+    def test_it_needs_only_the_gemini_key(self) -> None:
+        assert missing_environment(GEMINI_LIVE_PROVIDERS, {}) == ["GOOGLE_API_KEY"]
+
+    @pytest.mark.parametrize(
+        "providers",
+        [
+            {"llm": "gemini-live", "stt": "deepgram", "tts": "cartesia"},
+            {"llm": "anthropic", "stt": "gemini-live", "tts": "cartesia"},
+            {"llm": "gemini-live", "stt": "gemini-live", "tts": "google"},
+        ],
+    )
+    def test_a_split_selection_is_refused(self, providers: dict[str, str]) -> None:
+        """A recognizer or a voice beside a speech-to-speech model would never be in the call."""
+        import agent_bot
+
+        with pytest.raises(ValueError, match="BOT_BACKEND=gemini-live"):
+            agent_bot.refuse_a_split_speech_to_speech(providers)
+
+    def test_a_cascade_is_not_refused(self) -> None:
+        import agent_bot
+
+        agent_bot.refuse_a_split_speech_to_speech(CLOUD_PROVIDERS)
+
+    def test_more_than_one_speaking_language_is_refused(self) -> None:
+        """The voice is the model's own, so there is no voice to switch mid-call."""
+        import agent_bot
+
+        with pytest.raises(ValueError, match="gemini-live"):
+            agent_bot.resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGES": "nl,en"}, "gemini-live", "Charon"
+            )
+
+    def test_one_speaking_language_is_accepted(self) -> None:
+        import agent_bot
+
+        languages = agent_bot.resolve_speaking_languages(
+            {"BOT_TTS_LANGUAGE": "nl"}, "gemini-live", "Charon"
+        )
+        assert languages.starting == "nl"
+
+
+@pytest.mark.usefixtures("_vendor_credentials")
+class TestGeminiLiveBuilds:
+    """The speech-to-speech service is built with what the cascade's three services were told."""
+
+    def test_the_service_carries_model_voice_language_prompt_and_tools(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.adapters.schemas.function_schema import FunctionSchema
+        from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch)
+        tool = FunctionSchema(name="end_call", description="d", properties={}, required=[])
+
+        service = agent_bot.build_llm_service(with_hangup=True, tools=[tool])
+
+        assert isinstance(service, GeminiLiveLLMService)
+        settings: Any = service.settings
+        assert settings.model == agent_bot.DEFAULT_LLM_MODEL["gemini-live"]
+        assert settings.voice == agent_bot.DEFAULT_TTS_VOICE["gemini-live"]
+        assert settings.language == "en-US"
+        assert settings.system_instruction.startswith("You are a voice assistant")
+        # On the constructor, not the context: tools arriving on the context make the service
+        # reconnect before it can greet the caller.
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+        tools_from_init = service._tools_from_init
+        assert isinstance(tools_from_init, ToolsSchema)
+        assert [schema.name for schema in tools_from_init.standard_tools] == ["end_call"]
+
+    def test_the_speaking_language_is_sent_as_a_locale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gemini wants `nl-NL`; pipecat 1.12 sends an enum's bare value, `nl`, unconverted."""
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch)
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+
+        service = agent_bot.build_llm_service(with_hangup=False)
+
+        settings: Any = service.settings
+        assert settings.language == "nl-NL"
+
+
+class TestSpeechToSpeechCall:
+    """A Gemini Live call is the model between the wire's two ends, and the turn is the model's."""
+
+    @staticmethod
+    def _build(
+        monkeypatch: pytest.MonkeyPatch, control: ControlPlane | None
+    ) -> tuple[list[FrameProcessor], list[object], dict[str, Any]]:
+        import agent_bot
+
+        serializers, _workers = TestObserverHook._stub_the_call(monkeypatch)
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "gemini-live")
+
+        def refuse() -> FrameProcessor:
+            raise AssertionError("a speech-to-speech call builds no recognizer or voice")
+
+        monkeypatch.setattr(agent_bot, "build_speech_to_text", refuse)
+        monkeypatch.setattr(agent_bot, "build_text_to_speech", refuse)
+        llm_arguments: dict[str, Any] = {}
+
+        def recording_llm(with_hangup: bool, **settings: Any) -> FrameProcessor:
+            llm_arguments.update(settings, with_hangup=with_hangup)
+            return FrameProcessor()
+
+        monkeypatch.setattr(agent_bot, "build_llm_service", recording_llm)
+        built: list[list[FrameProcessor]] = []
+
+        def recording_pipeline(processors: list[FrameProcessor]) -> Pipeline:
+            built.append(processors)
+            return Pipeline(processors)
+
+        monkeypatch.setattr(agent_bot, "Pipeline", recording_pipeline)
+        websocket: Any = object()
+        agent_bot.build_worker(websocket, control)
+        return built[0], serializers, llm_arguments
+
+    def test_no_echo_guard_and_the_engine_speech_edges_are_not_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The model detects speech itself. A second detector would interrupt it on its own.
+
+        And the echo guard drops transcripts whatever their direction, which here are the model's
+        own record of what the caller said, travelling upstream.
+        """
+        import agent_bot
+
+        processors, serializers, _llm = self._build(monkeypatch, None)
+
+        assert not any(isinstance(p, agent_bot.EchoGuard) for p in processors)
+        serializer: Any = serializers[0]
+        assert serializer._params.speech_frames == "none"
+
+    def test_the_tools_go_to_the_service_and_not_the_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        processors, _serializers, llm = self._build(
+            monkeypatch, ControlPlane(application="agent-app", token="t", url="ws://127.0.0.1:9/x")
+        )
+
+        assert [schema.name for schema in llm["tools"]][:1] == ["end_call"]
+        from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
+
+        aggregator = next(p for p in processors if isinstance(p, LLMUserAggregator))
+        assert not aggregator.context.tools
+
+    def test_a_transfer_hold_also_holds_the_callers_audio(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a recognizer the model hears the audio itself, so audio is what must be held."""
+        import agent_bot
+
+        processors, _serializers, _llm = self._build(
+            monkeypatch, ControlPlane(application="agent-app", token="t", url="ws://127.0.0.1:9/x")
+        )
+
+        hold = next(p for p in processors if isinstance(p, agent_bot.TransferHold))
+        assert hold.holds_audio
+
+    async def test_holding_audio_drops_it_and_releasing_lets_it_through(self) -> None:
+        import agent_bot
+
+        hold = agent_bot.TransferHold(hold_audio=True)
+        hold.engage()
+        await run_test(
+            hold,
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+                TextFrame("not the caller"),
+            ],
+            expected_down_frames=[TextFrame],
+        )
+        hold.release()
+        await run_test(
+            hold,
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1)
+            ],
+            expected_down_frames=[InputAudioRawFrame],
+        )
+
+    async def test_the_cascade_hold_keeps_passing_audio(self) -> None:
+        """The recognizer sits in front of the hold there and has already heard the audio."""
+        import agent_bot
+
+        hold = agent_bot.TransferHold()
+        hold.engage()
+        await run_test(
+            hold,
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1)
+            ],
+            expected_down_frames=[InputAudioRawFrame],
+        )
+
+
+class _SpeakingNow(BotSpeechMonitor):
+    """A monitor that says the bot holds the line, or does not, as told."""
+
+    def __init__(self, ours: bool) -> None:
+        super().__init__()
+        self.ours = ours
+
+    def line_is_ours(self, tail_seconds: float) -> bool:
+        return self.ours
+
+
+class _AudioRecorder(FrameProcessor):
+    """Keep the audio that reaches it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.audio: list[bytes] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self.audio.append(frame.audio)
+        await self.push_frame(frame, direction)
+
+
+class TestEchoGate:
+    """While the bot holds the line, a speech-to-speech model hears silence, not its own echo.
+
+    It detects the caller's speech in the audio itself, so an echo the engine could not cancel is
+    the caller interrupting, and the bot cuts itself off a syllable into every sentence.
+    """
+
+    async def _pass(self, ours: bool) -> list[bytes]:
+        import agent_bot
+
+        recorder = _AudioRecorder()
+        gate = agent_bot.EchoGate(_SpeakingNow(ours), tail_seconds=0.6)
+        await run_test(
+            Pipeline([gate, recorder]),
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                InputAudioRawFrame(audio=b"\x10\x20" * 160, sample_rate=16000, num_channels=1)
+            ],
+            expected_down_frames=[InputAudioRawFrame],
+        )
+        return recorder.audio
+
+    async def test_the_bots_turn_is_silenced_at_the_same_length(self) -> None:
+        """Silence rather than nothing, so the model's audio clock keeps running."""
+        assert await self._pass(ours=True) == [b"\x00\x00" * 160]
+
+    async def test_the_callers_turn_passes_untouched(self) -> None:
+        assert await self._pass(ours=False) == [b"\x10\x20" * 160]
+
+    def test_the_gate_is_in_a_speech_to_speech_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        processors, _serializers, _llm = TestSpeechToSpeechCall._build(monkeypatch, None)
+
+        gates = [p for p in processors if isinstance(p, agent_bot.EchoGate)]
+        assert len(gates) == 1
+        assert processors.index(gates[0]) < next(
+            index for index, p in enumerate(processors) if type(p).__name__ == "LLMUserAggregator"
+        )
+
+    def test_no_tail_means_no_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A leg whose echo is cancelled can have its barge-in back."""
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "ECHO_GUARD_TAIL_SECONDS", 0.0)
+        processors, _serializers, _llm = TestSpeechToSpeechCall._build(monkeypatch, None)
+
+        assert not any(isinstance(p, agent_bot.EchoGate) for p in processors)
+
+
+@pytest.mark.usefixtures("_vendor_credentials")
+class TestGeminiLiveSpeechDetection:
+    def test_the_start_of_speech_is_detected_at_low_sensitivity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a phone line the residual echo and the line noise are not the caller starting."""
+        from google.genai.types import StartSensitivity
+
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch)
+
+        service = agent_bot.build_llm_service(with_hangup=False)
+
+        settings: Any = service.settings
+        assert settings.vad.start_sensitivity == StartSensitivity.START_SENSITIVITY_LOW

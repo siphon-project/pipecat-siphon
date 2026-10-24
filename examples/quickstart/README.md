@@ -121,13 +121,19 @@ The bot does three jobs and picks a provider for each, so they can be mixed:
 
 | variable | choices |
 |---|---|
-| `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local` |
-| `BOT_STT_PROVIDER` | `deepgram`, `google`, `openai`, `local` |
-| `BOT_TTS_PROVIDER` | `cartesia`, `google`, `openai`, `local` |
+| `BOT_LLM_PROVIDER` | `anthropic`, `google`, `openai`, `local`, `gemini-live` |
+| `BOT_STT_PROVIDER` | `deepgram`, `google`, `openai`, `local`, `gemini-live` |
+| `BOT_TTS_PROVIDER` | `cartesia`, `google`, `openai`, `local`, `gemini-live` |
 
 `BOT_BACKEND` is a preset for all three at once: `cloud` is Claude, Deepgram and Cartesia, `local`
 keeps every model on this host (llama.cpp, faster-whisper, Kokoro) on whichever GPU the image was
 built for. Set a role on its own to override the preset for that role only.
+
+`BOT_BACKEND=gemini-live` is Gemini's native audio: one model hears the caller, answers and speaks,
+with no recognizer or voice around it, and detects the caller's turns and interruptions itself. It
+fills all three roles or none, so it is selected as a backend rather than mixed, and needs only
+`GOOGLE_API_KEY`. `BOT_LLM_MODEL` picks the Live model, `BOT_TTS_VOICE` one of its voices
+(`Charon` by default) and `BOT_TTS_LANGUAGE` the one language it speaks.
 
 Each provider asks for its own credential and the bot names whatever is missing at startup rather
 than at the first call. Two things catch people out. Gemini and Google's speech APIs are different

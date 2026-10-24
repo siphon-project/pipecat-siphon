@@ -88,7 +88,8 @@ RUN if [ -n "$BOT_EXTRAS" ]; then extras="$BOT_EXTRAS"; \
         case "$BOT_BACKEND" in \
             cloud) extras="anthropic,deepgram,cartesia,websocket" ;; \
             local) extras="whisper,kokoro,websocket" ;; \
-            *) echo "unknown BOT_BACKEND: $BOT_BACKEND (cloud, local)" >&2; exit 2 ;; \
+            gemini-live) extras="google,websocket" ;; \
+            *) echo "unknown BOT_BACKEND: $BOT_BACKEND (cloud, local, gemini-live)" >&2; exit 2 ;; \
         esac \
     fi \
     # Keyed on the recognizer actually installed rather than on the preset, so a mixed image that

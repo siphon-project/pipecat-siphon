@@ -10,14 +10,16 @@ call itself driven over the control plane rather than left as an anonymous audio
 
 Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chosen for each:
 
-    BOT_LLM_PROVIDER   anthropic | google | openai | local
-    BOT_STT_PROVIDER   deepgram  | google | openai | local
-    BOT_TTS_PROVIDER   cartesia  | google | openai | local
+    BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live
+    BOT_STT_PROVIDER   deepgram  | google | openai | local | gemini-live
+    BOT_TTS_PROVIDER   cartesia  | google | openai | local | gemini-live
 
 `BOT_BACKEND` is a preset for all three: `cloud` is Claude, Deepgram and Cartesia, `local` keeps
-every model on this host. Each role can be overridden on its own, because the useful combinations
-are mixed -- a hosted model with a local recognizer, say. Everything that is not a model is the same
-object whichever is selected, which is what makes two providers comparable at all.
+every model on this host, and `gemini-live` is Gemini's native audio, one model that hears, answers
+and speaks, detecting the caller's turns itself. Each role can be overridden on its own, because
+the useful combinations are mixed -- a hosted model with a local recognizer, say. Everything that
+is not a model is the same object whichever is selected, which is what makes two providers
+comparable at all.
 
 Each provider asks for its own credential, read from the environment. The default selection wants:
 
@@ -156,6 +158,7 @@ from pipecat.frames.frames import (
     EndWorkerFrame,
     ErrorFrame,
     Frame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
@@ -376,21 +379,30 @@ def resolve_system_prompt(environment: Mapping[str, str]) -> str:
     return prompt
 
 
-LLM_PROVIDERS = ("anthropic", "google", "openai", "local")
+SPEECH_TO_SPEECH_PROVIDERS = ("gemini-live",)
+"""Providers whose one model hears the caller, answers and speaks, so they fill all three roles.
+
+Audio goes to the model and audio comes back: there is no transcript to decide a turn on and no text
+to synthesize, and the model detects the caller's speech and interruptions itself. A recognizer or a
+voice from another provider beside one would never be in the call, so a selection that splits one
+off is refused at startup; see `refuse_a_split_speech_to_speech`."""
+
+LLM_PROVIDERS = ("anthropic", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """Who answers a turn."""
 
-STT_PROVIDERS = ("deepgram", "google", "openai", "local")
+STT_PROVIDERS = ("deepgram", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """Who transcribes the caller."""
 
-TTS_PROVIDERS = ("cartesia", "google", "openai", "local")
+TTS_PROVIDERS = ("cartesia", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """Who speaks for the bot."""
 
-BACKENDS = ("cloud", "local")
+BACKENDS = ("cloud", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """The presets. A backend is a shorthand for one provider in each of the three roles."""
 
 BACKEND_PRESETS: dict[str, tuple[str, str, str]] = {
     "cloud": ("anthropic", "deepgram", "cartesia"),
     "local": ("local", "local", "local"),
+    **{provider: (provider, provider, provider) for provider in SPEECH_TO_SPEECH_PROVIDERS},
 }
 """What each backend name means, as (LLM, recognizer, synthesizer).
 
@@ -421,13 +433,26 @@ def _selected_provider(variable: str, preset: str) -> str:
 
 
 LLM_PROVIDER = _selected_provider("BOT_LLM_PROVIDER", _PRESET[0])
-"""Who answers a turn: `anthropic`, `google`, `openai`, or `local` for a server on this host."""
+"""Who answers a turn: `anthropic`, `google`, `openai`, `local` for a server on this host, or
+`gemini-live` for Gemini's native audio."""
 
-STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _PRESET[1])
+_ROLE_PRESET = (
+    BACKEND_PRESETS[LLM_PROVIDER] if LLM_PROVIDER in SPEECH_TO_SPEECH_PROVIDERS else _PRESET
+)
+"""The other two roles follow a speech-to-speech model, so `BOT_LLM_PROVIDER=gemini-live` alone
+selects it whole rather than leaving the backend's recognizer and voice beside it."""
+
+STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _ROLE_PRESET[1])
 """Who transcribes the caller: `deepgram`, `google`, `openai`, or `local` for faster-whisper."""
 
-TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _PRESET[2])
+TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _ROLE_PRESET[2])
 """Who speaks for the bot: `cartesia`, `google`, `openai`, or `local` for Kokoro."""
+
+
+def speech_to_speech() -> bool:
+    """Whether the selected model hears and speaks itself, read when a call is built."""
+    return LLM_PROVIDER in SPEECH_TO_SPEECH_PROVIDERS
+
 
 LOCAL_LLM_MODEL = "local"
 """The model name the local path asks for when `BOT_LLM_MODEL` is unset. `llama-server` serves one
@@ -440,6 +465,9 @@ DEFAULT_LLM_MODEL: dict[str, str] = {
     "google": "gemini-2.5-flash",
     "openai": "gpt-4.1",
     "local": LOCAL_LLM_MODEL,
+    # The Gemini API's name; on Vertex the same model has another. pipecat's own default moved
+    # from a 2.5 native-audio preview to this between 1.12 and 1.13, which is why it is pinned.
+    "gemini-live": "models/gemini-3.8-live",
 }
 """Which model each provider is asked for when `BOT_LLM_MODEL` says nothing.
 
@@ -487,6 +515,7 @@ SEED_IS_ACCEPTED: dict[str, bool] = {
     "google": True,
     "openai": True,
     "local": True,
+    "gemini-live": True,
 }
 """Which LLM providers take a sampling seed.
 
@@ -503,6 +532,8 @@ DEFAULT_STT_MODEL: dict[str, str] = {
     # faster-whisper's distilled medium English model, pipecat's own local default today, named
     # here so the example does not drift with it.
     "local": "Systran/faster-distil-whisper-medium.en",
+    # Empty: the model hears the caller itself.
+    "gemini-live": "",
 }
 """Which recognizer model each provider is asked for.
 
@@ -525,6 +556,8 @@ DEFAULT_STT_LANGUAGE: dict[str, str] = {
     # model before changing this: pipecat refuses an English-only model paired with any other
     # language, and that refusal happens when the model loads, which here is startup.
     "local": "en",
+    # What the model is told it will hear and speak, when `BOT_TTS_LANGUAGE` names nothing.
+    "gemini-live": "en-US",
 }
 """Which language each recognizer is pinned to when `BOT_STT_LANGUAGE` says nothing."""
 
@@ -545,6 +578,8 @@ DEFAULT_TTS_MODEL: dict[str, str] = {
     "openai": "gpt-4o-mini-tts",
     # Empty: Kokoro v1.0 serves one model and is selected by voice alone.
     "local": "",
+    # Empty: the voice is the model's own.
+    "gemini-live": "",
 }
 """Which synthesizer model each provider is asked for. Empty means the provider takes none."""
 
@@ -563,6 +598,8 @@ DEFAULT_TTS_VOICE: dict[str, str] = {
     "google": "en-US-Chirp3-HD-Charon",
     "openai": "alloy",
     "local": "af_heart",
+    # One of Gemini's prebuilt voices, which speak every language the model does.
+    "gemini-live": "Charon",
 }
 """Which voice each synthesizer is asked for when `BOT_TTS_VOICE` says nothing."""
 
@@ -726,6 +763,14 @@ def resolve_speaking_languages(
     )
     if provider == "local":
         _refuse_what_the_local_voice_cannot_speak(languages, default_voice)
+    if provider in SPEECH_TO_SPEECH_PROVIDERS and (languages.switchable or languages.voices):
+        # The language is told to the model when its session opens and the voice is its own,
+        # so there is nothing a mid-call switch could send. Asked in the prompt, it still answers
+        # a caller in their language; a list here would only promise a tool that does nothing.
+        raise ValueError(
+            f"{provider} speaks one configured language per call: set BOT_TTS_LANGUAGE alone, "
+            "without BOT_TTS_LANGUAGES or BOT_TTS_VOICES, and BOT_TTS_VOICE to one of its voices"
+        )
     return languages
 
 
@@ -2067,10 +2112,22 @@ class TransferHold(FrameProcessor):
     )
     """What opens or feeds a caller turn: the engine's speech edges and the recognizer's words."""
 
-    def __init__(self) -> None:
-        """Start open: a call is not on hold until a transfer puts it there."""
+    def __init__(self, hold_audio: bool = False) -> None:
+        """Start open: a call is not on hold until a transfer puts it there.
+
+        `hold_audio` holds the caller's audio as well, for a speech-to-speech model: there is no
+        recognizer in front of it, so the audio is what it hears and would answer.
+        """
         super().__init__()
         self._holding = False
+        self._held_frames: tuple[type[Frame], ...] = self.HELD_FRAMES + (
+            (InputAudioRawFrame,) if hold_audio else ()
+        )
+
+    @property
+    def holds_audio(self) -> bool:
+        """Whether the caller's audio is held too, not only what a recognizer made of it."""
+        return InputAudioRawFrame in self._held_frames
 
     @property
     def holding(self) -> bool:
@@ -2088,7 +2145,7 @@ class TransferHold(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Pass everything except a caller's speech while the hold is on."""
         await super().process_frame(frame, direction)
-        if self._holding and isinstance(frame, self.HELD_FRAMES):
+        if self._holding and isinstance(frame, self._held_frames):
             return
         await self.push_frame(frame, direction)
 
@@ -3322,14 +3379,48 @@ class DanglingWordUserTurnStopStrategy(BaseUserTurnStopStrategy):  # type: ignor
         await self._cancel_hold()
 
 
+class EchoGate(FrameProcessor):
+    """Give a speech-to-speech model silence instead of the line while the bot holds it.
+
+    `EchoGuard`'s job, for a model that hears audio rather than reading transcripts. It detects the
+    caller's speech in the audio itself, so the bot's own voice coming back on a leg whose echo the
+    engine cannot cancel is, to it, the caller interrupting: it stops a syllable into every
+    sentence. Seen on a carrier leg whose canceller locked on a weak peak and passed the echo on.
+
+    Silence rather than nothing, at the same length, so the model's audio clock keeps running and
+    its detector sees the bot's turn as quiet rather than as a gap. The cost is `EchoGuard`'s: a
+    caller cannot talk over the bot, and what they say into the gate is not heard. Set
+    `BOT_ECHO_GUARD_TAIL` to 0 to take the gate out, once the engine cancels the echo itself.
+    """
+
+    def __init__(self, speech: BotSpeechMonitor, tail_seconds: float) -> None:
+        """Gate against `speech`'s idea of who holds the line, for `tail_seconds` after it ends."""
+        super().__init__()
+        self._speech = speech
+        self._tail = tail_seconds
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Pass the caller's audio, or silence of the same length while the line is ours."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and self._speech.line_is_ours(self._tail):
+            frame = InputAudioRawFrame(
+                audio=bytes(len(frame.audio)),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+        await self.push_frame(frame, direction)
+
+
 def build_serializer() -> SiphonFrameSerializer:
     """Build the wire serializer, kept as its own object so the tools can read its `call_id`."""
     return SiphonFrameSerializer(
         params=SiphonFrameSerializer.InputParams(
             # The engine's VAD drives the turn, so there is no VAD analyzer in this pipeline at
             # all -- its edges arrive as the frames pipecat's own turn-start strategy already
-            # consumes.
-            speech_frames="vad",
+            # consumes. Except for a speech-to-speech model, which detects the caller's speech in
+            # the audio itself: the engine's edges would be a second detector, interrupting it on
+            # its own and disagreeing with it about where a turn starts.
+            speech_frames="none" if speech_to_speech() else "vad",
             stereo_input="caller",
             # The wire rate is known before `start` arrives, because the profile above asks for
             # it. Saying so keeps the serializer from building a resampler for the handful of
@@ -3382,6 +3473,10 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ("tts", "google"): (),
     ("tts", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
     ("tts", "local"): (),
+    ("llm", "gemini-live"): (("GOOGLE_API_KEY", "Gemini API key"),),
+    # Nothing: the one model fills these roles, under the key above.
+    ("stt", "gemini-live"): (),
+    ("tts", "gemini-live"): (),
 }
 """What each provider cannot start without, in each role, and what the value is for.
 
@@ -3496,6 +3591,27 @@ def _provider_summary(providers: Mapping[str, str]) -> str:
         if chosen == preset:
             return f"the {name} backend"
     return "llm={}, stt={}, tts={}".format(*chosen)
+
+
+def refuse_a_split_speech_to_speech(providers: Mapping[str, str]) -> None:
+    """Stop a speech-to-speech provider chosen for some roles and not the others.
+
+    Its model hears, answers and speaks in one, so a recognizer or a voice beside it would be built
+    and billed and never hear or say a word, and a speech-to-speech recognizer behind another model
+    has no transcript to give it.
+
+    Raises:
+        ValueError: Naming the selection and the preset that selects the provider whole.
+
+    """
+    chosen = {providers.get(role, "") for role in ("llm", "stt", "tts")}
+    for provider in SPEECH_TO_SPEECH_PROVIDERS:
+        if provider in chosen and chosen != {provider}:
+            raise ValueError(
+                f"{_provider_summary(providers)} splits {provider} across roles, but it hears, "
+                f"answers and speaks in one model: set BOT_BACKEND={provider} and leave "
+                "BOT_LLM_PROVIDER, BOT_STT_PROVIDER and BOT_TTS_PROVIDER unset"
+            )
 
 
 def refuse_an_unknown_backend(backend: str) -> None:
@@ -3644,6 +3760,7 @@ def build_llm_service(
     call_back: bool = False,
     configuration: CallConfiguration | None = None,
     facts: CallFacts | None = None,
+    tools: list[FunctionSchema] | None = None,
 ) -> LLMService[Any]:
     """Build the LLM service for the selected backend, tuned for a conversation in real time.
 
@@ -3651,6 +3768,8 @@ def build_llm_service(
     is siphon-pbx's for this call, whose instructions and options the model is told, and whose
     `end_call` reports rather than hangs up. `call_back` says the call_back tool is offered.
     `configuration` is the call's, the bot's own when not given, and `facts` say whose line it is.
+    `tools` are given to a speech-to-speech model at construction; the other models read theirs
+    from the context, and ignore these.
     """
     if configuration is None:
         configuration = default_configuration()
@@ -3671,6 +3790,7 @@ def build_llm_service(
         "google": _build_google_llm_service,
         "openai": _build_openai_llm_service,
         "local": _build_local_llm_service,
+        "gemini-live": lambda instruction: _build_gemini_live_service(instruction, tools or []),
     }
     # Deliberately no `.get(..., default)`: an unrecognised provider is refused at startup, and a
     # silent fallback to one particular vendor would bill somebody for a typo.
@@ -3774,6 +3894,49 @@ def _build_local_llm_service(system_instruction: str) -> LLMService[Any]:
             system_instruction=system_instruction,
             max_completion_tokens=MAXIMUM_RESPONSE_TOKENS,
             **_sampling_settings("local"),
+        ),
+    )
+
+
+def gemini_live_language() -> str:
+    """Name the language Gemini Live is told it hears and speaks, as the locale it wants.
+
+    The configured speaking language, else the recognizer's. pipecat 1.12 sends a `Language` it is
+    given as the enum's own value, `nl` rather than the `nl-NL` Gemini expects, so the conversion
+    happens here rather than being left to whichever pipecat is installed.
+    """
+    from pipecat.services.google.gemini_live.llm import language_to_gemini_language
+
+    code = configured_speaking_languages().starting or STT_LANGUAGE
+    language = as_pipecat_language(code)
+    return language_to_gemini_language(language) if isinstance(language, Language) else code
+
+
+def _build_gemini_live_service(
+    system_instruction: str, tools: list[FunctionSchema]
+) -> LLMService[Any]:
+    """Build Gemini's native-audio service, which hears, answers and speaks in one model.
+
+    Its own voice activity detection decides the caller's turns and interruptions, at a low
+    sensitivity to the start of speech: on a phone line, residual echo and line noise are not the
+    caller starting to talk, and at the default each was enough to cut the bot off. The tools and
+    the prompt go to the constructor rather than the context: tools arriving on the context make it
+    reconnect, which is a second session set up while the caller waits for the greeting.
+    """
+    from google.genai.types import StartSensitivity
+    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
+
+    return GeminiLiveLLMService(
+        api_key=_provider_key("llm", "gemini-live", "GOOGLE_API_KEY"),
+        tools=ToolsSchema(standard_tools=tools) if tools else None,
+        settings=GeminiLiveLLMService.Settings(
+            model=LLM_MODEL,
+            system_instruction=system_instruction,
+            voice=TTS_VOICE or DEFAULT_TTS_VOICE["gemini-live"],
+            language=gemini_live_language(),
+            vad=GeminiVADParams(start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW),
+            max_tokens=MAXIMUM_RESPONSE_TOKENS,
+            **_sampling_settings("gemini-live"),
         ),
     )
 
@@ -3975,6 +4138,16 @@ def build_user_aggregator_params() -> LLMUserAggregatorParams:
     defaults, which choose one way of opening and closing a turn for every backend, and the two
     backends here need different ones: see `build_user_turn_strategies`.
     """
+    if speech_to_speech():
+        # The model decides the turn from the audio, and the serializer passes on no speech edges
+        # for a local strategy to act on. Named rather than left unset, because unset is pipecat's
+        # default stop strategy, which loads a turn model this call has no use for.
+        return LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                start=[VADUserTurnStartStrategy()],
+                stop=[SpeechTimeoutUserTurnStopStrategy()],
+            ),
+        )
     return LLMUserAggregatorParams(
         user_turn_strategies=build_user_turn_strategies(),
         empty_user_turn=EMPTY_TURN_RECOVERY,
@@ -4046,18 +4219,22 @@ def build_worker(
         caller = facts.caller
     serializer = build_serializer()
     transport = build_transport(websocket, serializer)
-    speech_to_text = build_speech_to_text()
+    # One model that hears and speaks, or a recognizer and a voice around a model that reads text.
+    one_model = speech_to_speech()
+    speech_to_text = None if one_model else build_speech_to_text()
     call_backs = control.call_backs if control is not None else None
-    llm = build_llm_service(
-        with_hangup=control is not None,
-        brief=session.brief if session is not None else None,
-        call_back=call_backs is not None,
-        configuration=configuration,
-        facts=facts,
-    )
-    text_to_speech = build_text_to_speech()
+    text_to_speech = None if one_model else build_text_to_speech()
     speech_monitor = BotSpeechMonitor()
-    echo_guard = EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+    # One model gets the gate instead of the guard: the guard drops transcripts whatever their
+    # direction, and there the transcripts are the model's own record of what the caller said,
+    # travelling upstream, while what the model hears is the audio. See `EchoGate`.
+    echo_guard: FrameProcessor | None = (
+        EchoGuard(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+        if not one_model
+        else EchoGate(speech_monitor, ECHO_GUARD_TAIL_SECONDS)
+        if ECHO_GUARD_TAIL_SECONDS > 0
+        else None
+    )
     briefed = BriefedCall(session=session, speech=speech_monitor) if session is not None else None
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
@@ -4082,7 +4259,15 @@ def build_worker(
         transfer_target=configuration.transfer_target,
         caller_lookup_description=configuration.caller_lookup_description,
     )
-    if tools:
+    llm = build_llm_service(
+        with_hangup=control is not None,
+        brief=session.brief if session is not None else None,
+        call_back=call_backs is not None,
+        configuration=configuration,
+        facts=facts,
+        tools=tools,
+    )
+    if tools and not one_model:
         context.set_tools(ToolsSchema(standard_tools=tools))
     # The aggregator decides the caller's turn, and nothing else in the pipeline does: see
     # `build_user_aggregator_params` for what a second decider in front of it cost. Its strategies
@@ -4096,6 +4281,7 @@ def build_worker(
             speech=speech_monitor,
             control=control,
             transfer_target=configuration.transfer_target,
+            transfer_hold=TransferHold(hold_audio=one_model),
         )
         if control is not None
         else None
@@ -4105,19 +4291,19 @@ def build_worker(
         Pipeline(
             [
                 transport.input(),
-                speech_to_text,
+                *([speech_to_text] if speech_to_text is not None else []),
                 # After the recognizer, which keeps getting audio, and ahead of the turn logic: see
                 # `TransferHold`. Only with a control plane, since only then is there a transfer.
                 *([resources.transfer_hold] if resources is not None else []),
                 # Between the recognizer and the turn logic on purpose: the echo is dropped before
                 # anything can treat it as the caller starting a turn.
-                echo_guard,
+                *([echo_guard] if echo_guard is not None else []),
                 # After the echo guard, so the bot's own echo never counts as the caller changing
                 # language, and ahead of the turn, so a switch reaches the voice before the reply.
                 *([speaking_language] if speaking_language is not None else []),
                 aggregators.user(),
                 llm,
-                text_to_speech,
+                *([text_to_speech] if text_to_speech is not None else []),
                 transport.output(),
                 speech_monitor,
                 aggregators.assistant(),
@@ -4313,6 +4499,7 @@ async def main(
         refuse_an_unknown_backend(BACKEND)
         refuse_an_unknown_transfer_mode(TRANSFER_MODE)
         missing = missing_environment(providers, os.environ)
+        refuse_a_split_speech_to_speech(providers)
         resolve_system_prompt(os.environ)
         refuse_a_caller_lookup_url_without_the_caller(CALLER_LOOKUP_URL)
         check_configurations(CONFIGURATIONS_DIRECTORY)
@@ -4343,9 +4530,14 @@ async def main(
     logger.info(
         f"models: llm={LLM_PROVIDER}/{LLM_MODEL}"
         + (f" at {LLM_BASE_URL}" if LLM_BASE_URL else "")
-        + f" stt={STT_PROVIDER}/{STT_MODEL}/{STT_LANGUAGE}"
-        + (f" on {WHISPER_DEVICE}" if STT_PROVIDER == "local" else "")
-        + f" tts={TTS_PROVIDER}/{TTS_MODEL or TTS_VOICE or 'account voice'}"
+        + (
+            f" speech-to-speech in {gemini_live_language()}"
+            f" with voice {TTS_VOICE or DEFAULT_TTS_VOICE[LLM_PROVIDER]}"
+            if speech_to_speech()
+            else f" stt={STT_PROVIDER}/{STT_MODEL}/{STT_LANGUAGE}"
+            + (f" on {WHISPER_DEVICE}" if STT_PROVIDER == "local" else "")
+            + f" tts={TTS_PROVIDER}/{TTS_MODEL or TTS_VOICE or 'account voice'}"
+        )
         # A run compared against another is only comparable at the same sampling, so say which.
         + f" temperature={'default' if LLM_TEMPERATURE is None else LLM_TEMPERATURE}"
         + (
@@ -4404,7 +4596,8 @@ async def main(
             "Follow the caller with a recognizer on multi (deepgram)."
         )
     if (
-        speaking_languages.starting is not None
+        not speech_to_speech()
+        and speaking_languages.starting is not None
         and STT_LANGUAGE.lower() != "multi"
         and base_language(STT_LANGUAGE) != base_language(speaking_languages.starting)
     ):
@@ -4420,11 +4613,20 @@ async def main(
     logger.info(
         "turn-taking: "
         + (
-            f"echo guard {ECHO_GUARD_TAIL_SECONDS:g}s tail"
-            if ECHO_GUARD_TAIL_SECONDS > 0
-            else "echo guard off (the engine's canceller vetoes its own echo from 0.5.0)"
+            f"{LLM_PROVIDER}'s own speech detection; the engine's speech edges are ignored; "
+            + (
+                f"echo gate {ECHO_GUARD_TAIL_SECONDS:g}s tail (the caller cannot talk over the bot)"
+                if ECHO_GUARD_TAIL_SECONDS > 0
+                else "echo gate off (the caller can talk over the bot)"
+            )
+            if speech_to_speech()
+            else (
+                f"echo guard {ECHO_GUARD_TAIL_SECONDS:g}s tail"
+                if ECHO_GUARD_TAIL_SECONDS > 0
+                else "echo guard off (the engine's canceller vetoes its own echo from 0.5.0)"
+            )
+            + f", interrupt after {MIN_INTERRUPT_WORDS} word(s)"
         )
-        + f", interrupt after {MIN_INTERRUPT_WORDS} word(s)"
     )
     if voice_sessions is not None:
         logger.info(f"siphon-pbx sessions: briefed by and reporting to {PBX_URL}")

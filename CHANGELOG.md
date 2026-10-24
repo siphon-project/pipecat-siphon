@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The agent example runs on Gemini's native audio.** `BOT_BACKEND=gemini-live` replaces the
+  recognizer, model and voice with one Gemini Live model that hears the caller and speaks, and
+  decides the caller's turns and interruptions itself, so the serializer passes on none of the
+  engine's speech edges. Tools, the brief, transfers and the greeting work as on the other
+  backends; a transfer hold also holds the caller's audio, since that is what the model hears. It
+  speaks one language per call (`BOT_TTS_LANGUAGE`, sent as the locale Gemini expects) in one of
+  its own voices (`BOT_TTS_VOICE`, `Charon` by default), on `models/gemini-3.8-live` unless
+  `BOT_LLM_MODEL` says otherwise. A selection that splits it across roles is refused at startup.
+  While the bot speaks, plus `BOT_ECHO_GUARD_TAIL`, the model hears silence instead of the line, so
+  an echo the engine could not cancel does not cut it off (0 takes the gate out), and its start of
+  speech is detected at low sensitivity.
+
 ## [0.4.1] - 2026-10-23
 
 Nothing in the package itself changed beyond its version: the fix is the quickstart's image.
