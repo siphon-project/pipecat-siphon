@@ -12,7 +12,7 @@ Three jobs -- answer a turn, transcribe the caller, speak -- and a provider chos
 
     BOT_LLM_PROVIDER   anthropic | google | openai | local | gemini-live
     BOT_STT_PROVIDER   deepgram  | google | openai | local | gemini-live
-    BOT_TTS_PROVIDER   cartesia  | google | openai | local | gemini-live
+    BOT_TTS_PROVIDER   cartesia  | elevenlabs | google | openai | local | gemini-live
 
 `BOT_BACKEND` is a preset for all three: `cloud` is Claude, Deepgram and Cartesia, `local` keeps
 every model on this host, and `gemini-live` is Gemini's native audio, one model that hears, answers
@@ -31,7 +31,8 @@ Each provider asks for its own credential, read from the environment. The defaul
     pip install "pipecat-ai[anthropic,deepgram,cartesia,websocket]" uvicorn
     python examples/agent_bot.py --host 0.0.0.0 --port 9001
 
-Install one extra per provider you point a role at (`google`, `openai`, `whisper`, `kokoro`), and
+Install one extra per provider you point a role at (`google`, `openai`, `elevenlabs`, `whisper`,
+`kokoro`), and
 note that Gemini and Google's speech APIs are different products: `GOOGLE_API_KEY` for the model,
 application default credentials for the recognizer and the voice -- `GOOGLE_APPLICATION_CREDENTIALS`
 pointing at a service-account JSON file, or on Google Cloud the instance's own service account with
@@ -393,7 +394,14 @@ LLM_PROVIDERS = ("anthropic", "google", "openai", "local", *SPEECH_TO_SPEECH_PRO
 STT_PROVIDERS = ("deepgram", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
 """Who transcribes the caller."""
 
-TTS_PROVIDERS = ("cartesia", "google", "openai", "local", *SPEECH_TO_SPEECH_PROVIDERS)
+TTS_PROVIDERS = (
+    "cartesia",
+    "elevenlabs",
+    "google",
+    "openai",
+    "local",
+    *SPEECH_TO_SPEECH_PROVIDERS,
+)
 """Who speaks for the bot."""
 
 BACKENDS = ("cloud", "local", *SPEECH_TO_SPEECH_PROVIDERS)
@@ -446,7 +454,7 @@ STT_PROVIDER = _selected_provider("BOT_STT_PROVIDER", _ROLE_PRESET[1])
 """Who transcribes the caller: `deepgram`, `google`, `openai`, or `local` for faster-whisper."""
 
 TTS_PROVIDER = _selected_provider("BOT_TTS_PROVIDER", _ROLE_PRESET[2])
-"""Who speaks for the bot: `cartesia`, `google`, `openai`, or `local` for Kokoro."""
+"""Who speaks for the bot: `cartesia`, `elevenlabs`, `google`, `openai`, or `local` for Kokoro."""
 
 
 def speech_to_speech() -> bool:
@@ -572,6 +580,9 @@ per transcript; see `is_english`."""
 
 DEFAULT_TTS_MODEL: dict[str, str] = {
     "cartesia": "sonic-3.6",
+    # Low latency and multilingual, and one of the models that takes a language code: on
+    # `eleven_multilingual_v2` pipecat drops the language and the model guesses it from the text.
+    "elevenlabs": "eleven_flash_v2_5",
     # Empty: Google's Chirp3 voices carry their own model, and naming one alongside the voice is
     # how you get a voice and a model that disagree.
     "google": "",
@@ -595,6 +606,8 @@ so this is not a preference -- it is what the bytes are, whatever was asked for.
 DEFAULT_TTS_VOICE: dict[str, str] = {
     # Empty: a Cartesia voice belongs to an account, so it can only come from the environment.
     "cartesia": "",
+    # Empty for the same reason: an ElevenLabs voice id is one on the account.
+    "elevenlabs": "",
     "google": "en-US-Chirp3-HD-Charon",
     "openai": "alloy",
     "local": "af_heart",
@@ -604,7 +617,8 @@ DEFAULT_TTS_VOICE: dict[str, str] = {
 """Which voice each synthesizer is asked for when `BOT_TTS_VOICE` says nothing."""
 
 TTS_VOICE = os.environ.get("BOT_TTS_VOICE", "").strip() or DEFAULT_TTS_VOICE.get(TTS_PROVIDER, "")
-"""The voice to speak with. Empty only for Cartesia, which reads `CARTESIA_VOICE_ID` instead."""
+"""The voice to speak with. Empty for Cartesia, which reads `CARTESIA_VOICE_ID` instead, and for
+ElevenLabs, which cannot start without it."""
 
 FOLLOW_CALLER_CONSISTENT_TURNS = 2
 """How many stretches of caller speech in a row must be heard in another configured language
@@ -790,7 +804,7 @@ def _refuse_what_the_local_voice_cannot_speak(
                 f"the local voice (Kokoro) cannot speak {language!r}: it speaks only "
                 f"{', '.join(sorted(KOKORO_VOICE_PREFIXES))}, and would read {language!r} in an "
                 "English accent. Choose a hosted voice for it with BOT_TTS_PROVIDER "
-                "(cartesia, google or openai), or remove it from BOT_TTS_LANGUAGES."
+                "(cartesia, elevenlabs, google or openai), or remove it from BOT_TTS_LANGUAGES."
             )
         voice = languages.voice_for(language) or default_voice
         if not voice or voice[0] not in prefixes:
@@ -3470,6 +3484,10 @@ REQUIRED_ENVIRONMENT: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
         ("CARTESIA_API_KEY", "text-to-speech key"),
         ("CARTESIA_VOICE_ID", "voice to speak with"),
     ),
+    ("tts", "elevenlabs"): (
+        ("ELEVENLABS_API_KEY", "text-to-speech key"),
+        ("BOT_TTS_VOICE", "ElevenLabs voice id to speak with"),
+    ),
     ("tts", "google"): (),
     ("tts", "openai"): (("OPENAI_API_KEY", "OpenAI API key"),),
     ("tts", "local"): (),
@@ -4007,6 +4025,7 @@ def build_text_to_speech() -> TTSService:
     """Build the voice for the selected provider, at the pipeline's rate."""
     builders: dict[str, Callable[[], TTSService]] = {
         "cartesia": _build_cartesia_tts_service,
+        "elevenlabs": _build_elevenlabs_tts_service,
         "google": _build_google_tts_service,
         "openai": _build_openai_tts_service,
         "local": _build_local_tts_service,
@@ -4037,6 +4056,33 @@ def _build_cartesia_tts_service() -> TTSService:
         # in an English accent. The language, and that language's voice, only when one is set.
         settings=CartesiaTTSService.Settings(
             **{"voice": voice, "model": TTS_MODEL, **_starting_speaking_settings("cartesia", voice)}
+        ),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
+
+
+def _build_elevenlabs_tts_service() -> TTSService:
+    """Build ElevenLabs' voice, streamed over its WebSocket API, at the pipeline's rate.
+
+    The WebSocket service rather than the HTTP one: it holds one connection for the call, streams
+    each sentence as it is written, and reports word timestamps, so an interrupted reply is
+    recorded in the context only as far as the caller heard it. It asks for `pcm_16000`, raw PCM
+    at the wire's own rate, so nothing in this process resamples it.
+    """
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+
+    # An account voice, like Cartesia's, so there is no default to fall back on.
+    voice = TTS_VOICE or _provider_key("tts", "elevenlabs", "BOT_TTS_VOICE")
+    return ElevenLabsTTSService(
+        api_key=_provider_key("tts", "elevenlabs", "ELEVENLABS_API_KEY"),
+        # The language travels as the connection's `language_code`, so a switch mid-call
+        # reconnects the socket rather than reconfiguring it.
+        settings=ElevenLabsTTSService.Settings(
+            **{
+                "voice": voice,
+                "model": TTS_MODEL,
+                **_starting_speaking_settings("elevenlabs", voice),
+            }
         ),
         sample_rate=PIPELINE_SAMPLE_RATE,
     )

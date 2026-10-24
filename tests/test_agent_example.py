@@ -603,6 +603,14 @@ class TestMissingEnvironment:
             "ANTHROPIC_API_KEY",
         ]
 
+    def test_elevenlabs_needs_its_key_and_a_voice_from_the_account(self) -> None:
+        """An ElevenLabs voice id belongs to an account, so like Cartesia's it has no default."""
+        environment = {"ANTHROPIC_API_KEY": "key", "DEEPGRAM_API_KEY": "key"}
+        assert missing_environment({**CLOUD_PROVIDERS, "tts": "elevenlabs"}, environment) == [
+            "ELEVENLABS_API_KEY",
+            "BOT_TTS_VOICE",
+        ]
+
     def test_one_provider_in_two_roles_asks_for_its_key_once(self) -> None:
         """OpenAI for the model and the voice is one key, so the startup error must say it once."""
         assert missing_environment({"llm": "openai", "stt": "openai", "tts": "openai"}, {}) == [
@@ -769,6 +777,7 @@ class TestServiceImportsAreLazy:
         packages_by_provider = {
             "anthropic": ("pipecat.services.anthropic",),
             "cartesia": ("pipecat.services.cartesia",),
+            "elevenlabs": ("pipecat.services.elevenlabs",),
             "deepgram": ("pipecat.services.deepgram",),
             "google": ("pipecat.services.google",),
             "openai": ("pipecat.services.openai",),
@@ -1863,6 +1872,7 @@ def _vendor_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "DEEPGRAM_API_KEY",
         "CARTESIA_API_KEY",
         "CARTESIA_VOICE_ID",
+        "ELEVENLABS_API_KEY",
         "GOOGLE_API_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
     ):
@@ -1973,6 +1983,42 @@ class TestEveryProviderBuilds:
 
         settings: Any = service.settings
         assert settings.voice == "a-voice-on-this-account"
+
+    def test_elevenlabs_streams_over_its_websocket_at_the_pipeline_rate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The WebSocket service, with the account voice, asked for PCM at the wire's own rate.
+
+        ElevenLabs serves `pcm_16000`, so nothing between the voice and the wire resamples. A rate
+        it does not serve falls back to 24 kHz with only a warning, so the mapping is pinned too.
+        """
+        from pipecat.services.elevenlabs.tts import (
+            ElevenLabsTTSService,
+            output_format_from_sample_rate,
+        )
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "elevenlabs")
+        monkeypatch.setenv("BOT_TTS_VOICE", "a-voice-on-this-account")
+
+        service = agent_bot.build_text_to_speech()
+
+        assert isinstance(service, ElevenLabsTTSService)
+        settings: Any = service.settings
+        assert settings.model == "eleven_flash_v2_5"
+        assert settings.voice == "a-voice-on-this-account"
+        assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+        assert output_format_from_sample_rate(agent_bot.PIPELINE_SAMPLE_RATE) == "pcm_16000"
+
+    def test_the_pinned_elevenlabs_model_takes_a_dutch_language_code(self) -> None:
+        """A language the model does not take is dropped by pipecat with only a warning."""
+        from pipecat.services.elevenlabs.tts_base import elevenlabs_language_code
+
+        import agent_bot
+
+        model = agent_bot.DEFAULT_TTS_MODEL["elevenlabs"]
+        assert elevenlabs_language_code(model, "nl") == "nl"
 
 
 class TestObserverHook:
@@ -2295,6 +2341,49 @@ class TestSpeakingLanguageReachesEveryVoice:
 
         assert settings.language == "nl"
         assert settings.voice == "a-multilingual-voice"
+
+    def test_elevenlabs_is_built_without_a_language_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "elevenlabs")
+        monkeypatch.setenv("BOT_TTS_VOICE", "an-account-voice")
+        recorded = _record_settings(monkeypatch, ElevenLabsTTSService)
+
+        service = agent_bot.build_text_to_speech()
+
+        assert recorded[0] == {
+            "voice": "an-account-voice",
+            "model": agent_bot.DEFAULT_TTS_MODEL["elevenlabs"],
+        }
+        settings: Any = service.settings
+        assert settings.language is None
+
+    def test_elevenlabs_asks_for_the_configured_language_with_its_voice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Read back from the URL the service connects to, which is where the language travels."""
+        from pipecat.services.elevenlabs.tts import output_format_from_sample_rate
+
+        import agent_bot
+
+        _select(monkeypatch, "tts", "elevenlabs")
+        monkeypatch.setenv("BOT_TTS_VOICE", "an-account-voice")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl")
+        monkeypatch.setenv("BOT_TTS_VOICES", "nl=a-dutch-voice")
+
+        service: Any = agent_bot.build_text_to_speech()
+        # Set in `setup` from the resolved rate, which a test without a pipeline does not run.
+        service._output_format = output_format_from_sample_rate(agent_bot.PIPELINE_SAMPLE_RATE)
+        url = service._build_websocket_url()
+
+        assert service.settings.language == "nl"
+        assert "/v1/text-to-speech/a-dutch-voice/" in url
+        assert "language_code=nl" in url
+        assert "output_format=pcm_16000" in url
 
     def test_openai_is_built_exactly_as_before_when_unset(
         self, monkeypatch: pytest.MonkeyPatch
