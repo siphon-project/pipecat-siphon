@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The agent bot can tell the caller their number and the number they dialled.** From a siphon-pbx
+  brief whose context is `full`, the system prompt now says who is calling from which number and
+  which of the organisation's numbers they dialled (or, outbound, that the bot placed the call and
+  to which number), and that the bot may share them when asked. The caller's number goes in only
+  once it reads as a number (`+` and 6 to 15 digits); otherwise it is said to be withheld or not
+  known, and a display name never goes in. With context `organisation` or no brief nothing changes.
+
 ## [0.5.0] - 2026-10-24
 
 The package's one change is the clustered siphon-pbx session token below; the rest is the agent
