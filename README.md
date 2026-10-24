@@ -349,8 +349,9 @@ chain, so a caller talks to a model instead of to themselves. It needs three API
 environment and `pip install "pipecat-ai[anthropic,deepgram,cartesia]"`; the vendors are one line
 each to swap, and the file explains which knobs are there for latency rather than for taste. The
 turn taking is the engine's, not the pipeline's — there is no VAD analyzer in it at all.
-`BOT_BACKEND=gemini-live` replaces the chain with Gemini's native audio, one model that hears and
-speaks; there the turn taking is the model's, and the engine's speech edges are not used.
+`BOT_BACKEND=gemini-live` (or `openai-realtime`) replaces the chain with a model's native audio,
+one model that hears and speaks; there the turn taking is the model's, and the engine's speech
+edges are not used.
 
 Given `--control-url`, it also connects to the SIPhon SIP engine's control plane and gets an `end_call` tool, so
 the model can hang up when the conversation is done rather than emitting a magic phrase for

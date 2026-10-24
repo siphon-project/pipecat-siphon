@@ -11,7 +11,7 @@ import importlib.util
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from loguru import logger
@@ -783,6 +783,7 @@ class TestServiceImportsAreLazy:
             "openai": ("pipecat.services.openai",),
             "local": ("pipecat.services.whisper", "pipecat.services.kokoro"),
             "gemini-live": ("pipecat.services.google",),
+            "openai-realtime": ("pipecat.services.openai",),
         }
         providers = set(agent_bot.LLM_PROVIDERS + agent_bot.STT_PROVIDERS + agent_bot.TTS_PROVIDERS)
         unmapped = providers - packages_by_provider.keys()
@@ -4480,10 +4481,12 @@ class TestAConfigurationShapesTheCall:
 GEMINI_LIVE_PROVIDERS = {"llm": "gemini-live", "stt": "gemini-live", "tts": "gemini-live"}
 
 
-def _select_speech_to_speech(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point all three roles at Gemini Live, as `BOT_BACKEND=gemini-live` does."""
+def _select_speech_to_speech(
+    monkeypatch: pytest.MonkeyPatch, provider: str = "gemini-live"
+) -> None:
+    """Point all three roles at one speech-to-speech model, as `BOT_BACKEND=<provider>` does."""
     for role in ("llm", "stt", "tts"):
-        _select(monkeypatch, role, "gemini-live")
+        _select(monkeypatch, role, provider)
 
 
 class TestSpeechToSpeechSelection:
@@ -4577,6 +4580,179 @@ class TestGeminiLiveBuilds:
 
         settings: Any = service.settings
         assert settings.language == "nl-NL"
+
+
+OPENAI_REALTIME_PROVIDERS = {
+    "llm": "openai-realtime",
+    "stt": "openai-realtime",
+    "tts": "openai-realtime",
+}
+
+
+class TestOpenAIRealtimeSelection:
+    """OpenAI Realtime is selected whole, like Gemini Live, under the OpenAI key alone."""
+
+    def test_the_preset_is_a_backend(self) -> None:
+        refuse_an_unknown_backend("openai-realtime")
+
+    def test_it_needs_only_the_openai_key(self) -> None:
+        assert missing_environment(OPENAI_REALTIME_PROVIDERS, {}) == ["OPENAI_API_KEY"]
+
+    def test_a_split_selection_is_refused(self) -> None:
+        import agent_bot
+
+        with pytest.raises(ValueError, match="BOT_BACKEND=openai-realtime"):
+            agent_bot.refuse_a_split_speech_to_speech({**CLOUD_PROVIDERS, "llm": "openai-realtime"})
+
+    def test_more_than_one_speaking_language_is_refused(self) -> None:
+        import agent_bot
+
+        with pytest.raises(ValueError, match="openai-realtime"):
+            agent_bot.resolve_speaking_languages(
+                {"BOT_TTS_LANGUAGES": "nl,en"}, "openai-realtime", "marin"
+            )
+
+
+@pytest.mark.usefixtures("_vendor_credentials", "_no_speaking_language")
+class TestOpenAIRealtimeBuilds:
+    """The Realtime service carries what the cascade's three services were told."""
+
+    def test_the_session_carries_model_voice_prompt_tools_and_a_transcript(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pipecat.adapters.schemas.function_schema import FunctionSchema
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch, "openai-realtime")
+        tool = FunctionSchema(name="end_call", description="d", properties={}, required=[])
+
+        service = agent_bot.build_llm_service(with_hangup=True, tools=[tool])
+
+        assert isinstance(service, OpenAIRealtimeLLMService)
+        settings: Any = service.settings
+        assert settings.model == "gpt-realtime-2.1"
+        assert settings.system_instruction.startswith("You are a voice assistant")
+        session = settings.session_properties
+        assert session.model == "gpt-realtime-2.1"
+        assert session.instructions == settings.system_instruction
+        assert session.audio.output.voice == agent_bot.DEFAULT_TTS_VOICE["openai-realtime"]
+        assert session.max_output_tokens == agent_bot.MAXIMUM_RESPONSE_TOKENS
+        # On the session, not the context, as with Gemini Live.
+        assert isinstance(session.tools, ToolsSchema)
+        assert [schema.name for schema in session.tools.standard_tools] == ["end_call"]
+        # Off unless asked for, and without it the caller's side of the call is never written
+        # down: no transcript reaches the context, the observer or the log.
+        transcription = session.audio.input.transcription
+        assert transcription.model == "gpt-4o-mini-transcribe"
+        assert transcription.language is None
+
+    def test_the_speaking_language_reaches_the_prompt_and_the_transcript(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The transcription API takes ISO-639-1, so a regional code is sent as its base."""
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch, "openai-realtime")
+        monkeypatch.setenv("BOT_TTS_LANGUAGE", "nl-BE")
+
+        settings: Any = agent_bot.build_llm_service(with_hangup=False).settings
+
+        assert "nl-BE" in settings.system_instruction
+        assert settings.session_properties.audio.input.transcription.language == "nl"
+
+    def test_a_pinned_temperature_and_seed_are_not_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Withheld rather than sent, since the Realtime session has neither.
+
+        pipecat would only warn on every call that it dropped them; the startup line says n/a.
+        """
+        import agent_bot
+
+        _select_speech_to_speech(monkeypatch, "openai-realtime")
+        monkeypatch.setattr(agent_bot, "LLM_TEMPERATURE", 0.2)
+        monkeypatch.setattr(agent_bot, "LLM_SEED", 7)
+
+        assert agent_bot._sampling_settings("openai-realtime") == {}
+
+
+class TestOpenAIRealtimeTurns:
+    """The turn follows OpenAI's own speech detection, the way the service asks for it to."""
+
+    def test_the_services_proposals_decide_the_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit strategies override the ones a service recommends, in pipecat.
+
+        The Realtime service only *proposes* a caller's start of speech. Under the strategies
+        Gemini Live is given, nothing takes the proposal up, so no interruption reaches the output
+        transport and a caller who talks over the bot hears it finish what was already buffered.
+        """
+        from pipecat.turns.user_start import ExternalUserTurnStartStrategy
+        from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
+
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "openai-realtime")
+
+        strategies = agent_bot.build_user_aggregator_params().user_turn_strategies
+
+        assert strategies is not None
+        assert [type(strategy) for strategy in strategies.start or []] == [
+            ExternalUserTurnStartStrategy
+        ]
+        assert [type(strategy) for strategy in strategies.stop or []] == [
+            ExternalUserTurnStopStrategy
+        ]
+        assert getattr(strategies, "enable_interruptions", False)
+
+
+class TestSpeechToSpeechInputRate:
+    """What the pipeline hands a speech-to-speech model is at the rate the model takes in.
+
+    pipecat appends the caller's audio to OpenAI's Realtime buffer as it arrives, unconverted, and
+    that buffer is 24 kHz PCM and nothing else. Handed the wire's 16 kHz, the model hears the caller
+    half again as fast. The serializer converts from the wire to whatever the pipeline asks for, so
+    asking for the model's rate is the whole fix.
+    """
+
+    def test_the_constant_is_the_rate_pipecat_declares(self) -> None:
+        from pipecat.services.openai.realtime.events import PCMAudioFormat
+
+        import agent_bot
+
+        assert PCMAudioFormat().rate == agent_bot.OPENAI_REALTIME_SAMPLE_RATE == 24000
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [("openai-realtime", 24000), ("gemini-live", 16000), ("anthropic", 16000)],
+    )
+    def test_the_input_rate_follows_the_model(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, expected: int
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", provider)
+
+        assert agent_bot.pipeline_input_sample_rate() == expected
+
+    def test_the_transport_and_the_worker_take_it_and_the_output_stays_on_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "openai-realtime")
+        transport = agent_bot.build_transport(cast(Any, object()), agent_bot.build_serializer())
+        assert transport._params.audio_in_sample_rate == 24000
+        assert transport._params.audio_out_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+
+        _serializers, workers = TestObserverHook._stub_the_call(monkeypatch)
+        monkeypatch.setattr(agent_bot, "build_text_to_speech", FrameProcessor)
+        agent_bot.build_worker(cast(Any, object()), None)
+        params = workers[0]["params"]
+        assert params.audio_in_sample_rate == 24000
+        assert params.audio_out_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
 
 
 class TestSpeechToSpeechCall:
