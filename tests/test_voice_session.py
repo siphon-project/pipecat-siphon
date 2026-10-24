@@ -16,6 +16,7 @@ from loguru import logger
 from fake_pbx import FakePbx
 from pbx_fixtures import (
     BRIEF_CONTEXT_FULL,
+    BRIEF_CONTEXT_NATIONAL,
     BRIEF_CONTEXT_ORGANISATION,
     BRIEF_CONTEXT_UNSET,
     BRIEF_ESCAPED,
@@ -166,6 +167,45 @@ class TestCallContext:
             direction="inbound",
             trunk=ContextTrunk(id="22222222-2222-4222-8222-222222222222", name="Carrier"),
         )
+
+    def test_a_national_form_beside_each_number(self) -> None:
+        brief = parse_brief(BRIEF_CONTEXT_NATIONAL)
+        assert brief is not None
+        context = brief.context
+        assert context is not None
+        assert context.called == ContextCalled(
+            uri="sip:05550100@pbx.example.invalid;user=phone",
+            number="+995550100",
+            national="05550100",
+        )
+        assert context.caller == ContextCaller(
+            privacy="none", number="+995550142", national="05550142", display_name="Test Caller"
+        )
+
+    def test_a_pbx_from_before_the_national_form_reads_as_none(self) -> None:
+        brief = parse_brief(BRIEF_CONTEXT_FULL)
+        assert brief is not None
+        assert brief.context is not None
+        assert brief.context.called is not None
+        assert brief.context.caller is not None
+        assert brief.context.called.national is None
+        assert brief.context.caller.national is None
+
+    def test_a_withheld_caller_keeps_no_national_form_either(self) -> None:
+        document = json.loads(BRIEF_CONTEXT_NATIONAL)
+        document["context"]["caller"]["privacy"] = "id"
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None
+        assert brief.context is not None
+        assert brief.context.caller == ContextCaller(privacy="id")
+
+    @pytest.mark.parametrize("part", ["called", "caller"])
+    def test_a_national_form_that_is_not_text_drops_the_context(self, part: str) -> None:
+        document = json.loads(BRIEF_CONTEXT_NATIONAL)
+        document["context"][part]["national"] = 5550142
+        brief = parse_brief(json.dumps(document).encode())
+        assert brief is not None
+        assert brief.context is None
 
     def test_organisation_only(self) -> None:
         brief = parse_brief(BRIEF_CONTEXT_ORGANISATION)

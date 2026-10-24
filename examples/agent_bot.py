@@ -1547,8 +1547,9 @@ class CallFacts:
     # Digits only, as `caller_lookup` takes them; never from the media socket's URL.
     caller: str | None = None
     organisation: ContextOrganisation | None = None
-    # The numbers the bot may tell the caller, from a brief alone and only as validated numbers,
-    # `+` kept: the organisation's number that was dialled, and the caller's. A caller with no
+    # The numbers the bot may tell the caller, from a brief alone and only as validated numbers:
+    # the national form where siphon-pbx sent one, else E.164 with its `+`. The organisation's
+    # number that was dialled, and the caller's. A caller with no
     # number to give is `withheld` (their own choice) or `unknown` (none that reads as one).
     called_number: str | None = None
     caller_number: str | None = None
@@ -1573,12 +1574,23 @@ def _spoken_number(number: str | None) -> str | None:
     return number if _lookup_digits(number) is not None else None
 
 
+def _said_number(national: str | None, number: str | None) -> str | None:
+    """Choose how a number is said: its national form when the PBX sent one that reads as one.
+
+    A national form is the trunk prefix and digits (`0555...`), so it is checked as digits alone,
+    without the plus E.164 may carry. One that fails falls back to E.164, never to its own text.
+    """
+    if national is not None and CALLER_NUMBER.fullmatch(national):
+        return national
+    return _spoken_number(number)
+
+
 def call_facts_from_context(context: CallContext | None) -> CallFacts:
     """Read a siphon-pbx brief's `context`: the organisation's reference names the configuration."""
     if context is None:
         return CallFacts()
     caller = context.caller
-    caller_number = _spoken_number(caller.number) if caller is not None else None
+    caller_number = _said_number(caller.national, caller.number) if caller is not None else None
     presentation: Literal["withheld", "unknown"] | None = None
     if caller is not None and caller_number is None:
         presentation = "withheld" if caller.privacy == "id" else "unknown"
@@ -1586,7 +1598,9 @@ def call_facts_from_context(context: CallContext | None) -> CallFacts:
         configuration_key=context.organisation.external_ref,
         caller=_lookup_digits(caller.number) if caller is not None else None,
         organisation=context.organisation,
-        called_number=_spoken_number(context.called.number) if context.called else None,
+        called_number=(
+            _said_number(context.called.national, context.called.number) if context.called else None
+        ),
         caller_number=caller_number,
         caller_presentation=presentation,
         direction=context.direction,

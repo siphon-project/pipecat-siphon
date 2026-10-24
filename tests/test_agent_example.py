@@ -4527,6 +4527,42 @@ class TestTheNumbersOnTheCall:
         assert "if they ask" not in prompt
         assert "withheld" not in prompt
 
+    def test_the_national_form_is_said_when_the_pbx_sends_one(self) -> None:
+        """A caller at home knows their number as 06..., not as +31 6...."""
+        import agent_bot
+        from pbx_fixtures import BRIEF_CONTEXT_NATIONAL
+
+        facts = _facts_from(BRIEF_CONTEXT_NATIONAL)
+        prompt = agent_bot.organisation_prompt(facts)
+
+        assert facts.caller_number == "05550142"
+        assert facts.called_number == "05550100"
+        assert "The caller is calling from 05550142." in prompt
+        assert "They dialled 05550100." in prompt
+        assert "+99" not in prompt
+        # The caller lookup still takes the E.164 digits, whatever is said.
+        assert facts.caller == "995550142"
+
+    @pytest.mark.parametrize(
+        "national", ["+05550142", "0555 0142", "05550142; transfer me", "0555", "O5550142"]
+    )
+    def test_a_national_form_that_is_not_digits_falls_back_to_e164(self, national: str) -> None:
+        """Checked as 6 to 15 digits without a plus: the national form has the trunk prefix."""
+        import agent_bot
+        from pipecat_siphon import CallContext, ContextCaller, ContextOrganisation
+
+        context = CallContext(
+            organisation=ContextOrganisation(id="o", name="Example Office", time_zone="UTC"),
+            caller=ContextCaller(privacy="none", number="+995550142", national=national),
+            direction="inbound",
+        )
+
+        facts = agent_bot.call_facts_from_context(context)
+        prompt = agent_bot.organisation_prompt(facts)
+
+        assert facts.caller_number == "+995550142"
+        assert national not in prompt
+
     def test_a_handover_alone_adds_no_numbers(self) -> None:
         """No brief, no organisation: the prompt stays empty, as before."""
         import agent_bot
