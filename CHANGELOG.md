@@ -26,6 +26,15 @@ All notable changes to this project are documented here. The format follows
   otherwise, a low-latency model that takes the language code, so `BOT_TTS_LANGUAGE` and
   `BOT_TTS_VOICES` reach it. The quickstart image installs it with the `elevenlabs` extra.
 
+### Fixed
+
+- **A session token from a clustered siphon-pbx is accepted.** A clustered node mints
+  `<token>.<node id>` and routes the brief and the report on the node, but `session_token_from`
+  accepted only the plain token, so the bot answered without its brief and nothing could be
+  reported. The node suffix is now accepted as siphon-pbx's `NodeId` allows it (letters, digits,
+  `.`, `_`, `-`, starting with a letter or digit, at most 63) and passed on unchanged; a plain token
+  and a dial-in without a session behave as before.
+
 ## [0.4.1] - 2026-10-23
 
 Nothing in the package itself changed beyond its version: the fix is the quickstart's image.

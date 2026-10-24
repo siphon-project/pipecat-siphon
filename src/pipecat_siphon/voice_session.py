@@ -45,8 +45,13 @@ DEFAULT_TIMEOUT_SECONDS = 2.0
 _DEADLINE_MAXIMUM = 65535
 """`deadline_secs` is a `u16` on the PBX side."""
 
-_TOKEN = re.compile(r"[0-9A-Za-z_-]{16,256}")
-"""A token as the PBX mints one (`random_hex`), with room to spare but nothing that walks a path."""
+_TOKEN = re.compile(r"[0-9A-Za-z_-]{16,256}(?:\.[0-9A-Za-z][0-9A-Za-z._-]{0,62})?")
+"""A token as the PBX mints one (`random_hex`), with room to spare but nothing that walks a path.
+
+A clustered siphon-pbx appends `.` and the id of the node holding the session, and routes on it, so
+the suffix is kept: ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit, at
+most 63 characters (`NodeId`, `NODE_ID_MAX`). Matched as a suffix rather than by adding `.` to the
+whole class, so the token can never be a `.` or `..` path segment. A single node appends nothing."""
 
 
 @dataclass(frozen=True)
