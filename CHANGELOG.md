@@ -36,6 +36,12 @@ All notable changes to this project are documented here. The format follows
   both named at startup when missing, and runs `eleven_flash_v2_5` unless `BOT_TTS_MODEL` says
   otherwise, a low-latency model that takes the language code, so `BOT_TTS_LANGUAGE` and
   `BOT_TTS_VOICES` reach it. The quickstart image installs it with the `elevenlabs` extra.
+- **The agent example hears with ElevenLabs.** `BOT_STT_PROVIDER=elevenlabs` streams the caller to
+  ElevenLabs' realtime recognizer (`scribe_v2_realtime`) at 16 kHz, committing each segment on the
+  engine's speech edge, under the same `ELEVENLABS_API_KEY` as the voice. On `multi`, its default,
+  it detects the language per transcript, so `BOT_TTS_FOLLOW_CALLER` and the hold for an unfinished
+  English sentence work as on Deepgram; the ISO 639-3 codes it reports (`nld`) are translated to
+  the configured ones (`nl`) before anything reads them.
 
 ### Fixed
 

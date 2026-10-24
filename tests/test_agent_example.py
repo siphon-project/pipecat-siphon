@@ -20,6 +20,7 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     LLMContextFrame,
     STTMetadataFrame,
     TextFrame,
@@ -610,6 +611,12 @@ class TestMissingEnvironment:
             "ELEVENLABS_API_KEY",
             "BOT_TTS_VOICE",
         ]
+
+    def test_the_elevenlabs_recognizer_needs_its_key_once_beside_its_voice(self) -> None:
+        environment = {"ANTHROPIC_API_KEY": "key"}
+        assert missing_environment(
+            {"llm": "anthropic", "stt": "elevenlabs", "tts": "elevenlabs"}, environment
+        ) == ["ELEVENLABS_API_KEY", "BOT_TTS_VOICE"]
 
     def test_one_provider_in_two_roles_asks_for_its_key_once(self) -> None:
         """OpenAI for the model and the voice is one key, so the startup error must say it once."""
@@ -2020,6 +2027,127 @@ class TestEveryProviderBuilds:
 
         model = agent_bot.DEFAULT_TTS_MODEL["elevenlabs"]
         assert elevenlabs_language_code(model, "nl") == "nl"
+
+
+@pytest.mark.usefixtures("_vendor_credentials")
+class TestElevenLabsRecognizer:
+    """ElevenLabs' realtime recognizer: committed on the engine's speech edges, at 16 kHz."""
+
+    def test_it_streams_at_the_pipeline_rate_and_detects_the_language(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On `multi` it is asked to report each transcript's language, as Deepgram does."""
+        from pipecat.services.elevenlabs.stt import (
+            CommitStrategy,
+            ElevenLabsRealtimeSTTService,
+            audio_format_from_sample_rate,
+        )
+
+        import agent_bot
+
+        _select(monkeypatch, "stt", "elevenlabs")
+
+        built = agent_bot.build_speech_to_text()
+
+        assert isinstance(built, ElevenLabsRealtimeSTTService)
+        service: Any = built
+        assert service.settings.model == "scribe_v2_realtime"
+        assert service.settings.language is None
+        assert service._include_language_detection is True
+        # Committed when the engine's speech edge says the caller stopped, which arrives as the
+        # VAD frame the serializer emits: the recognizer's own VAD would be a second detector.
+        assert service._commit_strategy == CommitStrategy.MANUAL
+        assert service._init_sample_rate == agent_bot.PIPELINE_SAMPLE_RATE
+        assert audio_format_from_sample_rate(agent_bot.PIPELINE_SAMPLE_RATE) == "pcm_16000"
+
+    def test_a_pinned_language_is_sent_and_detection_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        _select(monkeypatch, "stt", "elevenlabs")
+        monkeypatch.setattr(agent_bot, "STT_LANGUAGE", "nl")
+
+        service: Any = agent_bot.build_speech_to_text()
+
+        assert service.settings.language == "nld"
+        assert service._include_language_detection is False
+
+    def test_its_language_codes_are_translated_for_the_languages_configured(self) -> None:
+        """ElevenLabs reports ISO 639-3, and everything downstream matches base codes.
+
+        `nld` is no configured language and not English to `configured_language_for` and
+        `is_english`, so without this the voice could not follow a caller and the hold for an
+        unfinished English sentence never applied.
+        """
+        import agent_bot
+
+        assert agent_bot.elevenlabs_reported_languages(["nl-BE", "de"]) == {
+            "eng": "en",
+            "nld": "nl-BE",
+            "deu": "de",
+        }
+
+    async def test_the_processor_rewrites_what_it_knows_and_passes_the_rest(self) -> None:
+        import agent_bot
+
+        rewrite = agent_bot.RecognizerLanguageCodes({"nld": "nl", "eng": "en"})
+        recorder = _TranscriptRecorder()
+        await run_test(
+            Pipeline([rewrite, recorder]),
+            start_timeout=PIPELINE_START_TIMEOUT_SECONDS,
+            frames_to_send=[
+                TranscriptionFrame("hallo", "caller", "now", cast(Any, "nld")),
+                InterimTranscriptionFrame("hel", "caller", "now", cast(Any, "eng")),
+                TranscriptionFrame("bonjour", "caller", "now", cast(Any, "fra")),
+                TranscriptionFrame("no language", "caller", "now"),
+            ],
+        )
+
+        assert recorder.languages == ["nl", "en", "fra", None]
+
+    @pytest.mark.parametrize(("provider", "present"), [("elevenlabs", True), ("deepgram", False)])
+    def test_the_call_carries_it_after_the_recognizer_only_for_elevenlabs(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, present: bool
+    ) -> None:
+        import agent_bot
+
+        _serializers, _workers = TestObserverHook._stub_the_call(monkeypatch)
+        monkeypatch.setattr(agent_bot, "STT_PROVIDER", provider)
+        built: list[list[FrameProcessor]] = []
+
+        def recording_pipeline(processors: list[FrameProcessor]) -> Pipeline:
+            built.append(processors)
+            return Pipeline(processors)
+
+        monkeypatch.setattr(agent_bot, "Pipeline", recording_pipeline)
+        monkeypatch.setattr(agent_bot, "build_text_to_speech", FrameProcessor)
+        agent_bot.build_worker(cast(Any, object()), None)
+
+        processors = built[0]
+        positions = [
+            index
+            for index, processor in enumerate(processors)
+            if isinstance(processor, agent_bot.RecognizerLanguageCodes)
+        ]
+        assert bool(positions) is present
+        if present:
+            # Straight after the recognizer, which the stub builds as the second processor.
+            assert positions == [2]
+
+
+class _TranscriptRecorder(FrameProcessor):
+    """Keep the language of every transcript that reaches it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.languages: list[str | None] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            self.languages.append(str(frame.language) if frame.language else None)
+        await self.push_frame(frame, direction)
 
 
 class TestObserverHook:
