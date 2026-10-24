@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`ContextCalled` and `ContextCaller` read `national`**, the number as it is dialled in the
+  organisation's own country, which siphon-pbx sends beside `number` from #270. Absent from an older
+  PBX, and never kept for a withheld caller.
+- **The agent bot can tell the caller their number and the number they dialled.** From a siphon-pbx
+  brief whose context is `full`, the system prompt now says who is calling from which number and
+  which of the organisation's numbers they dialled (or, outbound, that the bot placed the call and
+  to which number), and that the bot may share them when asked. The caller's number goes in only
+  once it reads as a number (`+` and 6 to 15 digits); otherwise it is said to be withheld or not
+  known, and a display name never goes in. With context `organisation` or no brief nothing changes.
+  Where siphon-pbx sends a number's `national` form (a number in the organisation's own country,
+  siphon-pbx #270), that is what is said, `06...` rather than `+316...`; it is checked as digits
+  alone, and one that fails falls back to E.164.
+
 ## [0.5.0] - 2026-10-24
 
 The package's one change is the clustered siphon-pbx session token below; the rest is the agent

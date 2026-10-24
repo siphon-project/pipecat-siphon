@@ -79,18 +79,27 @@ class ContextOrganisation:
 
 @dataclass(frozen=True)
 class ContextCalled:
-    """The number dialled: the request URI as received, and E.164 where the PBX could make it."""
+    """The number dialled: the request URI as received, and E.164 where the PBX could make it.
+
+    `national` is that number as it is dialled in the organisation's own country (trunk prefix and
+    national number), sent only when it is in that country. Absent from a PBX that predates it.
+    """
 
     uri: str
     number: str | None = None
+    national: str | None = None
 
 
 @dataclass(frozen=True)
 class ContextCaller:
-    """Who is calling. A withheld caller (`privacy` "id") carries neither number nor name."""
+    """Who is calling. A withheld caller (`privacy` "id") carries neither number nor name.
+
+    `national` is the number as a caller in the organisation's own country knows it, when they are.
+    """
 
     privacy: Literal["none", "id"]
     number: str | None = None
+    national: str | None = None
     display_name: str | None = None
 
 
@@ -191,12 +200,15 @@ def _part(document: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
 
 def _caller_from(document: Mapping[str, Any]) -> ContextCaller:
     number = _optional_text(document, "number")
+    national = _optional_text(document, "national")
     display_name = _optional_text(document, "display_name")
     if document.get("privacy") != "none":
         # Withheld, or a privacy this does not know: read as withheld either way, and whatever came
         # with it is not kept. The PBX never undoes a caller's withholding, and neither does this.
         return ContextCaller(privacy="id")
-    return ContextCaller(privacy="none", number=number, display_name=display_name)
+    return ContextCaller(
+        privacy="none", number=number, national=national, display_name=display_name
+    )
 
 
 def parse_context(value: Any) -> CallContext | None:
@@ -233,7 +245,11 @@ def parse_context(value: Any) -> CallContext | None:
                 locale=_optional_text(organisation, "locale"),
             ),
             called=(
-                ContextCalled(uri=_text(called, "uri"), number=_optional_text(called, "number"))
+                ContextCalled(
+                    uri=_text(called, "uri"),
+                    number=_optional_text(called, "number"),
+                    national=_optional_text(called, "national"),
+                )
                 if called is not None
                 else None
             ),
