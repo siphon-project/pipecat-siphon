@@ -1547,6 +1547,14 @@ class CallFacts:
     # Digits only, as `caller_lookup` takes them; never from the media socket's URL.
     caller: str | None = None
     organisation: ContextOrganisation | None = None
+    # The numbers the bot may tell the caller, from a brief alone and only as validated numbers:
+    # the national form where siphon-pbx sent one, else E.164 with its `+`. The organisation's
+    # number that was dialled, and the caller's. A caller with no
+    # number to give is `withheld` (their own choice) or `unknown` (none that reads as one).
+    called_number: str | None = None
+    caller_number: str | None = None
+    caller_presentation: Literal["withheld", "unknown"] | None = None
+    direction: Literal["inbound", "outbound"] | None = None
 
 
 def _lookup_digits(number: str | None) -> str | None:
@@ -1557,15 +1565,45 @@ def _lookup_digits(number: str | None) -> str | None:
     return digits if CALLER_NUMBER.fullmatch(digits) else None
 
 
+def _spoken_number(number: str | None) -> str | None:
+    """Return a number as the bot may say it, `+` kept, or None if it is not one.
+
+    The same check as the caller lookup's, so what reaches the system prompt is a plus and digits
+    and nothing else: a string that could carry instructions never passes it.
+    """
+    return number if _lookup_digits(number) is not None else None
+
+
+def _said_number(national: str | None, number: str | None) -> str | None:
+    """Choose how a number is said: its national form when the PBX sent one that reads as one.
+
+    A national form is the trunk prefix and digits (`0555...`), so it is checked as digits alone,
+    without the plus E.164 may carry. One that fails falls back to E.164, never to its own text.
+    """
+    if national is not None and CALLER_NUMBER.fullmatch(national):
+        return national
+    return _spoken_number(number)
+
+
 def call_facts_from_context(context: CallContext | None) -> CallFacts:
     """Read a siphon-pbx brief's `context`: the organisation's reference names the configuration."""
     if context is None:
         return CallFacts()
     caller = context.caller
+    caller_number = _said_number(caller.national, caller.number) if caller is not None else None
+    presentation: Literal["withheld", "unknown"] | None = None
+    if caller is not None and caller_number is None:
+        presentation = "withheld" if caller.privacy == "id" else "unknown"
     return CallFacts(
         configuration_key=context.organisation.external_ref,
         caller=_lookup_digits(caller.number) if caller is not None else None,
         organisation=context.organisation,
+        called_number=(
+            _said_number(context.called.national, context.called.number) if context.called else None
+        ),
+        caller_number=caller_number,
+        caller_presentation=presentation,
+        direction=context.direction,
     )
 
 
@@ -1582,10 +1620,11 @@ def call_facts_from_handover(payload: Any) -> CallFacts:
 
 
 def organisation_prompt(facts: CallFacts, now: datetime | None = None) -> str:
-    """Tell the model whose line it is answering, and the time there. Empty when nobody said.
+    """Tell the model whose line it is answering, the time there, and the numbers on the call.
 
-    Only what the operator set: the organisation's name and time zone. Nothing the caller controls,
-    a display name least of all, goes into the system prompt.
+    Empty when nobody said. Only what the operator set, the organisation's name and time zone and
+    the number that was dialled, and the caller's number once it has been checked to be one.
+    Nothing the caller controls as text, a display name least of all, goes into the system prompt.
     """
     organisation = facts.organisation
     if organisation is None:
@@ -1594,9 +1633,42 @@ def organisation_prompt(facts: CallFacts, now: datetime | None = None) -> str:
     try:
         zone = ZoneInfo(organisation.time_zone)
     except (ZoneInfoNotFoundError, ValueError):
-        return prompt
-    local = (now or datetime.now(zone)).astimezone(zone)
-    return prompt + f" It is {local:%A %d %B %Y, %H:%M} there ({organisation.time_zone})."
+        zone = None
+    if zone is not None:
+        local = (now or datetime.now(zone)).astimezone(zone)
+        prompt += f" It is {local:%A %d %B %Y, %H:%M} there ({organisation.time_zone})."
+    return prompt + call_numbers_prompt(facts)
+
+
+def call_numbers_prompt(facts: CallFacts) -> str:
+    """Say which numbers are on the call, from the side of the person the bot is talking to.
+
+    Inbound, that person is the caller, calling the organisation's number. Outbound, the bot placed
+    the call, from the organisation's number to theirs. Empty when the brief named no numbers.
+    """
+    if facts.direction == "outbound":
+        if facts.called_number is None:
+            return " You placed this call."
+        sentence = f" You placed this call to {facts.called_number}" + (
+            f", from {facts.caller_number}." if facts.caller_number else "."
+        )
+        return sentence + NUMBERS_MAY_BE_SHARED
+    sentences = ""
+    if facts.caller_number is not None:
+        sentences += f" The caller is calling from {facts.caller_number}."
+    elif facts.caller_presentation == "withheld":
+        sentences += " The caller's number is withheld."
+    elif facts.caller_presentation == "unknown":
+        sentences += " The caller's number is not known."
+    if facts.called_number is not None:
+        sentences += f" They dialled {facts.called_number}."
+    if facts.caller_number is None and facts.called_number is None:
+        return sentences
+    return sentences + NUMBERS_MAY_BE_SHARED
+
+
+NUMBERS_MAY_BE_SHARED = " You may tell the person on the line these numbers if they ask."
+"""Said after the numbers, so the model knows it may read them out rather than keep them back."""
 
 
 async def resolve_call(

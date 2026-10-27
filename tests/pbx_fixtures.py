@@ -45,6 +45,20 @@ BRIEF_CONTEXT_FULL = (
     b'"trunk":{"id":"22222222-2222-4222-8222-222222222222","name":"Carrier"}}}'
 )
 
+# A bot set to `full` whose caller and called number are both in the organisation's own country, so
+# each carries its `national` form beside E.164 (siphon-pbx #270; field order from `CalledContext`
+# and `CallerContext`). +99 is an unassigned country code, as in siphon-pbx's own tests.
+BRIEF_CONTEXT_NATIONAL = (
+    b'{"call_id":"b2b-00000000000000a1@example.invalid",'
+    b'"instructions":"Ask what the caller wants.","options":[],"deadline_secs":30,'
+    b'"context":{"version":1,"organisation":{"id":"00000000-0000-4000-8000-00000000000a",'
+    b'"external_ref":"CUST-0042","name":"Example Office","time_zone":"Europe/Amsterdam",'
+    b'"locale":"nl"},"called":{"number":"+995550100","national":"05550100",'
+    b'"uri":"sip:05550100@pbx.example.invalid;user=phone"},"caller":{"number":"+995550142",'
+    b'"national":"05550142","display_name":"Test Caller","privacy":"none"},'
+    b'"direction":"inbound"}}'
+)
+
 # A bot set to `organisation`: `version` and `organisation` only.
 BRIEF_CONTEXT_ORGANISATION = (
     b'{"call_id":"b2b-00000000000000a1@example.invalid",'
