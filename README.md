@@ -500,28 +500,81 @@ settings; the last is logged as an error. Every file is checked at startup, and 
 stops the bot. Files are re-read per call, so an edit needs no restart. Languages and voices stay
 the bot's own.
 
-### Behind siphon-pbx
+### Briefed per call: siphon-pbx, or your own session service
 
-When a siphon-pbx flow's voice block hands a call to the bot, the engine dials it with
-`&session=<token>` on the URL. With both of these set, the bot fetches that session's brief before
-it speaks, and reports how the conversation went back to the PBX, so the flow leaves the block on
-the report instead of waiting out its deadline:
+The bot can be told, per call, what this call is for and whose it is. The engine dials it with
+`&session=<token>` on the URL. With both of these set, the bot fetches that session's *brief*
+before it speaks, and reports how the conversation went when it is over:
 
 | variable | format | default |
 |---|---|---|
-| `BOT_PBX_URL` | the PBX's base URL (`https://pbx.example.invalid`) | unset: no brief is fetched |
-| `SIPHON_PBX_BOT_SECRET` | the secret the bot was given in siphon-pbx | unset |
+| `BOT_PBX_URL` | the session service's base URL (`https://pbx.example.invalid`) | unset: no brief is fetched |
+| `SIPHON_PBX_BOT_SECRET` | the secret the bot was given there | unset |
 
 Set both or neither; one without the other stops the bot at startup. The brief's instructions are
-added to the system prompt for that call. When the block declares options, the model gets a
+added to the system prompt for that call. When the brief declares options, the model gets a
 `choose_option` tool limited to them, which reports the caller's choice once the line passing them
 on has played. `end_call` reports the conversation finished instead of hanging up, because what
-happens to the call next is the flow's decision. A pipeline error reports the bot failed. Each call
-reports once. After a report the PBX took, the bot waits up to 10 s for the PBX to close its stream
-before ending the pipeline itself. After one it did not take, the bot ends the pipeline at once. A
-brief that is refused, unreachable within 2 s, or not the documented shape is logged, and the call
-is answered with the bot's own configuration. Neither the secret nor the token is logged.
-`pipecat_siphon.VoiceSessionClient` and `VoiceSession` are the same pieces for a bot of your own.
+happens to the call next is the session service's decision. A pipeline error reports the bot
+failed. Each call reports once. After a report the service took, the bot waits up to 10 s for the
+stream to close before ending the pipeline itself. After one it did not take, the bot ends the
+pipeline at once. A brief that is refused, unreachable within 2 s, or not the documented shape is
+logged, and the call is answered with the bot's own configuration. Neither the secret nor the token
+is logged. `pipecat_siphon.VoiceSessionClient` and `VoiceSession` are the same pieces for a bot of
+your own.
+
+**siphon-pbx** is one session service: a flow's voice block hands the call over and opens the
+session. It also tells the bot where it may transfer the caller. A brief that lists `destinations`
+(or allows `any_number`) gives the model a `transfer_call` tool, limited to those names and to the
+modes each one lists: `cold` rings the destination and connects the caller when it answers, `refer`
+has the caller's own phone call it, and `warm` asks the destination first while the caller holds.
+For a warm transfer siphon-pbx dials the bot again on a second session, a *consult*
+(`kind: consult`), whose only tools are `accept_transfer` and `decline_transfer`. The caller's socket
+closes while the destination is asked; if it does not take the call, the caller comes back on the
+same session, and the bot carries on the same conversation and tells them why.
+
+**Your own session service** is the other. Anything that sits beside the SIPhon SIP engine
+(siphon-sip) and knows something about the caller (a CRM, a ticket system, an account lookup) can
+brief the bot, without touching the bot's code. Your routing script opens a session with it before
+handing the call over, and dials the bot with `&session=<token>` on its `ws_uri`.
+[`examples/session_service.py`](examples/session_service.py) is a complete one in a single file,
+with a stand-in account lookup that puts what it knows about the caller into the instructions;
+`tests/test_session_service.py` runs it against this package's own client and the agent bot's own
+prompt. The contract it serves:
+
+| route | request | answer |
+|---|---|---|
+| `GET /voice/sessions/{token}` | `Authorization: Bearer <secret>` | `200` and the brief below; `404` for anything else |
+| `POST /voice/sessions/{token}/report` | the same, and a report below | `204` when taken, once; `404` for anything else |
+
+A brief:
+
+```json
+{"call_id": "b2b-1@example.invalid",
+ "instructions": "Find out what the caller needs and help them.",
+ "options": [{"option": "sales", "means": "buying something new"}, {"option": "support"}],
+ "deadline_secs": 600,
+ "context": {"version": 1,
+             "organisation": {"id": "org-1", "name": "Example Office", "time_zone": "Europe/Amsterdam"},
+             "called": {"number": "+15550100", "uri": "tel:+15550100"},
+             "caller": {"number": "+15550142", "privacy": "none"},
+             "direction": "inbound",
+             "destinations": [], "any_number": false},
+ "kind": "call"}
+```
+
+Only `call_id`, `instructions`, `options` (which may be empty) and `deadline_secs` are required.
+Everything in `context` is optional except `version` (always `1`) and `organisation` with its `id`,
+`name` and `time_zone`; with it, the bot tells the caller whose line it is and the time there, and
+can tell them their own number and the one they dialled. A caller who withheld their number is
+`{"privacy": "id"}`. A report is one of `{"outcome": "chose", "option": "sales"}`,
+`{"outcome": "finished"}` and `{"outcome": "failed", "reason": "..."}`. Leave `destinations`
+empty and `any_number` false unless you also serve siphon-pbx's transfer route.
+
+Two other ways to shape a call, when a session service is more than you need: the
+`bot_configuration` var a siphon-sip routing script sets picks one of the files in
+`BOT_CONFIGURATIONS_DIR` (see "One bot, many configurations" above), which is static per key; and a
+`caller` parameter on the bot's URL feeds the caller lookup tool. A brief is the per-call one.
 
 `examples/probe.py` speaks the engine's half of the media wire — connect, `start`, stream silence
 — and reports how much audio comes back and how long the first frame took. No phone, no SIP
