@@ -45,6 +45,7 @@ from pipecat_siphon.serializer import (
     StereoInputMode,
 )
 from pipecat_siphon.voice_session import (
+    Accept,
     BriefOption,
     CallContext,
     Chose,
@@ -52,10 +53,12 @@ from pipecat_siphon.voice_session import (
     ContextCaller,
     ContextOrganisation,
     ContextTrunk,
+    Decline,
     Failed,
     Finished,
     Report,
     SessionBrief,
+    SessionKind,
     TransferDestination,
     TransferMode,
     TransferOutcome,
@@ -72,6 +75,7 @@ from pipecat_siphon.voice_session import (
 __version__ = "0.6.0"
 
 __all__ = [
+    "Accept",
     "BriefOption",
     "CallContext",
     "CallOutcome",
@@ -83,6 +87,7 @@ __all__ = [
     "ContextTrunk",
     "ControlCall",
     "ControlMessage",
+    "Decline",
     "Direction",
     "DtmfData",
     "Encoding",
@@ -102,6 +107,7 @@ __all__ = [
     "RenegotiateData",
     "Report",
     "SessionBrief",
+    "SessionKind",
     "SiphonFrameSerializer",
     "SiphonProtocolError",
     "SpeechData",

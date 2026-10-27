@@ -15,6 +15,7 @@ from loguru import logger
 
 from fake_pbx import FakePbx
 from pbx_fixtures import (
+    BRIEF_CONSULT,
     BRIEF_CONTEXT_DESTINATIONS,
     BRIEF_CONTEXT_FULL,
     BRIEF_CONTEXT_NATIONAL,
@@ -23,7 +24,9 @@ from pbx_fixtures import (
     BRIEF_ESCAPED,
     BRIEF_MENU,
     BRIEF_OPEN,
+    REPORT_ACCEPT,
     REPORT_CHOSE_SALES,
+    REPORT_DECLINE,
     REPORT_FAILED,
     REPORT_FINISHED,
     TRANSFER_BAD_REQUEST,
@@ -33,6 +36,7 @@ from pbx_fixtures import (
     TRANSFER_TO_NUMBER,
 )
 from pipecat_siphon import (
+    Accept,
     BriefOption,
     CallContext,
     Chose,
@@ -40,6 +44,7 @@ from pipecat_siphon import (
     ContextCaller,
     ContextOrganisation,
     ContextTrunk,
+    Decline,
     Failed,
     Finished,
     SessionBrief,
@@ -757,3 +762,64 @@ def _parsed(raw: bytes) -> SessionBrief:
     brief = parse_brief(raw)
     assert brief is not None
     return brief
+
+
+class TestConsult:
+    """A consult (siphon-pbx #285): the bot asks a destination whether it takes the caller."""
+
+    def test_a_consult_brief_says_so_and_carries_the_summary(self) -> None:
+        brief = parse_brief(BRIEF_CONSULT)
+        assert brief is not None
+        assert brief.kind == "consult"
+        assert brief.summary == "wants to change an order"
+        assert brief.call_id == "consult-00000000000000d1@example.invalid"
+        # The original caller's facts, so the bot can say who is calling.
+        assert brief.context is not None
+        assert brief.context.caller is not None
+        assert brief.context.caller.number == "+15550142"
+        assert brief.context.destinations == ()
+
+    def test_a_brief_without_a_kind_serves_a_caller(self) -> None:
+        """A PBX that predates consults sends no `kind`."""
+        brief = parse_brief(BRIEF_MENU)
+        assert brief is not None
+        assert brief.kind == "call"
+        assert brief.summary is None
+
+    @pytest.mark.parametrize(
+        ("field", "value"), [("kind", "conference"), ("kind", 1), ("summary", 7)]
+    )
+    def test_a_kind_this_bot_cannot_serve_is_no_brief(self, field: str, value: Any) -> None:
+        """Answered with the wrong reports, a session it cannot read would stall its call."""
+        document = json.loads(BRIEF_CONSULT)
+        document[field] = value
+        assert parse_brief(json.dumps(document).encode()) is None
+
+    def test_accept_and_decline_are_encoded_as_the_route_reads_them(self) -> None:
+        assert encode_report(Accept()) == REPORT_ACCEPT
+        assert encode_report(Decline("in a meeting")) == REPORT_DECLINE
+
+    def test_a_decline_reason_is_cut_where_the_pbx_cuts_it(self) -> None:
+        declined = json.loads(encode_report(Decline("r" * (MAX_REPORTED_REASON + 5))))
+        assert declined["reason"] == "r" * MAX_REPORTED_REASON
+
+    async def test_a_consult_reports_its_verdict(self, pbx: FakePbx) -> None:
+        session = VoiceSession(VoiceSessionClient(pbx.url, SECRET), TOKEN, _parsed(BRIEF_CONSULT))
+
+        assert await session.report(Accept()) is True
+
+        assert pbx.requests[0]["path"] == f"/voice/sessions/{TOKEN}/report"
+        assert pbx.requests[0]["body"] == REPORT_ACCEPT
+
+    async def test_a_consult_does_not_transfer(self, pbx: FakePbx) -> None:
+        """siphon-pbx refuses it (`not_on_a_consult`); nothing is sent for it to refuse."""
+        session = VoiceSession(VoiceSessionClient(pbx.url, SECRET), TOKEN, _parsed(BRIEF_CONSULT))
+
+        result = await session.transfer(destination="support", mode="cold")
+
+        assert result.outcome == "failed"
+        assert pbx.requests == []
+
+    def test_the_client_waits_out_a_warm_transfer(self) -> None:
+        """210 s for a warm one: 120 s ringing, 60 s consulting, 30 s for the verdict to cross."""
+        assert TRANSFER_TIMEOUT_SECONDS > 210

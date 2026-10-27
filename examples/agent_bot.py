@@ -141,7 +141,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -205,9 +205,11 @@ from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserT
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_siphon import (
+    Accept,
     CallContext,
     Chose,
     ContextOrganisation,
+    Decline,
     Failed,
     Finished,
     Report,
@@ -298,6 +300,20 @@ context and the call works normally from then on. It reads as a dead line.
 
 Bracketed and third person on purpose. It lands in the transcript as a user turn, and a
 first-person line ("hello?") gets answered literally."""
+
+
+CONSULT_KICKOFF = (
+    "[You placed this call on behalf of a caller who is on hold. The person you called has just"
+    " answered and has not spoken yet.]"
+)
+"""The greeting turn's message on a consult: the bot rang, so it opens by saying who for and why."""
+
+
+def opening_message(placed_context: Mapping[str, str] | None, brief: SessionBrief | None) -> str:
+    """Return the greeting turn's one message, for the call this socket is."""
+    if brief is not None and brief.kind == "consult":
+        return CONSULT_KICKOFF
+    return kickoff_for(placed_context)
 
 
 def kickoff_for(placed_context: Mapping[str, str] | None) -> str:
@@ -1239,6 +1255,20 @@ This call was handed to you with the following instructions. Where they differ f
 told above, follow these:
 {instructions}"""
 """The block's instructions, appended per call: what this conversation is for."""
+
+CONSULT_PROMPT = """
+
+You are not talking to the caller. They asked to be put through, and are on hold while you ask
+whether the person you rang will take the call. These are your instructions:
+{instructions}
+What the caller's call is about, as the bot that spoke to them put it: {summary}{caller}
+
+Once they say they will take it, call the accept_transfer tool, then tell them in a few words that
+you are putting the caller through: they are connected once your words have finished playing. If
+they will not, or cannot, call decline_transfer with their reason in a few words, then say a short
+goodbye."""
+"""The whole of a consult's instructions beyond the bot's own persona. Tool first, words after, as
+HANGUP_PROMPT explains."""
 
 CHOOSE_OPTION_PROMPT = """
 
@@ -2574,6 +2604,131 @@ def brief_can_transfer(brief: SessionBrief | None) -> bool:
     return context is not None and (bool(context.destinations) or context.any_number)
 
 
+HELD_SESSION_SECONDS = 300.0
+"""How long a briefed caller's conversation is kept with no media socket and no transfer in flight.
+
+siphon-pbx closes the caller's socket for a warm transfer and, unless it completes, dials the bot
+again on the same token, so the conversation has to outlive the socket. A caller who hangs up during
+the consult never comes back, and this is when the bot stops waiting for them."""
+
+
+@dataclass
+class HeldSession:
+    """A briefed caller's side of one siphon-pbx session, kept across its media sockets.
+
+    The conversation is the session's, not the socket's: a caller back from a warm transfer that
+    did not go through is the same caller, mid-conversation, and is not greeted again.
+    """
+
+    owner: CallerSessions
+    session: VoiceSession
+    context: LLMContext = field(default_factory=LLMContext)
+    # The pipeline on the caller's socket, None while they are away (on hold for a warm transfer).
+    worker: PipelineWorker | None = None
+    # Whether a socket has been greeted yet: only the first is.
+    greeted: bool = False
+    # A transfer request in flight. siphon-pbx answers it after closing the caller's socket, so it
+    # belongs to the session and not to any one pipeline.
+    transfer: asyncio.Future[Any] | None = None
+    # What the model is to be told when the caller is back, for a verdict that came first.
+    note: str | None = None
+    expiry: asyncio.Task[None] | None = None
+
+
+class CallerSessions:
+    """The briefed callers this process holds, by session token, and how long it holds them."""
+
+    def __init__(self, keep_seconds: float = HELD_SESSION_SECONDS) -> None:
+        """Hold nobody yet, and let an abandoned caller go after `keep_seconds`."""
+        self._keep_seconds = keep_seconds
+        self._held: dict[str, HeldSession] = {}
+
+    def held(self, token: str) -> HeldSession | None:
+        """Find the caller held under `token`, if this process still holds them."""
+        return self._held.get(token)
+
+    def hold(self, session: VoiceSession) -> HeldSession:
+        """Start holding a newly briefed caller, with a fresh conversation."""
+        held = HeldSession(owner=self, session=session)
+        self._held[session.token] = held
+        self._expire_when_abandoned(held)
+        return held
+
+    def release(self, held: HeldSession) -> None:
+        """Stop holding a caller whose session is over: reported on, or transferred."""
+        if held.expiry is not None:
+            held.expiry.cancel()
+        if self._held.get(held.session.token) is held:
+            del self._held[held.session.token]
+
+    async def attach(self, held: HeldSession, worker: PipelineWorker) -> bool:
+        """Put the caller's new socket in charge. True when it is the first, which is greeted.
+
+        A note waiting for the caller goes to the model now.
+        """
+        if held.expiry is not None:
+            held.expiry.cancel()
+        held.worker = worker
+        first = not held.greeted
+        held.greeted = True
+        if held.note is not None:
+            note, held.note = held.note, None
+            await _tell_the_model(worker, note)
+        return first
+
+    def detach(self, held: HeldSession, worker: PipelineWorker | None) -> None:
+        """Note the caller's socket closed, and start the clock unless a transfer is in flight."""
+        if worker is not None and held.worker is worker:
+            held.worker = None
+            self._expire_when_abandoned(held)
+
+    async def tell(self, held: HeldSession, note: str) -> None:
+        """Put `note` to the model on the caller's live socket, or keep it till they are back."""
+        if held.worker is not None:
+            await _tell_the_model(held.worker, note)
+        else:
+            held.note = note
+
+    def run_transfer(self, held: HeldSession, request: Awaitable[Any]) -> asyncio.Future[Any]:
+        """Run a transfer request for the session, outside any pipeline, and keep the caller held.
+
+        siphon-pbx closes the caller's socket for a warm transfer while the request is still
+        open, which ends the pipeline and cancels the tool call that asked. The request has to go
+        on regardless, so it runs here, and the session is kept until it settles.
+        """
+        task = asyncio.ensure_future(request)
+        held.transfer = task
+        if held.expiry is not None:
+            held.expiry.cancel()
+
+        def settled(_task: asyncio.Future[Any]) -> None:
+            if held.transfer is task:
+                held.transfer = None
+            if held.worker is None and self._held.get(held.session.token) is held:
+                self._expire_when_abandoned(held)
+
+        task.add_done_callback(settled)
+        return task
+
+    def _expire_when_abandoned(self, held: HeldSession) -> None:
+        if held.expiry is not None:
+            held.expiry.cancel()
+        if held.transfer is not None:
+            return
+
+        async def expire() -> None:
+            await asyncio.sleep(self._keep_seconds)
+            if held.worker is None and held.transfer is None:
+                logger.info("a briefed caller did not come back; letting their session go")
+                self.release(held)
+
+        try:
+            held.expiry = asyncio.get_running_loop().create_task(expire())
+        except RuntimeError:
+            # No loop: nothing is running that could come back for it either.
+            held.expiry = None
+
+
 @dataclass
 class BriefedCall:
     """A call siphon-pbx handed over with a brief, and the tools that tell it how the call went.
@@ -2596,6 +2751,35 @@ class BriefedCall:
     # From the tool call until the PBX's verdict. A second request in that time is refused rather
     # than sent, as on the control plane's own transfer.
     transfer_pending: bool = False
+    # The caller's side of the session, kept across sockets. Held on its own when not given.
+    held: HeldSession | None = None
+
+    def __post_init__(self) -> None:
+        """Hold the session if nobody else does: a call served without the route's registry."""
+        if self.held is None:
+            self.held = CallerSessions().hold(self.session)
+
+    @property
+    def sessions(self) -> CallerSessions:
+        """The registry holding this caller."""
+        return self._held.owner
+
+    @property
+    def _held(self) -> HeldSession:
+        if self.held is None:
+            self.held = CallerSessions().hold(self.session)
+        return self.held
+
+    async def attach(self, worker: PipelineWorker) -> bool:
+        """Serve the caller on `worker`. True for the first socket, the one that is greeted."""
+        self.worker = worker
+        return await self.sessions.attach(self._held, worker)
+
+    def detach(self, worker: PipelineWorker | None) -> None:
+        """Let go of a closed socket, keeping the session held while it can still come back."""
+        self.sessions.detach(self._held, worker)
+        if self.worker is worker:
+            self.worker = None
 
     async def choose_option(self, params: FunctionCallParams) -> None:
         """Say the line passing the caller on, wait for it to play, then report the option."""
@@ -2629,6 +2813,31 @@ class BriefedCall:
             logger.warning("farewell did not finish within the cap, reporting anyway")
         await self._report_and_let_go(Finished())
 
+    async def accept_transfer(self, params: FunctionCallParams) -> None:
+        """On a consult: say the line, wait for it to play, then report that the call is taken.
+
+        siphon-pbx then bridges the caller to the destination and closes this socket.
+        """
+        await self._report_a_verdict(params, Accept(), {"accepted": True})
+
+    async def decline_transfer(self, params: FunctionCallParams) -> None:
+        """On a consult: say goodbye, wait for it to play, then report that the call is refused."""
+        reason = params.arguments.get("reason")
+        await self._report_a_verdict(
+            params, Decline(reason if isinstance(reason, str) else ""), {"declined": True}
+        )
+
+    async def _report_a_verdict(
+        self, params: FunctionCallParams, verdict: Report, result: dict[str, bool]
+    ) -> None:
+        if self.session.reported is not None:
+            await params.result_callback({"error": "you have already answered for this call"})
+            return
+        await params.result_callback(result)
+        if not await self.speech.wait_until_finished():
+            logger.warning("the consult's last line did not finish within the cap")
+        await self._report_and_let_go(verdict)
+
     async def transfer_call(self, params: FunctionCallParams) -> None:
         """Say the handover line, wait for it to play, and have the PBX transfer the caller.
 
@@ -2655,22 +2864,32 @@ class BriefedCall:
             if not await self.speech.wait_until_finished():
                 logger.warning("handover line did not finish within the cap, transferring anyway")
             self.transfer_hold.engage()
-            result = await self.session.transfer(
-                destination=asked.destination,
-                number=asked.number,
-                mode=asked.mode,
-                summary=summary if isinstance(summary, str) else "",
+            # Shielded: for a warm transfer the PBX closes this socket while the request is open,
+            # and the pipeline that ends with it cancels this call, but not the request.
+            await asyncio.shield(
+                self.sessions.run_transfer(
+                    self._held,
+                    self._transfer_and_settle(asked, summary if isinstance(summary, str) else ""),
+                )
             )
         finally:
             self.transfer_pending = False
+
+    async def _transfer_and_settle(self, asked: TransferAsked, summary: str) -> None:
+        """Ask the PBX, then act on the verdict wherever the caller is by the time it comes."""
+        result = await self.session.transfer(
+            destination=asked.destination, number=asked.number, mode=asked.mode, summary=summary
+        )
         if result.completed:
-            # The hold stays on: the caller is with the destination now, and the PBX closes the
-            # stream once it has bridged them.
+            # The caller is with the destination. After a cold transfer the hold stays on and the
+            # PBX closes this socket once it has bridged them; after a warm one it already has.
+            self.sessions.release(self._held)
             self._end_if_the_stream_outlives_the_grace()
             return
         self.transfer_hold.release()
-        if self.worker is not None:
-            await _tell_the_model_the_transfer_failed(self.worker, pbx_transfer_failure(result))
+        await self.sessions.tell(
+            self._held, TRANSFER_FAILED_NOTE.format(why=pbx_transfer_failure(result))
+        )
 
     def _transfer_asked(self, arguments: Mapping[str, Any]) -> TransferAsked | str:
         """Read a `transfer_call` against the brief: where to and how, or an error for the model."""
@@ -2708,6 +2927,7 @@ class BriefedCall:
     async def fail(self, reason: str) -> None:
         """Report that the bot cannot serve the call, and end its leg now: it has nothing to say."""
         await self.session.report(Failed(reason))
+        self.sessions.release(self._held)
         if self.worker is not None:
             await self.worker.queue_frame(EndWorkerFrame())
 
@@ -2719,7 +2939,10 @@ class BriefedCall:
     async def _report_and_let_go(self, report: Report) -> None:
         if self.worker is None:
             return
-        if not await self.session.report(report):
+        taken = await self.session.report(report)
+        # Over either way: taken, the flow has moved on; not taken, nobody was waiting for it.
+        self.sessions.release(self._held)
+        if not taken:
             await self.worker.queue_frame(EndWorkerFrame())
             return
         self._end_if_the_stream_outlives_the_grace()
@@ -2762,9 +2985,9 @@ TRANSFER_FAILURE_EXPLANATIONS: dict[str, str] = {
 among them, read as an outcome nobody confirmed."""
 
 
-NUMBER_TRANSFER_MODES: tuple[TransferMode, ...] = ("cold", "refer")
-"""How a number the brief allows may be reached. Not `warm`, which siphon-pbx #279 refuses
-(`warm_not_yet_supported`) until it carries a warm transfer out."""
+NUMBER_TRANSFER_MODES: tuple[TransferMode, ...] = ("cold", "warm", "refer")
+"""How a number the brief allows may be reached: every mode, since siphon-pbx #285 consults a
+number too (on the first outbound trunk that resolves it)."""
 
 PBX_TRANSFER_EXPLANATIONS: dict[str, str] = {
     "declined": "the person it was meant to reach declined the call",
@@ -2783,12 +3006,14 @@ def pbx_transfer_failure(result: TransferResult) -> str:
     """
     if result.outcome == "not_allowed":
         return f"it is not allowed ({result.message or result.reason})"
+    if result.outcome == "declined" and result.reason:
+        # A consult's own words for why, which the caller is owed: "in a meeting", say.
+        return f"{PBX_TRANSFER_EXPLANATIONS['declined']} ({result.reason})"
     return PBX_TRANSFER_EXPLANATIONS.get(result.outcome, "it was never confirmed")
 
 
-async def _tell_the_model_the_transfer_failed(worker: PipelineWorker, why: str) -> None:
-    """Put the failure in front of the model and have it answer, since nothing else will."""
-    note = TRANSFER_FAILED_NOTE.format(why=why)
+async def _tell_the_model(worker: PipelineWorker, note: str) -> None:
+    """Put a bracketed note in front of the model and have it answer, since nothing else will."""
     await worker.queue_frame(
         LLMMessagesAppendFrame(messages=[{"role": "user", "content": note}], run_llm=True)
     )
@@ -2798,7 +3023,7 @@ async def _inform_the_model_the_transfer_failed(resources: CallResources, why: s
     """Put the failure in front of the model and have it answer, since nothing else will."""
     if resources.worker is None:
         return
-    await _tell_the_model_the_transfer_failed(resources.worker, why)
+    await _tell_the_model(resources.worker, TRANSFER_FAILED_NOTE.format(why=why))
 
 
 async def _end_on_a_late_completion(
@@ -3331,7 +3556,10 @@ def build_speaking_language_controller() -> SpeakingLanguageController | None:
 
 TRANSFER_MODE_MEANINGS: dict[str, str] = {
     "cold": "cold puts them through once the destination answers",
-    "warm": "warm lets you speak to the destination first",
+    "warm": (
+        "warm asks the destination first while the caller holds, and connects them only if it "
+        "takes the call"
+    ),
     "refer": "refer has the caller's own phone call the destination",
 }
 """What each mode means, in the words the tool's schema gives the model."""
@@ -3397,6 +3625,37 @@ def briefed_transfer_schema(briefed: BriefedCall) -> FunctionSchema:
     )
 
 
+def consult_tool_schemas(briefed: BriefedCall) -> list[FunctionSchema]:
+    """List a consult's two tools: the destination takes the call, or it does not."""
+    return [
+        FunctionSchema(
+            name="accept_transfer",
+            description=(
+                "The person you called will take the call. Call it first, then tell them you are "
+                "putting the caller through: they are connected once your words have finished."
+            ),
+            properties={},
+            required=[],
+            handler=briefed.accept_transfer,
+        ),
+        FunctionSchema(
+            name="decline_transfer",
+            description=(
+                "The person you called will not or cannot take the call now. Call it first, then "
+                "say a short goodbye. The caller's bot is told the reason."
+            ),
+            properties={
+                "reason": {
+                    "type": "string",
+                    "description": "Why, in a few words, as they put it.",
+                }
+            },
+            required=["reason"],
+            handler=briefed.decline_transfer,
+        ),
+    ]
+
+
 def build_tool_schemas(
     with_control: bool,
     speaking: SpeakingLanguageController | None,
@@ -3418,6 +3677,11 @@ def build_tool_schemas(
     `transfer_target` and `caller_lookup_description` are the call's configuration's, the bot's
     own when not given.
     """
+    if briefed is not None and briefed.session.brief.kind == "consult":
+        # A consult answers one question and nothing else: siphon-pbx takes no other report from
+        # it, and a consult that could transfer would be placing calls from a call that is itself
+        # only a question.
+        return consult_tool_schemas(briefed)
     if transfer_target is None:
         transfer_target = TRANSFER_TARGET
     if caller_lookup_description is None:
@@ -4192,6 +4456,62 @@ def preload_local_models() -> None:
     )
 
 
+def call_system_instruction(
+    configuration: CallConfiguration,
+    facts: CallFacts,
+    brief: SessionBrief | None,
+    *,
+    with_hangup: bool,
+    call_back: bool,
+) -> str:
+    """Assemble the system prompt for serving a caller: each part only when it is true."""
+    return (
+        configuration.system_prompt
+        + organisation_prompt(facts)
+        + (HANGUP_PROMPT if with_hangup or brief is not None else "")
+        + (
+            TRANSFER_PROMPT
+            if (with_hangup and configuration.transfer_target) or brief_can_transfer(brief)
+            else ""
+        )
+        + (CALL_BACK_PROMPT if with_hangup and call_back else "")
+        + speaking_language_prompt(configured_speaking_languages())
+        + (CALLER_LOOKUP_PROMPT if configuration.caller_lookup_url else "")
+        + (WEATHER_PROMPT if WEATHER_ENABLED else "")
+        + (SESSION_PROMPT.format(instructions=brief.instructions) if brief is not None else "")
+        + (CHOOSE_OPTION_PROMPT if brief is not None and brief.options else "")
+    )
+
+
+def consult_system_instruction(
+    configuration: CallConfiguration, brief: SessionBrief, facts: CallFacts
+) -> str:
+    """Assemble a consult's system prompt: the persona, whose line it is, and what to find out.
+
+    None of a caller's call: the person on the line is the destination, so the numbers are said as
+    the waiting caller's, and the caller's tools (hangup, transfer, lookups) are not mentioned.
+    """
+    whose_line = organisation_prompt(
+        replace(
+            facts, called_number=None, caller_number=None, caller_presentation=None, direction=None
+        )
+    )
+    if facts.caller_number is not None:
+        caller = f"\nThe caller on hold is calling from {facts.caller_number}."
+    elif facts.caller_presentation == "withheld":
+        caller = "\nThe caller on hold withheld their number."
+    else:
+        caller = ""
+    return (
+        configuration.system_prompt
+        + whose_line
+        + speaking_language_prompt(configured_speaking_languages())
+        + CONSULT_PROMPT.format(
+            instructions=brief.instructions, summary=brief.summary or "not given", caller=caller
+        )
+    )
+
+
 def build_llm_service(
     with_hangup: bool,
     brief: SessionBrief | None = None,
@@ -4211,22 +4531,12 @@ def build_llm_service(
     """
     if configuration is None:
         configuration = default_configuration()
-    system_instruction = (
-        configuration.system_prompt
-        + organisation_prompt(facts or CallFacts())
-        + (HANGUP_PROMPT if with_hangup or brief is not None else "")
-        + (
-            TRANSFER_PROMPT
-            if (with_hangup and configuration.transfer_target) or brief_can_transfer(brief)
-            else ""
+    if brief is not None and brief.kind == "consult":
+        system_instruction = consult_system_instruction(configuration, brief, facts or CallFacts())
+    else:
+        system_instruction = call_system_instruction(
+            configuration, facts or CallFacts(), brief, with_hangup=with_hangup, call_back=call_back
         )
-        + (CALL_BACK_PROMPT if with_hangup and call_back else "")
-        + speaking_language_prompt(configured_speaking_languages())
-        + (CALLER_LOOKUP_PROMPT if configuration.caller_lookup_url else "")
-        + (WEATHER_PROMPT if WEATHER_ENABLED else "")
-        + (SESSION_PROMPT.format(instructions=brief.instructions) if brief is not None else "")
-        + (CHOOSE_OPTION_PROMPT if brief is not None and brief.options else "")
-    )
     builders: dict[str, Callable[[str], LLMService[Any]]] = {
         "anthropic": _build_anthropic_llm_service,
         "google": _build_google_llm_service,
@@ -4828,6 +5138,7 @@ def build_worker(
     session: VoiceSession | None = None,
     configuration: CallConfiguration | None = None,
     facts: CallFacts | None = None,
+    held: HeldSession | None = None,
 ) -> PipelineWorker:
     """Assemble one call: transport, recognizer, model, voice, and the turn machinery.
 
@@ -4880,14 +5191,15 @@ def build_worker(
     # One hold, whoever transfers: the control plane, or the PBX for a briefed call.
     transfer_hold = TransferHold(hold_audio=one_model)
     briefed = (
-        BriefedCall(session=session, speech=speech_monitor, transfer_hold=transfer_hold)
+        BriefedCall(session=session, speech=speech_monitor, transfer_hold=transfer_hold, held=held)
         if session is not None
         else None
     )
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
     # the context carries only the call.
-    context = LLMContext()
+    # The session's when it is held: a caller back from a warm transfer is mid-conversation.
+    context = briefed.held.context if briefed is not None and briefed.held else LLMContext()
     # None unless the deployment configured a second language: with one, the voice is built
     # speaking it and there is nothing to switch, so the pipeline stays as it was.
     speaking_language = build_speaking_language_controller()
@@ -5032,23 +5344,32 @@ def build_worker(
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport: object, _client: object) -> None:
+        speech_monitor.reset()
+        if briefed is not None and not await briefed.attach(worker):
+            # Back from a warm transfer that did not go through: the same conversation, carried
+            # on rather than greeted, and the verdict is put to the model as it comes.
+            logger.info("engine connected again for the same session, carrying on the call")
+            return
         logger.info(
             "engine connected, greeting the caller"
             if placed is None
             else f"engine connected for placed call {placed.channel}, greeting the callee"
         )
-        speech_monitor.reset()
         # Seeding also *clears* the previous call's transcript, which matters now that the
         # server outlives a call: `set_messages` replaces, so call two does not inherit call one.
-        kickoff = kickoff_for(placed.context if placed is not None else None)
+        kickoff = opening_message(
+            placed.context if placed is not None else None,
+            briefed.session.brief if briefed is not None else None,
+        )
         context.set_messages([{"role": "user", "content": kickoff}])
         await worker.queue_frame(LLMRunFrame())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(_transport: object, _client: object) -> None:
-        logger.info("engine disconnected, call over")
+        logger.info("engine disconnected")
         if briefed is not None:
             briefed.stream_closed()
+            briefed.detach(worker)
 
     return worker
 
@@ -5060,8 +5381,12 @@ async def serve_call(
     caller: str | None = None,
     placed: PlacedCall | None = None,
     session: VoiceSession | None = None,
+    held_session: HeldSession | None = None,
 ) -> None:
-    """Answer one call, on its own pipeline, and tear it down when the engine hangs up."""
+    """Answer one call, on its own pipeline, and tear it down when the engine hangs up.
+
+    `held_session` is the caller's side of `session`, kept across sockets by the route.
+    """
     await websocket.accept()
     # After the accept: siphon-sip hands a call over only once the stream it dials is up.
     configuration, facts = (
@@ -5078,6 +5403,7 @@ async def serve_call(
         session,
         configuration=configuration,
         facts=facts,
+        held=held_session,
     )
     runner = WorkerRunner()
     await runner.add_workers(worker)
@@ -5094,9 +5420,11 @@ def build_app(
 ) -> FastAPI:
     """Build the HTTP surface: one WebSocket route the engine dials, once per call.
 
-    With `voice_sessions`, a dial-in naming a siphon-pbx session is briefed before it is served.
+    With `voice_sessions`, a dial-in naming a siphon-pbx session is briefed before it is served, and
+    its caller held (`CallerSessions`) for as long as the session can still dial in again.
     """
     app = FastAPI()
+    sessions = CallerSessions()
 
     @app.websocket("/{path:path}")
     async def media(websocket: WebSocket) -> None:
@@ -5118,9 +5446,29 @@ def build_app(
             logger.warning("ignoring a caller parameter that is not 6 to 15 digits")
         placed = control.placed_calls.claim(websocket.query_params) if control is not None else None
         # Before the socket is accepted, so the brief is in hand before the bot can say anything.
-        session = await open_voice_session(voice_sessions, websocket.query_params)
+        # A token this process already holds is a caller back from a warm transfer that did not
+        # go through: the same session and conversation, not a second brief.
+        token = (
+            session_token_from(websocket.query_params)
+            if SESSION_QUERY_PARAMETER in websocket.query_params
+            else None
+        )
+        held = sessions.held(token) if token is not None else None
+        if held is not None:
+            session: VoiceSession | None = held.session
+        else:
+            session = await open_voice_session(voice_sessions, websocket.query_params)
+            held = sessions.hold(session) if session is not None else None
         try:
-            await serve_call(websocket, control, observer_factory, caller, placed, session=session)
+            await serve_call(
+                websocket,
+                control,
+                observer_factory,
+                caller,
+                placed,
+                session=session,
+                held_session=held,
+            )
         except WebSocketDisconnect:
             # The ordinary end of a call: the engine closed first.
             logger.info("engine closed the media socket")

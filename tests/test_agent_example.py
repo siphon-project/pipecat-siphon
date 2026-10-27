@@ -3659,7 +3659,11 @@ def _briefed_call(pbx: Any, brief: Any) -> tuple[Any, _FakeWorker]:
     session = VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, brief)
     worker = _FakeWorker()
     briefed = BriefedCall(session=session, speech=_FinishedSpeech())  # type: ignore[arg-type]
+    # What `attach` does once the socket is up, without its note delivery: there is none yet.
     briefed.worker = worker  # type: ignore[assignment]
+    assert briefed.held is not None
+    briefed.held.worker = worker  # type: ignore[assignment]
+    briefed.held.greeted = True
     return briefed, worker
 
 
@@ -4110,6 +4114,313 @@ class TestTransferOnABriefedCall:
         assert "transfer_call" in offered[0]
         holds = [p for p in built[0] if isinstance(p, agent_bot.TransferHold)]
         assert len(holds) == 1
+
+
+class TestCallerSessions:
+    """A briefed caller's conversation outlives a media socket, as long as the session does."""
+
+    def _held(self, pbx: Any, sessions: Any) -> Any:
+        from pipecat_siphon import VoiceSession, VoiceSessionClient
+
+        return sessions.hold(
+            VoiceSession(VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, _destinations_brief())
+        )
+
+    async def test_a_known_token_is_held_with_its_conversation(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions()
+        held = self._held(pbx, sessions)
+        held.context.add_message({"role": "user", "content": "I need support"})
+
+        assert held.context.get_messages() == [{"role": "user", "content": "I need support"}]
+        assert sessions.held(PBX_TOKEN) is held
+        assert sessions.held("another-token-entirely") is None
+
+    async def test_a_note_waits_for_the_caller_to_come_back(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions()
+        held = self._held(pbx, sessions)
+
+        await sessions.tell(held, "[The transfer did not go through: nobody answered.]")
+        worker = _FakeWorker()
+        await sessions.attach(held, worker)  # type: ignore[arg-type]
+
+        assert worker.notes_to_the_model() == [
+            "[The transfer did not go through: nobody answered.]"
+        ]
+        assert held.note is None
+
+    async def test_a_note_reaches_a_live_pipeline_straight_away(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions()
+        held = self._held(pbx, sessions)
+        worker = _FakeWorker()
+        await sessions.attach(held, worker)  # type: ignore[arg-type]
+
+        await sessions.tell(held, "[note]")
+
+        assert worker.notes_to_the_model() == ["[note]"]
+
+    async def test_only_the_first_socket_is_greeted(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions()
+        held = self._held(pbx, sessions)
+
+        first = await sessions.attach(held, _FakeWorker())  # type: ignore[arg-type]
+        sessions.detach(held, held.worker)
+        second = await sessions.attach(held, _FakeWorker())  # type: ignore[arg-type]
+
+        assert (first, second) == (True, False)
+
+    async def test_an_abandoned_session_is_let_go_after_a_while(self, pbx: Any) -> None:
+        """The caller hung up during a consult, or never came back: nothing holds the entry."""
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions(keep_seconds=0.05)
+        held = self._held(pbx, sessions)
+        worker = _FakeWorker()
+        await sessions.attach(held, worker)  # type: ignore[arg-type]
+
+        sessions.detach(held, worker)  # type: ignore[arg-type]
+        assert sessions.held(PBX_TOKEN) is held
+        await asyncio.sleep(0.1)
+
+        assert sessions.held(PBX_TOKEN) is None
+
+    async def test_coming_back_keeps_the_session(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions(keep_seconds=0.05)
+        held = self._held(pbx, sessions)
+        worker = _FakeWorker()
+        await sessions.attach(held, worker)  # type: ignore[arg-type]
+        sessions.detach(held, worker)  # type: ignore[arg-type]
+
+        await sessions.attach(held, _FakeWorker())  # type: ignore[arg-type]
+        await asyncio.sleep(0.1)
+
+        assert sessions.held(PBX_TOKEN) is held
+
+    async def test_a_transfer_in_flight_keeps_the_session_until_it_settles(self, pbx: Any) -> None:
+        import agent_bot
+
+        sessions = agent_bot.CallerSessions(keep_seconds=0.05)
+        held = self._held(pbx, sessions)
+        settle: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        sessions.run_transfer(held, settle)
+
+        await asyncio.sleep(0.1)
+        assert sessions.held(PBX_TOKEN) is held
+        settle.set_result(None)
+        await asyncio.sleep(0.1)
+
+        assert sessions.held(PBX_TOKEN) is None
+
+
+class TestAWarmTransferOutlivesTheSocket:
+    """siphon-pbx closes the caller's socket for a warm transfer while the request is still open.
+
+    The request has to survive that, and a caller who comes back on the same token has to find the
+    same conversation, with the reason the transfer failed waiting for the model.
+    """
+
+    async def test_the_request_survives_the_pipeline_ending(self, pbx: Any) -> None:
+        pbx.delay = 0.2
+        pbx.transfer_body = (
+            b'{"outcome":"declined",'
+            b'"reason":"the destination will not take the call: in a meeting"}'
+        )
+        briefed, worker = _briefed_call(pbx, _destinations_brief())
+        asking = asyncio.create_task(
+            briefed.transfer_call(_ResultOnly({"destination": "support", "mode": "warm"}))
+        )
+        await asyncio.sleep(0.05)
+
+        # The engine closes the caller's socket: the pipeline, and its tool call, go.
+        briefed.detach(worker)
+        asking.cancel()
+        await asyncio.sleep(0.3)
+
+        assert len(pbx.requests) == 1
+        assert worker.notes_to_the_model() == []
+        back = _FakeWorker()
+        await briefed.attach(back)
+        (note,) = back.notes_to_the_model()
+        assert "declined" in note
+        assert briefed.sessions.held(PBX_TOKEN) is briefed.held
+
+    async def test_a_completed_warm_transfer_lets_the_session_go(self, pbx: Any) -> None:
+        pbx.delay = 0.1
+        briefed, worker = _briefed_call(pbx, _destinations_brief())
+        asking = asyncio.create_task(
+            briefed.transfer_call(_ResultOnly({"destination": "support", "mode": "warm"}))
+        )
+        await asyncio.sleep(0.05)
+        briefed.detach(worker)
+        asking.cancel()
+        await asyncio.sleep(0.2)
+
+        assert briefed.session.transferred
+        assert briefed.sessions.held(PBX_TOKEN) is None
+
+    async def test_a_report_the_pbx_took_lets_the_session_go(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+
+        await briefed.end_call(_ResultOnly())
+
+        assert briefed.sessions.held(PBX_TOKEN) is None
+
+    async def test_the_caller_coming_back_is_served_the_same_session(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """No second brief, and the same conversation: the bot carries on rather than greet."""
+        from fastapi.routing import APIWebSocketRoute
+
+        import agent_bot
+        from pipecat_siphon import VoiceSessionClient
+
+        held: list[Any] = []
+
+        async def serve_call(*_arguments: Any, held_session: Any = None, **_rest: Any) -> None:
+            held.append(held_session)
+
+        monkeypatch.setattr(agent_bot, "serve_call", serve_call)
+        app = agent_bot.build_app(None, voice_sessions=VoiceSessionClient(pbx.url, PBX_SECRET))
+        route = next(route for route in app.routes if isinstance(route, APIWebSocketRoute))
+
+        for _ in range(2):
+            await route.endpoint(SimpleNamespace(query_params={"session": PBX_TOKEN}))
+
+        assert held[0] is not None
+        assert held[0] is held[1]
+        assert [request["path"] for request in pbx.requests] == [f"/voice/sessions/{PBX_TOKEN}"]
+
+
+def _consult_brief() -> Any:
+    from pbx_fixtures import BRIEF_CONSULT
+    from pipecat_siphon import parse_brief
+
+    brief = parse_brief(BRIEF_CONSULT)
+    assert brief is not None
+    return brief
+
+
+class TestAConsult:
+    """On a consult the bot rang a destination for a caller on hold, to ask if it takes the call."""
+
+    @pytest.fixture(autouse=True)
+    def _short_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "PBX_STREAM_GRACE_SECONDS", 0.05)
+
+    def test_it_can_only_accept_or_decline(self, pbx: Any) -> None:
+        """Nothing a caller's bot has: a consult that could transfer would place calls itself."""
+        from agent_bot import build_tool_schemas
+
+        briefed, _ = _briefed_call(pbx, _consult_brief())
+        offered = {
+            schema.name: schema for schema in build_tool_schemas(True, None, briefed=briefed)
+        }
+
+        assert set(offered) == {"accept_transfer", "decline_transfer"}
+        assert offered["accept_transfer"].handler == briefed.accept_transfer
+        assert offered["decline_transfer"].required == ["reason"]
+
+    def test_the_prompt_says_whom_it_is_calling_for_and_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        brief = _consult_brief()
+        facts = agent_bot.call_facts_from_context(brief.context)
+        settings: Any = agent_bot.build_llm_service(
+            with_hangup=True, brief=brief, facts=facts
+        ).settings
+        prompt = settings.system_instruction
+
+        assert "You are calling support on behalf of a caller" in prompt
+        assert "wants to change an order" in prompt
+        assert "accept_transfer" in prompt
+        assert "decline_transfer" in prompt
+        assert "The caller on hold is calling from" in prompt
+        # Nothing of a caller's call: the person on the line is the destination.
+        assert "The caller is calling from" not in prompt
+        assert "end_call" not in prompt
+        assert "transfer_call" not in prompt
+        assert "choose_option" not in prompt
+
+    def test_it_opens_as_the_one_who_rang(self) -> None:
+        import agent_bot
+
+        opening = agent_bot.opening_message(None, _consult_brief())
+
+        assert opening == agent_bot.CONSULT_KICKOFF
+        assert agent_bot.opening_message(None, _menu_brief()) == agent_bot.KICKOFF
+
+    async def test_accepting_reports_it_once_the_line_has_played(self, pbx: Any) -> None:
+        from pbx_fixtures import REPORT_ACCEPT
+
+        briefed, worker = _briefed_call(pbx, _consult_brief())
+        call = _ResultOnly()
+
+        await briefed.accept_transfer(call)
+
+        assert call.results == [{"accepted": True}]
+        assert [request["body"] for request in pbx.requests] == [REPORT_ACCEPT]
+        # siphon-pbx bridges the caller and closes this socket; the bot only waits for that.
+        assert not worker.ended()
+        await asyncio.sleep(0.1)
+        assert worker.ended()
+
+    async def test_declining_reports_the_reason(self, pbx: Any) -> None:
+        from pbx_fixtures import REPORT_DECLINE
+
+        briefed, _ = _briefed_call(pbx, _consult_brief())
+
+        await briefed.decline_transfer(_ResultOnly({"reason": "in a meeting"}))
+
+        assert [request["body"] for request in pbx.requests] == [REPORT_DECLINE]
+
+    async def test_only_one_verdict(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _consult_brief())
+        await briefed.accept_transfer(_ResultOnly())
+        second = _ResultOnly({"reason": "changed my mind"})
+
+        await briefed.decline_transfer(second)
+
+        assert "already" in second.results[0]["error"]
+        assert len(pbx.requests) == 1
+
+
+class TestAWarmTransferAsked:
+    """The caller's side of a warm transfer: offered where the brief lists it, and its decline."""
+
+    def test_a_number_may_be_reached_warm_too(self) -> None:
+        import agent_bot
+
+        assert agent_bot.NUMBER_TRANSFER_MODES == ("cold", "warm", "refer")
+
+    def test_a_declined_consult_tells_the_model_why(self) -> None:
+        import agent_bot
+        from pipecat_siphon import TransferResult
+
+        why = agent_bot.pbx_transfer_failure(
+            TransferResult(
+                outcome="declined",
+                reason="the destination will not take the call: in a meeting",
+            )
+        )
+
+        assert "declined" in why
+        assert "in a meeting" in why
 
 
 class TestTheOutcomeIsReported:
