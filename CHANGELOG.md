@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A session service of your own, documented and shown.** The README's brief section now
+  describes the brief and report routes as a contract anything beside siphon-sip can serve, not
+  only siphon-pbx, with the fields that are required and the ones that are optional, and covers
+  siphon-pbx's transfers and consults. `examples/session_service.py` is a complete one in a single
+  file, briefing the bot per call with what a stand-in account lookup knows about the caller, and
+  its test runs it against this package's client and the agent bot's prompt.
 - **A brief's context carries the organisation's transfer destinations.** `CallContext` gains
   `destinations`, each a `TransferDestination` with the name the bot chooses, a description and the
   modes it may be reached in (`cold`, `warm`, `refer`), and `any_number`, whether the bot may name
