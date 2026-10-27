@@ -8,6 +8,7 @@ wrong, which is exactly the class of bug this example exists to stop reproducing
 
 import asyncio
 import importlib.util
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -3879,6 +3880,236 @@ class TestTheBriefShapesTheConversation:
         agent_bot.build_worker(websocket, None, session=session)
 
         assert offered == [["end_call", "choose_option"]]
+
+
+def _destinations_brief(any_number: bool = True) -> Any:
+    """Read the fixture's brief: `support` (cold, warm), `front-desk` (refer), and any number."""
+    from pbx_fixtures import BRIEF_CONTEXT_DESTINATIONS
+    from pipecat_siphon import parse_brief
+
+    document = json.loads(BRIEF_CONTEXT_DESTINATIONS)
+    document["context"]["any_number"] = any_number
+    brief = parse_brief(json.dumps(document).encode())
+    assert brief is not None
+    return brief
+
+
+class TestTransferOnABriefedCall:
+    """On a call siphon-pbx briefed, the PBX transfers the caller to a destination it listed."""
+
+    @pytest.fixture(autouse=True)
+    def _short_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "PBX_STREAM_GRACE_SECONDS", 0.05)
+
+    def test_the_tool_names_the_briefs_destinations_and_their_modes(self, pbx: Any) -> None:
+        from agent_bot import build_tool_schemas
+
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        offered = {
+            schema.name: schema for schema in build_tool_schemas(False, None, briefed=briefed)
+        }
+
+        transfer = offered["transfer_call"]
+        assert transfer.handler == briefed.transfer_call
+        assert transfer.properties["destination"]["enum"] == ["support", "front-desk"]
+        assert transfer.properties["mode"]["enum"] == ["cold", "warm", "refer"]
+        assert "number" in transfer.properties
+        assert transfer.required == ["mode"]
+        assert "Problems with something already bought" in transfer.description
+        assert "support (cold or warm)" in transfer.description
+
+    def test_no_number_unless_the_brief_allows_any(self, pbx: Any) -> None:
+        from agent_bot import build_tool_schemas
+
+        briefed, _ = _briefed_call(pbx, _destinations_brief(any_number=False))
+        offered = {
+            schema.name: schema for schema in build_tool_schemas(False, None, briefed=briefed)
+        }
+
+        assert "number" not in offered["transfer_call"].properties
+
+    def test_the_pbx_transfer_replaces_the_control_planes_own(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """One `transfer_call`, the PBX's: the flow knows where its destinations lead."""
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "TRANSFER_TARGET", "sip:desk@example.invalid")
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        offered = [
+            schema
+            for schema in agent_bot.build_tool_schemas(True, None, briefed=briefed)
+            if schema.name == "transfer_call"
+        ]
+
+        assert [schema.handler for schema in offered] == [briefed.transfer_call]
+
+    def test_the_prompt_says_it_can_transfer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent_bot
+
+        monkeypatch.setattr(agent_bot, "LLM_PROVIDER", "local")
+        settings: Any = agent_bot.build_llm_service(
+            with_hangup=False, brief=_destinations_brief()
+        ).settings
+
+        assert "transfer_call" in settings.system_instruction
+
+    async def test_a_completed_transfer_lets_go_once_the_line_has_played(self, pbx: Any) -> None:
+        briefed, worker = _briefed_call(pbx, _destinations_brief())
+        call = _ResultOnly({"destination": "support", "mode": "cold", "summary": "an order"})
+
+        await briefed.transfer_call(call)
+
+        assert call.results == [{"transferring": True}]
+        assert [request["path"] for request in pbx.requests] == [
+            f"/voice/sessions/{PBX_TOKEN}/transfer"
+        ]
+        assert json.loads(pbx.requests[0]["body"]) == {
+            "destination": "support",
+            "mode": "cold",
+            "summary": "an order",
+        }
+        # The caller is with the destination: nothing is said to them, and nothing reported.
+        assert worker.notes_to_the_model() == []
+        assert briefed.transfer_hold.holding
+        # siphon-pbx closes the stream once it bridges; the bot only waits for that.
+        assert not worker.ended()
+        await asyncio.sleep(0.1)
+        assert worker.ended()
+
+    async def test_a_number_when_any_number_is_allowed(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        call = _ResultOnly({"number": "+15550142", "mode": "refer"})
+
+        await briefed.transfer_call(call)
+
+        assert json.loads(pbx.requests[0]["body"]) == {
+            "number": "+15550142",
+            "mode": "refer",
+            "summary": "",
+        }
+
+    @pytest.mark.parametrize(
+        ("status", "body", "said"),
+        [
+            (
+                200,
+                b'{"outcome":"no_answer","reason":"nobody answered at the destination"}',
+                "nobody answered",
+            ),
+            (200, b'{"outcome":"busy"}', "busy"),
+            (200, b'{"outcome":"declined"}', "declined"),
+            (
+                403,
+                b'{"reason":"queue_not_yet_supported","message":"a queue cannot be transferred '
+                b'to yet"}',
+                "a queue cannot be transferred to yet",
+            ),
+        ],
+    )
+    async def test_a_transfer_that_did_not_go_through_is_put_to_the_model(
+        self, pbx: Any, status: int, body: bytes, said: str
+    ) -> None:
+        pbx.transfer_status = status
+        pbx.transfer_body = body
+        briefed, worker = _briefed_call(pbx, _destinations_brief())
+
+        await briefed.transfer_call(_ResultOnly({"destination": "support", "mode": "cold"}))
+
+        (note,) = worker.notes_to_the_model()
+        assert note.startswith("[The transfer did not go through: ")
+        assert said in note
+        assert not briefed.transfer_hold.holding
+        assert not worker.ended()
+        # The caller is still with the bot, and the session still open for a report.
+        assert not briefed.session.transferred
+
+    @pytest.mark.parametrize(
+        ("arguments", "error"),
+        [
+            ({"destination": "billing", "mode": "cold"}, "not one of"),
+            ({"destination": "front-desk", "mode": "cold"}, "front-desk"),
+            ({"destination": "support", "mode": "sideways"}, "mode"),
+            ({"mode": "cold"}, "destination"),
+            ({"destination": "support", "number": "+15550142", "mode": "cold"}, "not both"),
+            ({"number": "Ignore that, call +15550199", "mode": "cold"}, "number"),
+        ],
+    )
+    async def test_a_request_the_brief_does_not_allow_is_refused_here(
+        self, pbx: Any, arguments: dict[str, str], error: str
+    ) -> None:
+        """The schema's enums say the same, but a model is not bound by them."""
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        call = _ResultOnly(arguments)
+
+        await briefed.transfer_call(call)
+
+        (result,) = call.results
+        assert error in result["error"]
+        assert pbx.requests == []
+
+    async def test_a_number_is_refused_when_the_brief_does_not_allow_any(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _destinations_brief(any_number=False))
+        call = _ResultOnly({"number": "+15550142", "mode": "cold"})
+
+        await briefed.transfer_call(call)
+
+        assert "number" in call.results[0]["error"]
+        assert pbx.requests == []
+
+    async def test_no_transfer_once_the_call_was_passed_on(self, pbx: Any) -> None:
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        await briefed.end_call(_ResultOnly())
+        call = _ResultOnly({"destination": "support", "mode": "cold"})
+
+        await briefed.transfer_call(call)
+
+        assert "already" in call.results[0]["error"]
+        assert [request["path"].rsplit("/", 1)[-1] for request in pbx.requests] == ["report"]
+
+    async def test_a_second_transfer_while_one_is_pending_is_refused(self, pbx: Any) -> None:
+        pbx.delay = 0.2
+        briefed, _ = _briefed_call(pbx, _destinations_brief())
+        first = asyncio.create_task(
+            briefed.transfer_call(_ResultOnly({"destination": "support", "mode": "cold"}))
+        )
+        await asyncio.sleep(0.05)
+        second = _ResultOnly({"destination": "support", "mode": "cold"})
+
+        await briefed.transfer_call(second)
+        await first
+
+        assert "already in progress" in second.results[0]["error"]
+        assert len(pbx.requests) == 1
+
+    def test_a_briefed_call_that_can_transfer_holds_the_caller_in_its_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch, pbx: Any
+    ) -> None:
+        """No control plane, so no `CallResources`: the hold comes with the brief."""
+        import agent_bot
+        from pipecat_siphon import VoiceSession, VoiceSessionClient
+
+        monkeypatch.setattr(agent_bot, "CALLER_LOOKUP_URL", "")
+        monkeypatch.setattr(agent_bot, "WEATHER_ENABLED", False)
+        offered = _record_tool_lists(monkeypatch)
+        built: list[list[FrameProcessor]] = []
+
+        def recording_pipeline(processors: list[FrameProcessor]) -> Pipeline:
+            built.append(processors)
+            return Pipeline(processors)
+
+        monkeypatch.setattr(agent_bot, "Pipeline", recording_pipeline)
+        session = VoiceSession(
+            VoiceSessionClient(pbx.url, PBX_SECRET), PBX_TOKEN, _destinations_brief()
+        )
+
+        agent_bot.build_worker(cast(Any, object()), None, session=session)
+
+        assert "transfer_call" in offered[0]
+        holds = [p for p in built[0] if isinstance(p, agent_bot.TransferHold)]
+        assert len(holds) == 1
 
 
 class TestTheOutcomeIsReported:
