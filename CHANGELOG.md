@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A brief's context carries the organisation's transfer destinations.** `CallContext` gains
+  `destinations`, each a `TransferDestination` with the name the bot chooses, a description and the
+  modes it may be reached in (`cold`, `warm`, `refer`), and `any_number`, whether the bot may name
+  a number instead (siphon-pbx #277). Never where a destination leads. A PBX that predates them
+  reads as none and false. A destination siphon-pbx would not send (a name outside its rules, an
+  empty or over-long description, no mode this release knows) is dropped alone, with a warning,
+  and a mode from a newer PBX is passed over.
+- **A bot can ask siphon-pbx to transfer the caller.** `VoiceSession.transfer` (and
+  `VoiceSessionClient.transfer`) posts to the session's transfer route (siphon-pbx #279): a
+  destination the brief listed or a number, the mode, and a summary cut at 1000 characters. It waits
+  for the verdict, which siphon-pbx holds for up to 150 s (`TRANSFER_TIMEOUT_SECONDS` is 160), and
+  never raises: the answer is a `TransferResult` with `completed`, `declined`, `no_answer`, `busy`,
+  `refused` or `failed`, or `not_allowed` with the PBX's reason and message for a `403`. Anything
+  else reads as `failed`. A completed transfer ends the session, so nothing is reported after it,
+  and a transfer is never asked for once the call was reported on.
+- **The agent example transfers a briefed caller through siphon-pbx.** When the brief lists
+  destinations, or allows any number, `transfer_call` takes a destination from the brief's list (or
+  a number), a mode that destination offers and a summary, in place of the control plane's single
+  target. The request is checked against the brief before anything is sent. The caller's words are
+  held from the model while the PBX decides. A completed transfer lets the PBX close the stream, and
+  any other outcome is put to the model with the reason, so it tells the caller and carries on. A
+  number goes by `cold` or `refer`, since siphon-pbx does not carry out `warm` yet.
+
 ## [0.6.0] - 2026-10-27
 
 ### Added

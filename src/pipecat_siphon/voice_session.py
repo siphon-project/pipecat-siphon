@@ -42,6 +42,14 @@ MAX_REPORTED_REASON = 400
 DEFAULT_TIMEOUT_SECONDS = 2.0
 """How long one request to the PBX may take. The brief is fetched before the bot speaks."""
 
+TRANSFER_TIMEOUT_SECONDS = 160.0
+"""How long a transfer request may take. siphon-pbx holds it until the verdict, for at most
+`TRANSFER_ANSWER_DEADLINE` (150 s: a cold transfer rings for up to 120 s, plus 30). A client that
+gave up first would tell the bot a transfer failed that then went through."""
+
+MAX_TRANSFER_SUMMARY = 1_000
+"""The PBX cuts a transfer's summary to this many characters (`MAX_TRANSFER_SUMMARY`)."""
+
 _DEADLINE_MAXIMUM = 65535
 """`deadline_secs` is a `u16` on the PBX side."""
 
@@ -111,6 +119,114 @@ class ContextTrunk:
     name: str
 
 
+TransferMode = Literal["cold", "warm", "refer"]
+"""How a bot may hand a caller to a destination (siphon-pbx's `TransferMode`, `snake_case`)."""
+
+_TRANSFER_MODES: tuple[TransferMode, ...] = ("cold", "warm", "refer")
+
+_DESTINATION_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+"""A destination name as siphon-pbx accepts one (`check_name`, `MAX_NAME_CHARS`). Checked here as
+well, since a name ends up in the model's tool definition."""
+
+MAX_DESTINATION_DESCRIPTION = 500
+"""The longest description siphon-pbx accepts (`MAX_DESCRIPTION_CHARS`)."""
+
+
+@dataclass(frozen=True)
+class TransferDestination:
+    """Where a bot may hand the caller on: a name to choose, what it is for, and how.
+
+    Never where it leads; the PBX keeps that.
+    """
+
+    name: str
+    description: str
+    modes: tuple[TransferMode, ...]
+
+
+TransferOutcome = Literal[
+    "completed", "declined", "no_answer", "busy", "refused", "failed", "not_allowed"
+]
+"""How a transfer request ended. The first six are siphon-pbx's verdicts (`TransferVerdict`); the
+caller is with the destination only after `completed`, and still with the bot after the rest.
+`not_allowed` is a `403`: the PBX placed nothing, and its message says why."""
+
+_TRANSFER_VERDICTS: tuple[TransferOutcome, ...] = (
+    "completed",
+    "declined",
+    "no_answer",
+    "busy",
+    "refused",
+    "failed",
+)
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    """What came of a transfer request: the outcome, the PBX's reason, and its message on a refusal.
+
+    `reason` is a verdict's own explanation, or a refusal's code (`warm_not_yet_supported`).
+    """
+
+    outcome: TransferOutcome
+    reason: str | None = None
+    message: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        """Whether the caller has been put through, and is no longer with the bot."""
+        return self.outcome == "completed"
+
+
+def _transfer_failed(reason: str) -> TransferResult:
+    return TransferResult(outcome="failed", reason=reason)
+
+
+def _transfer_result_from(status: int, body: bytes) -> TransferResult:
+    """Read the transfer route's answer: a verdict, a refusal, or else a failed transfer."""
+    try:
+        document = json.loads(body) if body else None
+    except (ValueError, UnicodeDecodeError):
+        document = None
+    if not isinstance(document, dict):
+        document = {}
+    reason = document.get("reason")
+    reason = reason if isinstance(reason, str) else None
+    if status == 200:
+        outcome = document.get("outcome")
+        for verdict in _TRANSFER_VERDICTS:
+            if outcome == verdict:
+                return TransferResult(outcome=verdict, reason=reason)
+        return _transfer_failed("the PBX answered with no verdict this bot knows")
+    message = document.get("message")
+    if status == 403 and reason is not None:
+        return TransferResult(
+            outcome="not_allowed",
+            reason=reason,
+            message=message if isinstance(message, str) else None,
+        )
+    if status == 400:
+        # Ours to fix, not the caller's: the request was built here.
+        logger.error(f"the PBX could not read the transfer request: {reason} ({message})")
+        return _transfer_failed("the PBX could not read the request")
+    return _transfer_failed(f"the PBX answered HTTP {status}")
+
+
+def encode_transfer(
+    *, destination: str | None, number: str | None, mode: TransferMode, summary: str
+) -> bytes:
+    """Encode a transfer request as the route's `TransferBody` reads it.
+
+    One of destination and number, the mode, and the summary cut where the PBX would cut it.
+    """
+    document: dict[str, str] = (
+        {"destination": destination} if destination is not None else {"number": number or ""}
+    )
+    document["mode"] = mode
+    document["summary"] = summary[:MAX_TRANSFER_SUMMARY]
+    return json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+
+
 @dataclass(frozen=True)
 class CallContext:
     """Whose call it is, as much as the bot's `context` setting in siphon-pbx lets it be told.
@@ -123,6 +239,10 @@ class CallContext:
     caller: ContextCaller | None = None
     direction: Literal["inbound", "outbound"] | None = None
     trunk: ContextTrunk | None = None
+    # The organisation's transfer destinations, narrowed to the voice block's, and whether any
+    # number may be named instead. Empty and False from a PBX that predates them.
+    destinations: tuple[TransferDestination, ...] = ()
+    any_number: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,6 +331,51 @@ def _caller_from(document: Mapping[str, Any]) -> ContextCaller:
     )
 
 
+def _destination_from(value: Any) -> TransferDestination | None:
+    """Read one destination, or None, logged, for one siphon-pbx would never have sent.
+
+    A mode this does not know is passed over, so a newer PBX's destinations keep the modes this one
+    can use; a destination left with none is dropped.
+    """
+    if not isinstance(value, Mapping):
+        logger.warning("ignoring a transfer destination that is not an object")
+        return None
+    name = value.get("name")
+    description = value.get("description")
+    modes = value.get("modes")
+    if not isinstance(name, str) or _DESTINATION_NAME.fullmatch(name) is None:
+        logger.warning("ignoring a transfer destination whose name siphon-pbx would refuse")
+        return None
+    if (
+        not isinstance(description, str)
+        or not description.strip()
+        or len(description) > MAX_DESTINATION_DESCRIPTION
+    ):
+        logger.warning(f"ignoring transfer destination {name!r}: its description is not one")
+        return None
+    if not isinstance(modes, list):
+        logger.warning(f"ignoring transfer destination {name!r}: its modes are not a list")
+        return None
+    known = tuple(mode for mode in _TRANSFER_MODES if mode in modes)
+    if not known:
+        logger.warning(f"ignoring transfer destination {name!r}: no mode this bot knows")
+        return None
+    return TransferDestination(name=name, description=description, modes=known)
+
+
+def _destinations_from(document: Mapping[str, Any]) -> tuple[TransferDestination, ...]:
+    value = document.get("destinations")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise _Malformed("destinations")
+    return tuple(
+        destination
+        for destination in (_destination_from(entry) for entry in value)
+        if destination is not None
+    )
+
+
 def parse_context(value: Any) -> CallContext | None:
     """Read a brief's `context`: None if there is none, of another version, or it is malformed.
 
@@ -236,6 +401,9 @@ def parse_context(value: Any) -> CallContext | None:
         caller = _part(value, "caller")
         trunk = _part(value, "trunk")
         direction = value.get("direction")
+        any_number = value.get("any_number", False)
+        if not isinstance(any_number, bool):
+            raise _Malformed("any_number")
         return CallContext(
             organisation=ContextOrganisation(
                 id=_text(organisation, "id"),
@@ -260,6 +428,8 @@ def parse_context(value: Any) -> CallContext | None:
                 if trunk is not None
                 else None
             ),
+            destinations=_destinations_from(value),
+            any_number=any_number,
         )
     except _Malformed as malformed:
         logger.warning(f"the brief's context has a malformed {malformed}; serving without it")
@@ -367,8 +537,12 @@ class VoiceSessionClient:
         secret: str,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        transfer_timeout_seconds: float = TRANSFER_TIMEOUT_SECONDS,
     ) -> None:
         """Talk to the PBX at `base_url` (scheme and host, and a path prefix if it has one).
+
+        `timeout_seconds` bounds a brief and a report; a transfer, which the PBX holds until its
+        verdict, has `transfer_timeout_seconds`.
 
         Raises:
             ValueError: If `base_url` is not http(s) with a host, or `secret` is empty.
@@ -382,6 +556,9 @@ class VoiceSessionClient:
         self._base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {secret}"}
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._transfer_timeout = aiohttp.ClientTimeout(
+            total=transfer_timeout_seconds, connect=timeout_seconds
+        )
 
     def _session_url(self, token: str) -> str:
         return f"{self._base_url}/voice/sessions/{quote(token, safe='')}"
@@ -443,6 +620,53 @@ class VoiceSessionClient:
         logger.info(f"reported to the PBX: {_describe(report)}")
         return True
 
+    async def transfer(
+        self,
+        token: str,
+        *,
+        destination: str | None = None,
+        number: str | None = None,
+        mode: TransferMode,
+        summary: str = "",
+    ) -> TransferResult:
+        """Ask the PBX to transfer the caller, and wait for the verdict. Never raises.
+
+        Exactly one of `destination` (a name the brief listed) and `number` (only when the brief
+        says any number may be named). Every way this can go wrong reads as a `failed` result,
+        so the bot always has something to tell the caller, who is still with it.
+        """
+        if (destination is None) == (number is None):
+            logger.error("a transfer names exactly one of a destination and a number")
+            return _transfer_failed("the request named neither or both of destination and number")
+        body = encode_transfer(destination=destination, number=number, mode=mode, summary=summary)
+        target = f"destination {destination!r}" if destination is not None else "a number"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=self._transfer_timeout) as session,
+                session.post(
+                    f"{self._session_url(token)}/transfer",
+                    data=body,
+                    headers={**self._headers, "Content-Type": "application/json"},
+                    allow_redirects=False,
+                ) as reply,
+            ):
+                status = reply.status
+                answer = await _read_at_most(reply, MAX_BRIEF_BYTES)
+        except TimeoutError:
+            logger.warning(f"the PBX gave no verdict on the {mode} transfer to {target} in time")
+            return _transfer_failed("no verdict came back in time")
+        except aiohttp.ClientError as error:
+            logger.warning(
+                f"the PBX could not be reached to transfer to {target}: {type(error).__name__}"
+            )
+            return _transfer_failed("the PBX could not be reached")
+        result = _transfer_result_from(status, answer)
+        logger.info(
+            f"{mode} transfer to {target}: {result.outcome}"
+            + (f" ({result.reason})" if result.reason else "")
+        )
+        return result
+
 
 class VoiceSession:
     """One call's session: its brief, and the one report the PBX will act on.
@@ -458,6 +682,7 @@ class VoiceSession:
         self._client = client
         self._token = token
         self._reported: Report | None = None
+        self._transferred = False
         self._lock = asyncio.Lock()
 
     @property
@@ -465,9 +690,17 @@ class VoiceSession:
         """The report sent for this call, if one has been."""
         return self._reported
 
+    @property
+    def transferred(self) -> bool:
+        """Whether the caller was transferred, which ends the session: nothing is reported after."""
+        return self._transferred
+
     async def report(self, report: Report) -> bool:
         """Send `report` if nothing has been reported yet. True only when the PBX took it."""
         async with self._lock:
+            if self._transferred:
+                logger.info(f"the caller was transferred; dropping {_describe(report)}")
+                return False
             if self._reported is not None:
                 logger.info(
                     f"already reported {_describe(self._reported)}; dropping {_describe(report)}"
@@ -475,3 +708,28 @@ class VoiceSession:
                 return False
             self._reported = report
         return await self._client.report(self._token, report)
+
+    async def transfer(
+        self,
+        *,
+        destination: str | None = None,
+        number: str | None = None,
+        mode: TransferMode,
+        summary: str = "",
+    ) -> TransferResult:
+        """Ask for the caller to be transferred, unless the session has already ended.
+
+        Held under the same lock as a report, so a report and a transfer never race: one sent while
+        the other waits for its answer would act on a call the first may already have moved on.
+        A completed transfer ends the session on siphon-pbx's `transferred` port.
+        """
+        async with self._lock:
+            if self._transferred or self._reported is not None:
+                logger.info("this call's session has already ended; not asking for a transfer")
+                return _transfer_failed("this call has already been passed on")
+            result = await self._client.transfer(
+                self._token, destination=destination, number=number, mode=mode, summary=summary
+            )
+            if result.completed:
+                self._transferred = True
+            return result

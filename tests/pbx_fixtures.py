@@ -59,6 +59,20 @@ BRIEF_CONTEXT_NATIONAL = (
     b'"direction":"inbound"}}'
 )
 
+# A bot set to `organisation` whose organisation lists transfer destinations (siphon-pbx #277):
+# each by name, description and modes, never where it leads, and whether any number may be named.
+# Field order from `CallContext` and `BriefDestination`; `destinations` and `any_number` come last.
+BRIEF_CONTEXT_DESTINATIONS = (
+    b'{"call_id":"b2b-00000000000000a1@example.invalid",'
+    b'"instructions":"Ask what the caller wants.","options":[],"deadline_secs":30,'
+    b'"context":{"version":1,"organisation":{"id":"00000000-0000-4000-8000-00000000000a",'
+    b'"external_ref":"CUST-0042","name":"Example Office","time_zone":"Europe/Amsterdam",'
+    b'"locale":"nl"},"destinations":[{"name":"support",'
+    b'"description":"Problems with something already bought","modes":["cold","warm"]},'
+    b'{"name":"front-desk","description":"Anything else","modes":["refer"]}],'
+    b'"any_number":true}}'
+)
+
 # A bot set to `organisation`: `version` and `organisation` only.
 BRIEF_CONTEXT_ORGANISATION = (
     b'{"call_id":"b2b-00000000000000a1@example.invalid",'
@@ -83,3 +97,17 @@ BRIEF_CONTEXT_UNSET = (
 REPORT_CHOSE_SALES = b'{"outcome":"chose","option":"sales"}'
 REPORT_FINISHED = b'{"outcome":"finished"}'
 REPORT_FAILED = b'{"outcome":"failed","reason":"no speech service"}'
+
+# A transfer request and its answers, as siphon-pbx #279's route reads and writes them
+# (`TransferBody`, `TransferVerdictBody`, `TransferRefusalBody`; the values from its own API tests).
+TRANSFER_TO_DESTINATION = b'{"destination":"support","mode":"cold","summary":"an order"}'
+TRANSFER_TO_NUMBER = b'{"number":"+15550142","mode":"refer","summary":""}'
+TRANSFER_COMPLETED = b'{"outcome":"completed"}'
+TRANSFER_NO_ANSWER = b'{"outcome":"no_answer","reason":"nobody answered at the destination"}'
+TRANSFER_REFUSED_WARM = (
+    b'{"reason":"warm_not_yet_supported","message":"a warm transfer cannot be carried out by this '
+    b'release; ask for cold or refer"}'
+)
+TRANSFER_BAD_REQUEST = (
+    b'{"reason":"bad_request","message":"name exactly one of destination and number"}'
+)

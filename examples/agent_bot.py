@@ -213,6 +213,8 @@ from pipecat_siphon import (
     Report,
     SessionBrief,
     SiphonFrameSerializer,
+    TransferMode,
+    TransferResult,
     VoiceSession,
     VoiceSessionClient,
     session_token_from,
@@ -2557,6 +2559,21 @@ async def end_call(params: FunctionCallParams) -> None:
         logger.info(f"hangup rejected ({error}); the caller most likely hung up first")
 
 
+@dataclass(frozen=True)
+class TransferAsked:
+    """Where a `transfer_call` asks the PBX to send the caller, and how."""
+
+    mode: TransferMode
+    destination: str | None = None
+    number: str | None = None
+
+
+def brief_can_transfer(brief: SessionBrief | None) -> bool:
+    """Whether the brief gives the bot anywhere to transfer the caller to."""
+    context = brief.context if brief is not None else None
+    return context is not None and (bool(context.destinations) or context.any_number)
+
+
 @dataclass
 class BriefedCall:
     """A call siphon-pbx handed over with a brief, and the tools that tell it how the call went.
@@ -2573,6 +2590,12 @@ class BriefedCall:
     worker: PipelineWorker | None = None
     # After a report the PBX took: ends the pipeline if the stream outlives the grace.
     stream_watch: asyncio.Task[None] | None = None
+    # In the pipeline whenever the brief allows a transfer, and the same object as the control
+    # plane's when there is one: the caller is kept from the model while the PBX transfers them.
+    transfer_hold: TransferHold = field(default_factory=TransferHold)
+    # From the tool call until the PBX's verdict. A second request in that time is refused rather
+    # than sent, as on the control plane's own transfer.
+    transfer_pending: bool = False
 
     async def choose_option(self, params: FunctionCallParams) -> None:
         """Say the line passing the caller on, wait for it to play, then report the option."""
@@ -2606,6 +2629,82 @@ class BriefedCall:
             logger.warning("farewell did not finish within the cap, reporting anyway")
         await self._report_and_let_go(Finished())
 
+    async def transfer_call(self, params: FunctionCallParams) -> None:
+        """Say the handover line, wait for it to play, and have the PBX transfer the caller.
+
+        To a destination the brief listed, by name, in a mode that destination offers, or to a
+        number when the brief allows any. Checked here as well as by the schema and the PBX: a model
+        is not bound by an enum, and a request the PBX refuses has already been announced to the
+        caller. While the PBX decides, the caller is kept from the model (`TransferHold`). A
+        completed transfer ends the session and the PBX closes the stream; any other outcome leaves
+        the caller with the bot, and the model is told why so that it can say so.
+        """
+        asked = self._transfer_asked(params.arguments)
+        if isinstance(asked, str):
+            await params.result_callback({"error": asked})
+            return
+        if self.transfer_pending:
+            await params.result_callback(
+                {"error": "a transfer is already in progress; wait for it to go through or fail"}
+            )
+            return
+        summary = params.arguments.get("summary")
+        self.transfer_pending = True
+        try:
+            await params.result_callback({"transferring": True})
+            if not await self.speech.wait_until_finished():
+                logger.warning("handover line did not finish within the cap, transferring anyway")
+            self.transfer_hold.engage()
+            result = await self.session.transfer(
+                destination=asked.destination,
+                number=asked.number,
+                mode=asked.mode,
+                summary=summary if isinstance(summary, str) else "",
+            )
+        finally:
+            self.transfer_pending = False
+        if result.completed:
+            # The hold stays on: the caller is with the destination now, and the PBX closes the
+            # stream once it has bridged them.
+            self._end_if_the_stream_outlives_the_grace()
+            return
+        self.transfer_hold.release()
+        if self.worker is not None:
+            await _tell_the_model_the_transfer_failed(self.worker, pbx_transfer_failure(result))
+
+    def _transfer_asked(self, arguments: Mapping[str, Any]) -> TransferAsked | str:
+        """Read a `transfer_call` against the brief: where to and how, or an error for the model."""
+        if self.session.reported is not None or self.session.transferred:
+            return "how this call goes has already been decided"
+        context = self.session.brief.context
+        destinations = {each.name: each for each in context.destinations} if context else {}
+        any_number = bool(context and context.any_number)
+        destination = arguments.get("destination")
+        number = arguments.get("number")
+        mode = arguments.get("mode")
+        if destination is not None and number is not None:
+            return "name a destination or a number, not both"
+        if number is not None:
+            if not any_number:
+                return "this call can only be transferred to a named destination, not a number"
+            if not isinstance(number, str) or _lookup_digits(number) is None:
+                return "that is not a phone number; give its digits, with + and the country code"
+            if mode not in NUMBER_TRANSFER_MODES:
+                return f"a number can be reached by mode {' or '.join(NUMBER_TRANSFER_MODES)}"
+            return TransferAsked(number=number, mode=cast(TransferMode, mode))
+        if destination is None:
+            return (
+                "name a destination"
+                + (" or a number" if any_number else "")
+                + f"; one of: {', '.join(destinations)}"
+            )
+        if destination not in destinations:
+            return f"not one of the destinations; choose one of: {', '.join(destinations)}"
+        offered = destinations[destination].modes
+        if mode not in offered:
+            return f"{destination} can be reached by mode {' or '.join(offered)} only"
+        return TransferAsked(destination=str(destination), mode=cast(TransferMode, mode))
+
     async def fail(self, reason: str) -> None:
         """Report that the bot cannot serve the call, and end its leg now: it has nothing to say."""
         await self.session.report(Failed(reason))
@@ -2620,10 +2719,16 @@ class BriefedCall:
     async def _report_and_let_go(self, report: Report) -> None:
         if self.worker is None:
             return
-        worker = self.worker
         if not await self.session.report(report):
-            await worker.queue_frame(EndWorkerFrame())
+            await self.worker.queue_frame(EndWorkerFrame())
             return
+        self._end_if_the_stream_outlives_the_grace()
+
+    def _end_if_the_stream_outlives_the_grace(self) -> None:
+        """Wait for the PBX to close the stream, and end the pipeline if it has not in time."""
+        if self.worker is None:
+            return
+        worker = self.worker
 
         async def end_if_still_open() -> None:
             await asyncio.sleep(PBX_STREAM_GRACE_SECONDS)
@@ -2657,14 +2762,43 @@ TRANSFER_FAILURE_EXPLANATIONS: dict[str, str] = {
 among them, read as an outcome nobody confirmed."""
 
 
+NUMBER_TRANSFER_MODES: tuple[TransferMode, ...] = ("cold", "refer")
+"""How a number the brief allows may be reached. Not `warm`, which siphon-pbx #279 refuses
+(`warm_not_yet_supported`) until it carries a warm transfer out."""
+
+PBX_TRANSFER_EXPLANATIONS: dict[str, str] = {
+    "declined": "the person it was meant to reach declined the call",
+    "no_answer": "nobody answered",
+    "busy": "the line was busy",
+    "refused": "it was refused",
+    "failed": "it could not be completed",
+}
+"""Why, per siphon-pbx verdict, in the words the note gives the model."""
+
+
+def pbx_transfer_failure(result: TransferResult) -> str:
+    """Say why a transfer the PBX did not complete failed, for the model to tell the caller.
+
+    A refusal carries the PBX's own message, written to be read: it says what is not allowed.
+    """
+    if result.outcome == "not_allowed":
+        return f"it is not allowed ({result.message or result.reason})"
+    return PBX_TRANSFER_EXPLANATIONS.get(result.outcome, "it was never confirmed")
+
+
+async def _tell_the_model_the_transfer_failed(worker: PipelineWorker, why: str) -> None:
+    """Put the failure in front of the model and have it answer, since nothing else will."""
+    note = TRANSFER_FAILED_NOTE.format(why=why)
+    await worker.queue_frame(
+        LLMMessagesAppendFrame(messages=[{"role": "user", "content": note}], run_llm=True)
+    )
+
+
 async def _inform_the_model_the_transfer_failed(resources: CallResources, why: str) -> None:
     """Put the failure in front of the model and have it answer, since nothing else will."""
     if resources.worker is None:
         return
-    note = TRANSFER_FAILED_NOTE.format(why=why)
-    await resources.worker.queue_frame(
-        LLMMessagesAppendFrame(messages=[{"role": "user", "content": note}], run_llm=True)
-    )
+    await _tell_the_model_the_transfer_failed(resources.worker, why)
 
 
 async def _end_on_a_late_completion(
@@ -3195,6 +3329,74 @@ def build_speaking_language_controller() -> SpeakingLanguageController | None:
     )
 
 
+TRANSFER_MODE_MEANINGS: dict[str, str] = {
+    "cold": "cold puts them through once the destination answers",
+    "warm": "warm lets you speak to the destination first",
+    "refer": "refer has the caller's own phone call the destination",
+}
+"""What each mode means, in the words the tool's schema gives the model."""
+
+
+def briefed_transfer_schema(briefed: BriefedCall) -> FunctionSchema:
+    """Describe `transfer_call` for a briefed call: the brief's destinations and modes only.
+
+    A number is offered only when the brief allows any, and a destination's target is never known
+    here at all: the flow keeps it, so a model-chosen name can only ever reach what it listed.
+    """
+    context = briefed.session.brief.context
+    destinations = context.destinations if context is not None else ()
+    any_number = context is not None and context.any_number
+    offered = {mode for destination in destinations for mode in destination.modes}
+    if any_number:
+        offered.update(NUMBER_TRANSFER_MODES)
+    modes = [mode for mode in TRANSFER_MODE_MEANINGS if mode in offered]
+    properties: dict[str, Any] = {}
+    if destinations:
+        properties["destination"] = {
+            "type": "string",
+            "enum": [destination.name for destination in destinations],
+            "description": "The destination to put the caller through to.",
+        }
+    if any_number:
+        properties["number"] = {
+            "type": "string",
+            "description": (
+                "A phone number to put the caller through to instead of a destination, with + "
+                "and the country code. Only one the caller gave you."
+            ),
+        }
+    properties["mode"] = {
+        "type": "string",
+        "enum": modes,
+        "description": "How: " + "; ".join(TRANSFER_MODE_MEANINGS[mode] for mode in modes) + ".",
+    }
+    properties["summary"] = {
+        "type": "string",
+        "description": "What the call is about, in a sentence, for the record.",
+    }
+    listed = "; ".join(
+        f"{destination.name} ({' or '.join(destination.modes)}): {destination.description}"
+        for destination in destinations
+    )
+    return FunctionSchema(
+        name="transfer_call",
+        description=(
+            "Put the caller through to someone else. Call it first, then tell them you are "
+            "transferring them: the transfer starts once your words have finished playing, and "
+            "the call is not yours once it goes through."
+            + (f" The destinations: {listed}." if listed else "")
+            + (
+                f" Or a number the caller gives, by {' or '.join(NUMBER_TRANSFER_MODES)}."
+                if any_number
+                else ""
+            )
+        ),
+        properties=properties,
+        required=["mode"],
+        handler=briefed.transfer_call,
+    )
+
+
 def build_tool_schemas(
     with_control: bool,
     speaking: SpeakingLanguageController | None,
@@ -3263,7 +3465,11 @@ def build_tool_schemas(
                 handler=briefed.choose_option,
             )
         )
-    if with_control and transfer_target:
+    if briefed is not None and brief_can_transfer(briefed.session.brief):
+        # The PBX's transfer, to the destinations its flow knows, in place of the control plane's
+        # own: one `transfer_call`, and the flow decides where a name leads.
+        tools.append(briefed_transfer_schema(briefed))
+    elif with_control and transfer_target:
         tools.append(
             FunctionSchema(
                 name="transfer_call",
@@ -4009,7 +4215,11 @@ def build_llm_service(
         configuration.system_prompt
         + organisation_prompt(facts or CallFacts())
         + (HANGUP_PROMPT if with_hangup or brief is not None else "")
-        + (TRANSFER_PROMPT if with_hangup and configuration.transfer_target else "")
+        + (
+            TRANSFER_PROMPT
+            if (with_hangup and configuration.transfer_target) or brief_can_transfer(brief)
+            else ""
+        )
         + (CALL_BACK_PROMPT if with_hangup and call_back else "")
         + speaking_language_prompt(configured_speaking_languages())
         + (CALLER_LOOKUP_PROMPT if configuration.caller_lookup_url else "")
@@ -4667,7 +4877,13 @@ def build_worker(
         if ECHO_GUARD_TAIL_SECONDS > 0
         else None
     )
-    briefed = BriefedCall(session=session, speech=speech_monitor) if session is not None else None
+    # One hold, whoever transfers: the control plane, or the PBX for a briefed call.
+    transfer_hold = TransferHold(hold_audio=one_model)
+    briefed = (
+        BriefedCall(session=session, speech=speech_monitor, transfer_hold=transfer_hold)
+        if session is not None
+        else None
+    )
 
     # The conversation itself. The system prompt lives on the service (and is cached there), so
     # the context carries only the call.
@@ -4713,7 +4929,7 @@ def build_worker(
             speech=speech_monitor,
             control=control,
             transfer_target=configuration.transfer_target,
-            transfer_hold=TransferHold(hold_audio=one_model),
+            transfer_hold=transfer_hold,
         )
         if control is not None
         else None
@@ -4729,7 +4945,12 @@ def build_worker(
                 *([recognizer_language_codes] if recognizer_language_codes is not None else []),
                 # After the recognizer, which keeps getting audio, and ahead of the turn logic: see
                 # `TransferHold`. Only with a control plane, since only then is there a transfer.
-                *([resources.transfer_hold] if resources is not None else []),
+                *(
+                    [transfer_hold]
+                    if resources is not None
+                    or (briefed is not None and brief_can_transfer(briefed.session.brief))
+                    else []
+                ),
                 # Between the recognizer and the turn logic on purpose: the echo is dropped before
                 # anything can treat it as the caller starting a turn.
                 *([echo_guard] if echo_guard is not None else []),
