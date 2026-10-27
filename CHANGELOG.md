@@ -29,7 +29,19 @@ All notable changes to this project are documented here. The format follows
   target. The request is checked against the brief before anything is sent. The caller's words are
   held from the model while the PBX decides. A completed transfer lets the PBX close the stream, and
   any other outcome is put to the model with the reason, so it tells the caller and carries on. A
-  number goes by `cold` or `refer`, since siphon-pbx does not carry out `warm` yet.
+  number may go by any mode.
+- **Warm transfers and consults** (siphon-pbx #285). A brief carries `kind` (`call`, or `consult` for
+  a session asking a destination whether it takes a caller on hold) and, on a consult, `summary`;
+  a brief with a kind this release does not know is unreadable rather than served wrongly. A
+  consult reports `Accept` or `Decline(reason)`, and never transfers. The transfer timeout is 220 s,
+  over the 210 s siphon-pbx holds a warm transfer for.
+- **The agent example keeps a briefed caller across sockets.** siphon-pbx closes the caller's socket
+  for a warm transfer while the request is still open and, unless the transfer completes, dials the
+  bot again on the same token. The request now runs outside the pipeline, the session and its
+  conversation are held by token (`CallerSessions`), and a caller who comes back is carried on with
+  rather than greeted, the reason the transfer failed put to the model. A caller who never comes
+  back is let go after 5 minutes. A consult is served with its own instructions, the waiting caller's
+  number and the summary, and only `accept_transfer` and `decline_transfer`.
 
 ## [0.6.0] - 2026-10-27
 

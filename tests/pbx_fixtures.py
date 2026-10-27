@@ -111,3 +111,24 @@ TRANSFER_REFUSED_WARM = (
 TRANSFER_BAD_REQUEST = (
     b'{"reason":"bad_request","message":"name exactly one of destination and number"}'
 )
+
+# A consult brief (siphon-pbx #285, `kind: consult`), from siphon-pbx's own e2e fixture
+# (`deploy/e2e/voice-consult-brief.fixture.json`), keys as it publishes them: the original caller's
+# context, no destinations, and the summary the caller's bot sent.
+BRIEF_CONSULT = (
+    b'{"call_id":"consult-00000000000000d1@example.invalid","context":{"any_number":false,"cal'
+    b'led":{"national":"15550100","number":"+15550100","uri":"sip:+15550100@pbx.example.invali'
+    b'd;user=phone"},"caller":{"display_name":"Test Caller","national":"15550142","number":"+1'
+    b'5550142","privacy":"none"},"destinations":[],"direction":"inbound","organisation":{"exte'
+    b'rnal_ref":"CUST-0042","id":"00000000-0000-4000-8000-00000000000a","locale":"nl","name":"'
+    b'Example Office","time_zone":"Europe/Amsterdam"},"trunk":{"id":"22222222-2222-4222-8222-2'
+    b'22222222222","name":"Carrier"},"version":1},"deadline_secs":60,"instructions":"You are c'
+    b"alling support on behalf of a caller who is waiting on hold. Say who is calling and why,"
+    b" using the summary, and ask whether they will take the call now. Report accept if they w"
+    b'ill and decline if they will not; say nothing to them about anything else.","kind":"cons'
+    b'ult","media":"engine_turns","options":[],"summary":"wants to change an order"}'
+)
+
+# What a consult reports (the route's `Report::Accept` and `Report::Decline`).
+REPORT_ACCEPT = b'{"outcome":"accept"}'
+REPORT_DECLINE = b'{"outcome":"decline","reason":"in a meeting"}'

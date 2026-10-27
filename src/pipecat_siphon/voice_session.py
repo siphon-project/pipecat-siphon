@@ -42,10 +42,11 @@ MAX_REPORTED_REASON = 400
 DEFAULT_TIMEOUT_SECONDS = 2.0
 """How long one request to the PBX may take. The brief is fetched before the bot speaks."""
 
-TRANSFER_TIMEOUT_SECONDS = 160.0
+TRANSFER_TIMEOUT_SECONDS = 220.0
 """How long a transfer request may take. siphon-pbx holds it until the verdict, for at most
-`TRANSFER_ANSWER_DEADLINE` (150 s: a cold transfer rings for up to 120 s, plus 30). A client that
-gave up first would tell the bot a transfer failed that then went through."""
+`TRANSFER_ANSWER_DEADLINE`: 210 s, for a warm transfer that rings for up to 120 s and consults for
+up to 60, plus 30. A client that gave up first would tell the bot a transfer failed that then went
+through."""
 
 MAX_TRANSFER_SUMMARY = 1_000
 """The PBX cuts a transfer's summary to this many characters (`MAX_TRANSFER_SUMMARY`)."""
@@ -245,6 +246,12 @@ class CallContext:
     any_number: bool = False
 
 
+SessionKind = Literal["call", "consult"]
+"""What a voice session is for (siphon-pbx's `SessionKind`, `snake_case`)."""
+
+_SESSION_KINDS: tuple[SessionKind, ...] = ("call", "consult")
+
+
 @dataclass(frozen=True)
 class SessionBrief:
     """What a bot is told about the call it has been handed.
@@ -259,6 +266,11 @@ class SessionBrief:
     deadline_secs: int
     # None for a PBX that sends none, a bot set to `none`, or a context this cannot read.
     context: CallContext | None = None
+    # What the session is for: serving a caller, or, for a consult, asking a destination whether it
+    # takes the caller a warm transfer is for. `call` from a PBX that predates consults.
+    kind: SessionKind = "call"
+    # On a consult, what the caller's bot said the call is about, to tell the destination.
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -280,7 +292,19 @@ class Failed:
     reason: str = ""
 
 
-Report = Chose | Finished | Failed
+@dataclass(frozen=True)
+class Accept:
+    """On a consult: the destination takes the call, so the caller is connected to it."""
+
+
+@dataclass(frozen=True)
+class Decline:
+    """On a consult: the destination will not take the call. The caller's bot is told `reason`."""
+
+    reason: str = ""
+
+
+Report = Chose | Finished | Failed | Accept | Decline
 
 
 def _option_from(value: Any) -> BriefOption | None:
@@ -470,12 +494,20 @@ def parse_brief(raw: bytes | str) -> SessionBrief | None:
         if option is None:
             return None
         options.append(option)
+    # A kind this bot does not know is a session it cannot serve: it would answer with the wrong
+    # reports and leave the call waiting out its deadline.
+    kind = next((each for each in _SESSION_KINDS if each == document.get("kind", "call")), None)
+    summary = document.get("summary")
+    if kind is None or (summary is not None and not isinstance(summary, str)):
+        return None
     return SessionBrief(
         call_id=call_id,
         instructions=instructions,
         options=tuple(options),
         deadline_secs=deadline,
         context=parse_context(document.get("context")),
+        kind=kind,
+        summary=summary,
     )
 
 
@@ -493,6 +525,10 @@ def encode_report(report: Report) -> bytes:
             document = {"outcome": "finished"}
         case Failed(reason=reason):
             document = {"outcome": "failed", "reason": reason[:MAX_REPORTED_REASON]}
+        case Accept():
+            document = {"outcome": "accept"}
+        case Decline(reason=reason):
+            document = {"outcome": "decline", "reason": reason[:MAX_REPORTED_REASON]}
     return json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
 
 
@@ -512,6 +548,10 @@ def _describe(report: Report) -> str:
             return "finished"
         case Failed(reason=reason):
             return f"failed ({reason[:MAX_REPORTED_REASON]})"
+        case Accept():
+            return "accept"
+        case Decline(reason=reason):
+            return f"decline ({reason[:MAX_REPORTED_REASON]})"
 
 
 async def _read_at_most(reply: aiohttp.ClientResponse, limit: int) -> bytes:
@@ -691,6 +731,11 @@ class VoiceSession:
         return self._reported
 
     @property
+    def token(self) -> str:
+        """The session's token: what a dial-in names it by. Never logged."""
+        return self._token
+
+    @property
     def transferred(self) -> bool:
         """Whether the caller was transferred, which ends the session: nothing is reported after."""
         return self._transferred
@@ -724,6 +769,9 @@ class VoiceSession:
         A completed transfer ends the session on siphon-pbx's `transferred` port.
         """
         async with self._lock:
+            if self.brief.kind != "call":
+                logger.error("a consult session cannot transfer; not asking for one")
+                return _transfer_failed("a consult cannot transfer anyone")
             if self._transferred or self._reported is not None:
                 logger.info("this call's session has already ended; not asking for a transfer")
                 return _transfer_failed("this call has already been passed on")
